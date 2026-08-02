@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env
+
+# Checkpoints and model weights (large files — store on S3/NFS)
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.gguf
+*.ggml
+*.q4_0
+*.q4_k_m
+*.awq
+
+# Data (large files — stream from HuggingFace or object storage)
+data/
+*.jsonl
+*.parquet
+*.arrow
+*.tfrecord
+
+# Logs
+logs/
+runs/
+*.log
+tensorboard/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.key
+*.pem
+secrets/
+
+# Build artifacts
+*.o
+*.a
+*.dylib
+*.dll

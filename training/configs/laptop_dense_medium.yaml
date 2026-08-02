@@ -1,0 +1,43 @@
+# Jupiter Shot — Laptop Dense Medium Config
+# Target hardware: 10–16 GB VRAM (e.g., RTX 3080 10GB, RTX 4080 16GB, A10)
+# Model size: ~350M parameters
+# Gradient checkpointing: optional (recommended for 10GB)
+# Effective VRAM budget: ~9.5 GB (after 1.5 GB Windows/CUDA overhead)
+
+model:
+  vocab_size: 32000
+  hidden_size: 1024
+  num_hidden_layers: 16
+  num_attention_heads: 16
+  # intermediate_size = SwiGLU: 2/3 * 4 * hidden_size, rounded to 64
+  # 2/3 * 4 * 1024 = 2731 → round to 2752
+  intermediate_size: 2752
+  max_position_embeddings: 1024
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000.0
+  tie_word_embeddings: true
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  seq_length: 1024
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 200
+  precision: bf16   # Prefer BF16 on Ampere+ (RTX 3080+); falls back to FP16 automatically
+  gradient_checkpointing: true
+
+  # Estimated VRAM breakdown (BF16):
+  # Weights:    ~0.70 GB  (350M × 2 bytes)
+  # Gradients:  ~0.70 GB
+  # Optimizer:  ~2.10 GB  (350M × 12 bytes AdamW fp32)
+  # Activations: ~2.0 GB  (batch=2, seq=1024, with checkpointing)
+  # CUDA buffers: ~0.5 GB
+  # Total est:  ~6.0 GB   (within 9.5 GB budget)
+
+metadata:
+  tier: "10-16GB"
+  param_count_approx_m: 350
+  vram_budget_gb: 9.5
+  notes: "Medium validation config. Tests architecturally meaningful scale on high-end laptop GPUs."

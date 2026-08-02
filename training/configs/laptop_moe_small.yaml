@@ -1,0 +1,49 @@
+# Jupiter Shot — Laptop MoE Small Config
+# Target hardware: 6–8 GB VRAM
+# Architecture: 8 experts, top-2 routing, ~180M total / ~55M active
+# Effective VRAM budget: ~5.5 GB
+
+model:
+  base:
+    vocab_size: 32000
+    hidden_size: 512
+    num_hidden_layers: 8
+    num_attention_heads: 8
+    intermediate_size: 1408
+    max_position_embeddings: 512
+    rms_norm_eps: 1.0e-5
+    rope_theta: 10000.0
+    tie_word_embeddings: true
+  # MoE parameters
+  num_experts: 8
+  num_experts_per_token: 2
+  moe_layer_freq: 2          # Every 2nd layer is MoE (4 MoE layers out of 8)
+  capacity_factor: 1.25
+  aux_loss_coeff: 0.01
+  z_loss_coeff: 0.001
+  router_jitter: 0.01
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  seq_length: 512
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 100
+  precision: fp16
+  gradient_checkpointing: true
+
+  # Estimated VRAM (FP16):
+  # Weights:    ~0.36 GB  (180M × 2 bytes)
+  # Gradients:  ~0.36 GB
+  # Optimizer:  ~1.08 GB  (180M × 12 bytes)
+  # Activations: ~1.0 GB
+  # Total est:  ~2.8 GB   (within 5.5 GB budget)
+
+metadata:
+  tier: "6-8GB"
+  total_params_approx_m: 180
+  active_params_approx_m: 55
+  sparsity_pct: 69
+  notes: "Standard MoE validation config. Tests routing stability and expert utilization at meaningful scale."

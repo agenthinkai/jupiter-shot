@@ -1,0 +1,43 @@
+# Jupiter Shot — Laptop Dense Small Config
+# Target hardware: 6–8 GB VRAM (e.g., RTX 3060 6GB, RTX 2070 8GB, RTX 3070 8GB)
+# Model size: ~85M parameters
+# Gradient checkpointing: recommended
+# Effective VRAM budget: ~5.5 GB (after 1.5 GB Windows/CUDA overhead)
+
+model:
+  vocab_size: 32000
+  hidden_size: 512
+  num_hidden_layers: 8
+  num_attention_heads: 8
+  # intermediate_size = SwiGLU: 2/3 * 4 * hidden_size, rounded to 64
+  # 2/3 * 4 * 512 = 1365 → round to 1408
+  intermediate_size: 1408
+  max_position_embeddings: 512
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000.0
+  tie_word_embeddings: true
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  seq_length: 512
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 100
+  precision: fp16
+  gradient_checkpointing: true
+
+  # Estimated VRAM breakdown (FP16):
+  # Weights:    ~0.17 GB  (85M × 2 bytes)
+  # Gradients:  ~0.17 GB
+  # Optimizer:  ~0.51 GB  (85M × 12 bytes AdamW fp32)
+  # Activations: ~1.0 GB  (batch=2, seq=512, with checkpointing)
+  # CUDA buffers: ~0.5 GB
+  # Total est:  ~2.4 GB   (within 5.5 GB budget with headroom)
+
+metadata:
+  tier: "6-8GB"
+  param_count_approx_m: 85
+  vram_budget_gb: 5.5
+  notes: "Standard small validation config. Suitable for most gaming laptops with 6-8GB VRAM."

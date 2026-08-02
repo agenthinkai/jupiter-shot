@@ -9,8 +9,15 @@ Run:
 """
 
 import pytest
-import torch
-import torch.nn as nn
+
+try:
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+pytestmark = pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
 
 
 # ── Dense Model Tests ─────────────────────────────────────────────────────────

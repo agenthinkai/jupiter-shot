@@ -1,0 +1,42 @@
+# Jupiter Shot — Laptop Dense Tiny Config
+# Target hardware: 4 GB VRAM (e.g., GTX 1650, RTX 3050 4GB)
+# Model size: ~25M parameters
+# Gradient checkpointing: mandatory
+# Effective VRAM budget: ~2.5 GB (after 1.5 GB Windows/CUDA overhead)
+
+model:
+  vocab_size: 32000
+  hidden_size: 256
+  num_hidden_layers: 6
+  num_attention_heads: 8
+  # intermediate_size = 4/3 * hidden_size * 2, rounded to 64
+  # 256 * 8/3 ≈ 683 → round to 704
+  intermediate_size: 704
+  max_position_embeddings: 256
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000.0
+  tie_word_embeddings: true
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  seq_length: 256
+  learning_rate: 5.0e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 50
+  precision: fp16
+  gradient_checkpointing: true
+
+  # Estimated VRAM breakdown (FP16):
+  # Weights:    ~0.05 GB  (25M × 2 bytes)
+  # Gradients:  ~0.05 GB
+  # Optimizer:  ~0.15 GB  (25M × 12 bytes for AdamW fp32)
+  # Activations: ~0.3 GB  (batch=2, seq=256, with checkpointing)
+  # Total est:  ~0.6 GB   (well within 2.5 GB budget)
+
+metadata:
+  tier: "4GB"
+  param_count_approx_m: 25
+  vram_budget_gb: 2.5
+  notes: "Minimal architectural validation config. Gradient checkpointing mandatory."

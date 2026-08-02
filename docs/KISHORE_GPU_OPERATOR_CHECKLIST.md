@@ -11,7 +11,7 @@
 - [ ] Laptop plugged into power (not battery)
 - [ ] Laptop on a hard flat surface (ventilation)
 - [ ] All other GPU-using apps closed (games, Chrome hardware acceleration)
-- [ ] At least 5 GB free disk space
+- [ ] At least 20 GB free disk space (for PyTorch download, checkpoints, and logs)
 - [ ] Internet connection available (for cloning repo and installing packages)
 - [ ] Python 3.10 or 3.11 installed (`python --version`)
 - [ ] NVIDIA GPU driver installed (`nvidia-smi` works in Command Prompt)
@@ -83,9 +83,11 @@ After the run completes, open `benchmarks\results\laptop\dense_summary.json` and
 - [ ] Open `docs\generated\LAPTOP_GPU_VALIDATION_DRAFT.md`
 - [ ] Verify it contains your GPU model and results (not all dashes)
 - [ ] Share these files with the team:
-  - `benchmarks\results\laptop\` (all JSON files)
-  - `docs\generated\LAPTOP_GPU_VALIDATION_DRAFT.md`
+  - `docs\generated\LAPTOP_GPU_VALIDATION_DRAFT.md` ← **primary report**
+  - `benchmarks\results\laptop\` (all JSON files) ← raw metrics
   - `logs\laptop\validation_run_*.log`
+
+> **Scope reminder:** This validation confirms CUDA execution, dense training, small MoE routing, checkpoint resume, and thermal controls on a single GPU. It does not validate 8× A100 distributed training or 20T scalability. A successful result authorizes the next controlled validation stage — not 47B MoE training.
 
 ---
 
@@ -96,7 +98,7 @@ After the run completes, open `benchmarks\results\laptop\dense_summary.json` and
 | `CUDA not available` | Run `nvidia-smi` — if it fails, reinstall NVIDIA drivers |
 | `Out of memory` | Script auto-retries smaller config; if still fails, note the error |
 | `NaN loss from step 1` | Note it and report — do not retry with different settings |
-| `ModuleNotFoundError` | Run `venv\Scripts\activate.bat` first |
+| `ModuleNotFoundError` | Run `.venv\Scripts\activate.bat` first |
 | Script blocked by Windows | Right-click → Properties → Unblock |
 
 **Do not modify any scripts or configs to make tests pass.** Record failures as-is.

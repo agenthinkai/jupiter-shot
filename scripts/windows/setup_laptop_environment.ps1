@@ -58,24 +58,24 @@ try {
 Write-Host ""
 Write-Host "[2/8] Creating virtual environment..." -ForegroundColor Yellow
 
-$venvPath = ".\venv"
+$venvPath = ".\.venv"
 if (Test-Path $venvPath) {
     if ($Force) {
-        Write-Host "  Removing existing venv (--Force specified)..."
+        Write-Host "  Removing existing .venv (--Force specified)..."
         Remove-Item -Recurse -Force $venvPath
     } else {
-        Write-Host "  Virtual environment already exists. Use -Force to recreate." -ForegroundColor Green
+        Write-Host "  Virtual environment already exists at .venv. Use -Force to recreate." -ForegroundColor Green
     }
 }
 
 if (-not (Test-Path $venvPath)) {
-    python -m venv venv
+    python -m venv .venv
     Write-Host "  Created: $venvPath" -ForegroundColor Green
 }
 
 # Activate
-& ".\venv\Scripts\Activate.ps1"
-Write-Host "  Activated virtual environment" -ForegroundColor Green
+& ".\.venv\Scripts\Activate.ps1"
+Write-Host "  Activated virtual environment (.venv)" -ForegroundColor Green
 
 # ── Step 3: Upgrade pip ───────────────────────────────────────────────────────
 Write-Host ""
@@ -97,27 +97,21 @@ Write-Host "  $cudaCheck" -ForegroundColor Green
 
 # ── Step 5: Install core dependencies ────────────────────────────────────────
 Write-Host ""
-Write-Host "[5/8] Installing core dependencies..." -ForegroundColor Yellow
-pip install `
-    transformers==4.40.2 `
-    tokenizers==0.19.1 `
-    datasets==2.19.1 `
-    accelerate==0.29.3 `
-    pyyaml==6.0.1 `
-    numpy==1.26.4 `
-    tqdm==4.66.2 `
-    psutil==5.9.8
+Write-Host "[5/8] Installing pinned dependencies from requirements.txt..." -ForegroundColor Yellow
+Write-Host "  This installs exactly the versions pinned in requirements.txt."
 
-Write-Host "  Core dependencies installed" -ForegroundColor Green
+if (Test-Path "requirements.txt") {
+    pip install -r requirements.txt
+    Write-Host "  All pinned dependencies installed from requirements.txt" -ForegroundColor Green
+} else {
+    Write-Host "  [ERROR] requirements.txt not found. Ensure you are in the repo root." -ForegroundColor Red
+    exit 1
+}
 
-# ── Step 6: Install test dependencies ────────────────────────────────────────
+# ── Step 6: Install test dependencies ─────────────────────────────────────────────
 Write-Host ""
-Write-Host "[6/8] Installing test dependencies..." -ForegroundColor Yellow
-pip install `
-    pytest==8.1.1 `
-    pytest-asyncio==0.23.6 `
-    datasketch==1.6.4
-
+Write-Host "[6/8] Installing test dependencies (pinned)..." -ForegroundColor Yellow
+pip install pytest==8.1.1 pytest-asyncio==0.23.6 datasketch==1.6.4
 Write-Host "  Test dependencies installed" -ForegroundColor Green
 
 # ── Step 7: Optional — DeepSpeed ─────────────────────────────────────────────

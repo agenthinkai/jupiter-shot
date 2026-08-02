@@ -162,19 +162,44 @@ deepspeed --num_gpus=8 training/train_moe.py \
 
 ## GO/NO-GO Decision
 
-### Current: CONDITIONAL NO-GO
+### Current: CONDITIONAL NO-GO for large-scale Month 2 training
 
 **Code-complete. Hardware-validation pending.**
 
-All software gates pass. The codebase is production-quality. The recommendation is **NO-GO for Month 2 production work** (47B MoE, 10B-token training) until Gates C4 and C5 are verified on actual hardware.
+All software gates pass. The codebase is CPU-tested and prepared for single-GPU CUDA validation.
+
+The recommendation is **CONDITIONAL NO-GO for large-scale Month 2 training** (47B MoE, 10B-token training run). The next blocker is single-GPU CUDA validation in Kuwait, followed later by distributed-GPU validation.
+
+**What the Kuwait laptop test validates:**
+- CUDA execution on a single NVIDIA GPU
+- Dense transformer training (small config)
+- Small MoE routing (8-expert prototype)
+- Checkpoint save, interrupt, and resume
+- Metrics collection and thermal monitoring
+
+**What the Kuwait laptop test does NOT validate:**
+- 8× A100 distributed training
+- DeepSpeed NCCL multi-node communication
+- Full 1.3B parameter training run
+- Proof of 20T scalability
+
+A successful Kuwait laptop test may authorize the next controlled validation stage. It does not automatically authorize 47B MoE training.
 
 ### Path to Full GO
 
+**Stage A — Single-GPU CUDA validation (Kuwait laptop):**
+1. Run `scripts/windows/run_all_laptop_validation.bat` on Kishore's GPU laptop
+2. Review `docs/generated/LAPTOP_GPU_VALIDATION_DRAFT.md`
+3. If Stage A passes → authorized to proceed to Stage B
+
+**Stage B — Distributed-GPU validation (8× A100):**
 1. Provision 8× A100 80GB (~$8.90/hr spot on AWS p4d.24xlarge)
 2. Run C4: 8-GPU dense 1,000 steps (~45 min, ~$11)
 3. Run C5: 8-GPU MoE 1,000 steps (~60 min, ~$15)
 4. Record all metrics in `benchmarks/MONTH1_VALIDATION_RESULTS.md`
-5. If C4 and C5 pass → **Full GO for Month 2**
+5. If C4 and C5 pass → **Full GO for large-scale Month 2 training**
+
+Stage A must complete before Stage B begins. A successful Stage A does not automatically authorize Stage B or 47B MoE training.
 
 **Estimated total GPU cost to reach Full GO: ~$26**  
 **Estimated time: ~2 hours**

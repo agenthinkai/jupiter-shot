@@ -43,30 +43,44 @@ The most immediate compute need is Month 1 GPU validation. This requires a singl
 
 **How to run it:**
 
-```bash
-# Clone the repository
+**Windows with NVIDIA GPU (recommended for Kuwait laptop validation):**
+```bat
 git clone https://github.com/agenthinkai/jupiter-shot.git
 cd jupiter-shot
+git checkout validation/kuwait-laptop-gpu
 
-# Install dependencies (see docs/LAPTOP_GPU_VALIDATION.md for full instructions)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+:: One-click runner — creates isolated .venv, installs pinned deps, runs all validation
+scripts\windows\run_all_laptop_validation.bat
+```
+
+**Linux with NVIDIA GPU:**
+```bash
+git clone https://github.com/agenthinkai/jupiter-shot.git
+cd jupiter-shot
+git checkout validation/kuwait-laptop-gpu
+
+# Create isolated virtual environment
+python3 -m venv .venv && source .venv/bin/activate
+
+# Install pinned dependencies (bundled CUDA — no system CUDA toolkit required)
+pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 
-# Run preflight
+# Run preflight (stops if CUDA not available)
 python scripts/laptop_gpu_preflight.py
 
-# Run all validation (auto-selects config based on VRAM)
+# Run validation
 python scripts/run_laptop_dense.py
 python scripts/run_laptop_moe.py
 python scripts/run_laptop_resume_test.py
 
-# Generate validation report
+# Generate report
 python scripts/generate_laptop_validation_draft.py
 ```
 
-The validation scripts auto-detect VRAM and select the appropriate config (tiny/small/medium). They produce a `LAPTOP_GPU_VALIDATION_DRAFT.md` file with all results. Share this file with the Jupiter Shot team.
+> **Note:** NVIDIA CUDA is not supported on modern macOS. Run validation only on Windows with NVIDIA GPU or Linux with NVIDIA GPU.
 
-**For Windows users:** See `scripts/windows/run_all_laptop_validation.bat` for a one-click validation runner.
+The validation scripts auto-detect VRAM and select the appropriate config (tiny/small/medium). The generated report is written to `docs/generated/LAPTOP_GPU_VALIDATION_DRAFT.md`. Raw metrics are stored under `benchmarks/results/laptop/`. Share the generated report with the Jupiter Shot team.
 
 ---
 

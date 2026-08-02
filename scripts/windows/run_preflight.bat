@@ -15,11 +15,11 @@ echo ============================================================
 echo.
 
 REM Activate virtual environment if it exists
-if exist "venv\Scripts\activate.bat" (
-    call venv\Scripts\activate.bat
-    echo [OK] Virtual environment activated
+if exist ".venv\Scripts\activate.bat" (
+    call .venv\Scripts\activate.bat
+    echo [OK] Virtual environment (.venv) activated
 ) else (
-    echo [WARN] No venv found. Using system Python.
+    echo [WARN] No .venv found. Using system Python.
     echo        Run scripts\windows\setup_laptop_environment.ps1 first.
 )
 

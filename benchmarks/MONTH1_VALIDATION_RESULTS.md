@@ -430,12 +430,12 @@ Based on `benchmarks/scaling_estimator.py` output and current AWS spot pricing:
 
 ### Current Status
 
-**CONDITIONAL NO-GO for Month 2 production work.**  
-**GO for Month 2 planning and GPU procurement.**
+**CONDITIONAL NO-GO for large-scale Month 2 training.**  
+**GO for Month 2 planning, GPU procurement, and Kuwait laptop validation.**
 
 ### Rationale
 
-All code-level gates (1, 2, 3, 7, 8) pass cleanly. The codebase is production-quality: 76 tests pass, parameter counts are analytically verified, the CPU smoke test runs without errors, compliance language is corrected, and all CPU-executable RUNBOOK commands work.
+All code-level gates (1, 2, 3, 7, 8) pass cleanly. The codebase is CPU-tested and prepared for single-GPU CUDA validation: 76 tests pass, parameter counts are analytically verified, the CPU smoke test runs without errors, compliance language is corrected, and all CPU-executable RUNBOOK commands work.
 
 However, Gates 4, 5, and 6 — which require actual GPU hardware — are not yet completed. These gates are the critical path to Month 2, because:
 
@@ -445,11 +445,13 @@ However, Gates 4, 5, and 6 — which require actual GPU hardware — are not yet
 
 ### Recommended Next Action
 
-Provision 8× A100 80GB (AWS p4d.24xlarge or equivalent) and run Gates 4, 5, and 6 in sequence. Estimated cost: ~$26, estimated time: ~2 hours. If all three gates pass, the recommendation changes to **full GO for Month 2**.
+**Stage A (immediate):** Run single-GPU CUDA validation on Kishore's laptop in Kuwait using `scripts/windows/run_all_laptop_validation.bat`. This validates CUDA execution, dense training, small MoE routing, checkpoint resume, and thermal controls. It does not validate 8× A100 distributed training, DeepSpeed NCCL, full 1.3B training, or 20T scalability. A successful Stage A may authorize Stage B.
+
+**Stage B (after Stage A passes):** Provision 8× A100 80GB (AWS p4d.24xlarge or equivalent) and run Gates 4, 5, and 6 in sequence. Estimated cost: ~$26, estimated time: ~2 hours. If all three gates pass, the recommendation changes to **Full GO for large-scale Month 2 training**.
 
 ### Month 2 Scope (pending GPU validation)
 
-Do not begin the 47B MoE model or the 10B-token training run until:
+A successful Kuwait laptop test does not automatically authorize 47B MoE training. Do not begin the 47B MoE model or the 10B-token training run until:
 - Gate 5 confirms loss decreases and no NaN/Inf on 8× A100
 - Gate 6 confirms router stability and expert utilization > 5% per expert
 - Actual tokens/second is measured (to replace the 40% MFU assumption in cost estimates)

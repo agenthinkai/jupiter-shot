@@ -21,7 +21,7 @@ echo   Config: %CONFIG%
 echo ============================================================
 echo.
 
-if exist "venv\Scripts\activate.bat" call venv\Scripts\activate.bat
+if exist ".venv\Scripts\activate.bat" call .venv\Scripts\activate.bat
 
 python scripts\run_laptop_resume_test.py --config %CONFIG% --steps 20
 set EXIT_CODE=%ERRORLEVEL%

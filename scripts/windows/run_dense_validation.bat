@@ -39,7 +39,7 @@ echo   Steps:  %STEPS%
 echo ============================================================
 echo.
 
-if exist "venv\Scripts\activate.bat" call venv\Scripts\activate.bat
+if exist ".venv\Scripts\activate.bat" call .venv\Scripts\activate.bat
 
 echo [STAGE 1] Running 10 diagnostic steps...
 python scripts\run_laptop_dense.py --config %CONFIG% --steps 10

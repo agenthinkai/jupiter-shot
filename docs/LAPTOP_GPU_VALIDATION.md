@@ -234,7 +234,13 @@ These limitations are documented in the validation report. A PASS on laptop vali
 - The training loop runs without errors
 - Checkpointing works correctly
 
-It does **not** confirm production-scale throughput or distributed training correctness.
+It does **not** confirm:
+- 8× A100 distributed training
+- DeepSpeed NCCL multi-node communication
+- Full 1.3B parameter training run
+- 20T scalability
+
+A successful laptop validation may authorize the next controlled validation stage. It does not automatically authorize 47B MoE training.
 
 ---
 
@@ -244,7 +250,9 @@ Once all stages pass, the team will:
 1. Review `docs/generated/LAPTOP_GPU_VALIDATION_DRAFT.md`
 2. Update `benchmarks/MONTH1_VALIDATION_RESULTS.md` with measured results
 3. Update `docs/MONTH1_GO_NO_GO.md` with GPU gate status
-4. Issue a final GO/NO-GO recommendation for Month 2
+4. Issue a GO/NO-GO for the next controlled validation stage (Stage B: 8× A100 distributed validation)
+
+**Important:** A successful Kuwait laptop test does not automatically authorize 47B MoE training or the 10B-token training run. Those require Stage B distributed-GPU validation.
 
 ---
 

@@ -299,19 +299,34 @@ class TopKRouter(nn.Module):
             z_loss = torch.mean(torch.log(torch.exp(router_logits).sum(dim=-1)) ** 2)
             aux_loss = aux_loss + self.z_loss_coeff * z_loss
 
-        # ── Metrics ───────────────────────────────────────────────────────────
+        # ── Metrics — canonical schema from training.router_metrics ────────────
         with torch.no_grad():
-            expert_counts = tokens_per_expert.detach().cpu()
-            metrics = {
-                "expert_counts": expert_counts.tolist(),
-                "expert_fraction": fraction_per_expert.detach().cpu().tolist(),
-                "router_entropy": -(router_probs * (router_probs + 1e-9).log()).sum(-1).mean().item(),
-                "max_expert_fraction": fraction_per_expert.max().item(),
-                "min_expert_fraction": fraction_per_expert.min().item(),
-                "load_imbalance_ratio": (
-                    fraction_per_expert.max() / (fraction_per_expert.mean() + 1e-9)
-                ).item(),
-            }
+            from training.router_metrics import compute_router_metrics as _crm
+            _counts = tokens_per_expert.detach().cpu().tolist()
+            _mean_probs = mean_prob_per_expert.detach().cpu().tolist()
+            # Compute raw (unscaled) z-loss value for the metrics record
+            if self.z_loss_coeff > 0:
+                _z_raw = float(torch.mean(
+                    torch.log(torch.exp(router_logits).sum(dim=-1)) ** 2
+                ).item())
+            else:
+                _z_raw = 0.0
+            _aux_raw = float(
+                self.num_experts
+                * (fraction_per_expert * mean_prob_per_expert).sum().item()
+            )
+            metrics = _crm(
+                expert_assignment_counts=_counts,
+                num_tokens=num_tokens,
+                num_experts=self.num_experts,
+                top_k=self.num_experts_per_token,
+                router_probs_mean=_mean_probs,
+                aux_loss_unscaled=_aux_raw,
+                aux_loss_coeff=self.aux_loss_coeff,
+                z_loss_unscaled=_z_raw,
+                z_loss_coeff=self.z_loss_coeff,
+                capacity_factor=self.capacity_factor,
+            )
 
         return top_k_weights, top_k_indices, aux_loss, metrics
 

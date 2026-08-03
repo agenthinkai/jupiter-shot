@@ -528,17 +528,29 @@ class TestMoEForwardPass:
         assert isinstance(aux_val, float)
         assert isinstance(router_metrics, list)
 
-    def test_moe_router_metrics_has_expert_fraction(
+    def test_moe_router_metrics_has_canonical_keys(
         self, moe_model: MoETransformer, cpu_batch: torch.Tensor
     ) -> None:
-        """Each layer's router_metrics dict should contain 'expert_fraction'."""
+        """
+        Each layer's router_metrics dict must contain the canonical schema keys
+        defined in training/router_metrics.py.
+
+        Required keys (from REQUIRED_ACCEPTANCE_KEYS):
+          router_entropy, expert_assignment_fractions, minimum_expert_fraction,
+          maximum_expert_fraction, utilization_cv, number_of_inactive_experts,
+          inactive_expert_indices, dropped_token_fraction,
+          auxiliary_load_balancing_loss, experts_selected_per_token, number_of_experts
+        """
+        from training.router_metrics import REQUIRED_ACCEPTANCE_KEYS
         moe_model.eval()
         with torch.no_grad():
             out = moe_model(input_ids=cpu_batch)
         for i, layer_metrics in enumerate(out["router_metrics"]):
             if layer_metrics:  # skip empty dicts from gradient checkpointing
-                assert "expert_fraction" in layer_metrics, (
-                    f"router_metrics[{i}] missing 'expert_fraction'. Keys: {list(layer_metrics.keys())}"
+                missing = [k for k in REQUIRED_ACCEPTANCE_KEYS if k not in layer_metrics]
+                assert not missing, (
+                    f"router_metrics[{i}] missing canonical keys: {missing}. "
+                    f"Present keys: {list(layer_metrics.keys())}"
                 )
 
     def test_moe_router_entropy_is_positive(
@@ -595,29 +607,44 @@ class TestGradScalerAPI:
         """
         Verify that run_laptop_dense.py uses torch.amp.GradScaler, not the deprecated
         torch.cuda.amp.GradScaler.
+
+        NOTE: Comments are allowed to mention the old API for documentation purposes
+        (e.g. "replaces deprecated torch.cuda.amp.GradScaler").
+        Only actual *call sites* (non-comment lines) are forbidden.
         """
         runner_path = REPO_ROOT / "scripts" / "run_laptop_dense.py"
         assert runner_path.exists(), f"Runner not found: {runner_path}"
-        content = runner_path.read_text()
+        content = runner_path.read_text(encoding="utf-8")
         # Must use the new API
         assert 'torch.amp.GradScaler("cuda"' in content, (
             "run_laptop_dense.py must use torch.amp.GradScaler(\"cuda\", ...) "
             "instead of the deprecated torch.cuda.amp.GradScaler"
         )
-        # Must NOT use the deprecated API
-        assert "torch.cuda.amp.GradScaler" not in content, (
-            "run_laptop_dense.py still uses deprecated torch.cuda.amp.GradScaler"
+        # Must NOT call the deprecated API on a non-comment line
+        non_comment_text = "\n".join(
+            line for line in content.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "torch.cuda.amp.GradScaler" not in non_comment_text, (
+            "run_laptop_dense.py calls deprecated torch.cuda.amp.GradScaler "
+            "on a non-comment line"
         )
 
     def test_deprecated_gradscaler_api_is_not_used_in_moe_runner(self) -> None:
+        """Same policy as dense runner: comments may mention the old API, calls may not."""
         runner_path = REPO_ROOT / "scripts" / "run_laptop_moe.py"
         assert runner_path.exists(), f"Runner not found: {runner_path}"
-        content = runner_path.read_text()
+        content = runner_path.read_text(encoding="utf-8")
         assert 'torch.amp.GradScaler("cuda"' in content, (
             "run_laptop_moe.py must use torch.amp.GradScaler(\"cuda\", ...) "
         )
-        assert "torch.cuda.amp.GradScaler" not in content, (
-            "run_laptop_moe.py still uses deprecated torch.cuda.amp.GradScaler"
+        non_comment_text = "\n".join(
+            line for line in content.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "torch.cuda.amp.GradScaler" not in non_comment_text, (
+            "run_laptop_moe.py calls deprecated torch.cuda.amp.GradScaler "
+            "on a non-comment line"
         )
 
 

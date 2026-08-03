@@ -1,0 +1,115 @@
+# Jupiter Shot — Dense Laptop Validation Config (Run 7)
+# =========================================================
+#
+# This config is loaded by the STRICT config loader (training/config_loader.py).
+# ALL keys must map to canonical DenseConfig field names or declared aliases.
+# Unknown keys halt execution. Unsupported keys halt execution.
+#
+# Canonical field name: num_layers  (NOT num_hidden_layers)
+# Alias supported:      num_hidden_layers → num_layers  (for legacy compat)
+#
+# ── Architecture ──────────────────────────────────────────────────────────────
+#
+#   vocab_size:    50,277  (EleutherAI/gpt-neox-20b tokenizer, Apache 2.0)
+#   hidden_size:   512
+#   num_layers:    8       ← CANONICAL field name (not num_hidden_layers)
+#   heads:         8
+#   intermediate:  1,408   (auto = 2/3 × 4 × 512 = 1365 → rounded to 1408)
+#   max_pos:       512
+#
+# ── Parameter count (programmatically verified) ───────────────────────────────
+#
+#   Embedding (tied):    50,277 × 512          = 25,741,824
+#   Per-layer:           Q+K+V+O (4×512²)
+#                      + SwiGLU (2×512×1408 + 1408×512)
+#                      + 2×RMSNorm (2×512)
+#                      = 1,048,576 + 2,162,688 + 1,024
+#                      = 3,212,288
+#   8 layers:            3,212,288 × 8         = 25,698,304
+#   Final RMSNorm:       512
+#   LM head (tied):      0
+#   ─────────────────────────────────────────────────────
+#   TOTAL:               51,440,640            ≈ 51.44M
+#
+#   NOTE: These counts are computed from the config fields above.
+#   The pipeline will construct the actual model and verify the count
+#   against this expected value (±1% tolerance).
+#
+# ── VRAM estimate (NOT verified on hardware) ─────────────────────────────────
+#
+#   Weights (BF16):      51.44M × 2 bytes       = 0.103 GB
+#   Gradients (BF16):    51.44M × 2 bytes       = 0.103 GB
+#   Optimizer (AdamW):   51.44M × 2 × 4 bytes   = 0.412 GB
+#   Activations:         batch=2, seq=512        ≈ 0.050 GB
+#   ─────────────────────────────────────────────────────
+#   ESTIMATED PEAK:      ~0.67 GB   NOT verified on hardware
+#   Target (< 6.5 GB):  6.50 GB    Margin: ~5.83 GB
+#
+# ── Tokenizer contract ────────────────────────────────────────────────────────
+#
+#   tokenizer_id:  EleutherAI/gpt-neox-20b
+#   vocab_size:    50,277
+#   license:       Apache 2.0
+#   The runner will halt with TOKENIZER_VOCABULARY_MISMATCH if the loaded
+#   tokenizer has a different vocab_size than this config's vocab_size.
+
+model:
+  # ── All keys use CANONICAL DenseConfig field names ──
+  vocab_size: 50277
+  hidden_size: 512
+  num_layers: 8                    # canonical name (NOT num_hidden_layers)
+  num_attention_heads: 8
+  intermediate_size: 1408
+  max_position_embeddings: 512
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000.0
+  tie_word_embeddings: true
+  gradient_checkpointing: true
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  seq_length: 512
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 50
+  precision: bf16
+  gradient_checkpointing: true
+
+metadata:
+  run: "run7"
+  config_name: "laptop_dense_run7"
+  config_version: "7.0"
+  strict_loader: true              # loaded by training/config_loader.py
+  # Tokenizer
+  tokenizer_id: "EleutherAI/gpt-neox-20b"
+  tokenizer_vocab_size: 50277
+  tokenizer_license: "Apache 2.0"
+  # Parameter counts (programmatically computed from config fields above)
+  total_params: 51440640
+  total_params_approx_m: 51.44
+  params_verified_by: "scripts/run_laptop_validation_pipeline.py"
+  params_tolerance_pct: 1.0
+  # VRAM estimates — NOT verified on hardware
+  weight_memory_gb: 0.103
+  estimated_peak_vram_gb: 0.67
+  vram_target_gb: 6.50
+  vram_estimate_verified: false
+  # Dataset
+  dataset_id: "Salesforce/wikitext"
+  dataset_config: "wikitext-2-raw-v1"
+  dataset_split: "train"
+  dataset_license_note: >-
+    Hugging Face metadata lists CC BY-SA 3.0 and GFDL. Dataset card text states
+    CC BY-SA 4.0. Use for technical validation only pending governance review.
+  # Hardware target
+  blackwell_compatible: true
+  min_pytorch_version: "2.7.1+cu128"
+  notes: >
+    Run 7 dense validation config. Uses canonical DenseConfig field names.
+    Loaded via strict config_loader.py — unknown keys halt execution.
+    Parameter counts are computed from config fields and verified at runtime
+    by constructing the actual model. Do not use YAML comments as measured facts.

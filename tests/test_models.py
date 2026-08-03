@@ -183,11 +183,24 @@ class TestTopKRouter:
         assert aux_loss.item() >= 0
 
     def test_metrics_keys(self, router):
+        """
+        Router metrics must contain all REQUIRED_ACCEPTANCE_KEYS from
+        training/router_metrics.py.
+
+        The old ad-hoc keys (expert_counts, load_imbalance_ratio, router_entropy)
+        were removed in Run 7 when the shared schema was introduced.
+        This test asserts the canonical schema keys instead.
+        """
+        import sys, pathlib
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+        from training.router_metrics import REQUIRED_ACCEPTANCE_KEYS
         x = torch.randn(32, 64)
         _, _, _, metrics = router(x)
-        assert "expert_counts" in metrics
-        assert "load_imbalance_ratio" in metrics
-        assert "router_entropy" in metrics
+        missing = [k for k in REQUIRED_ACCEPTANCE_KEYS if k not in metrics]
+        assert not missing, (
+            f"Router metrics missing REQUIRED_ACCEPTANCE_KEYS: {missing}. "
+            f"Present keys: {sorted(metrics.keys())}"
+        )
 
     def test_aux_loss_backward(self, router):
         x = torch.randn(32, 64, requires_grad=True)

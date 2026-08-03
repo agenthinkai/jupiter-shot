@@ -3,10 +3,72 @@
 > **Branch:** `fix/rtx50-blackwell-validation`
 > **Operator:** Kishore
 > **Purpose:** Execute Month 1 GPU gates on a single laptop GPU in Kuwait
-> **Status:** ENVIRONMENT BLOCKED — REPAIRABLE
-> **Blocker:** RTX 5060 Laptop GPU (Blackwell, sm_120) requires PyTorch 2.7.1+cu128. Installed version was 2.2.2+cu121 which does not include sm_120 kernels.
-> **Resolution:** Run `scripts/windows/run_all_laptop_validation.bat` — it now auto-detects Blackwell and installs the correct wheel.
+> **Status:** BLACKWELL ENVIRONMENT PASS — TRAINING RUNNER REPAIRED (Run 2)
+> **Run 1 result:** Environment unblocked — PyTorch 2.7.1+cu128 installed, CUDA kernel test passes, sm_120 confirmed.
+> **Run 2 result:** Training runner crashes fixed — dict API mismatch, deprecated GradScaler, real-text mode, failure artifacts.
+> **Next gate:** Single-GPU CUDA validation in Kuwait (Kishore executes `run_all_laptop_validation.bat`).
 > **See also:** [docs/BLACKWELL_ENVIRONMENT.md](BLACKWELL_ENVIRONMENT.md)
+
+---
+
+## Run 2 Repair Summary (2026-08-03)
+
+### Root Cause
+
+All three training runners (`run_laptop_dense.py`, `run_laptop_moe.py`, `run_laptop_resume_test.py`) crashed at the first forward pass because they treated the model's dict output as a bare tensor or tuple. The model API contract is:
+
+```python
+out = model(input_ids=input_ids, labels=labels)  # → dict
+loss = out["loss"]   # scalar tensor
+logits = out["logits"]  # (batch, seq_len, vocab_size)
+```
+
+The runners were calling `model(input_ids)` (no `labels=` keyword) and then calling `.backward()` directly on the dict object, which raises `AttributeError: 'dict' object has no attribute 'backward'`.
+
+### Fixes Applied (Run 2)
+
+| File | Fix |
+|------|-----|
+| `run_laptop_dense.py` | `out = model(input_ids=input_ids, labels=labels)` → `loss = out["loss"] / grad_accum` |
+| `run_laptop_dense.py` | `torch.cuda.amp.GradScaler` → `torch.amp.GradScaler("cuda", ...)` (deprecated API removed) |
+| `run_laptop_dense.py` | Real-text mode: Wikitext-2 (MIT) via HuggingFace datasets with synthetic fallback |
+| `run_laptop_dense.py` | Failure artifact: JSON with full traceback saved on exception |
+| `run_laptop_moe.py` | `out = model(input_ids=input_ids, labels=labels)` → `loss = out["loss"]`, `aux = out["aux_loss"]` |
+| `run_laptop_moe.py` | Router metrics: `out["router_metrics"]` (list of per-layer dicts) instead of module hook |
+| `run_laptop_moe.py` | `torch.cuda.amp.GradScaler` → `torch.amp.GradScaler("cuda", ...)` |
+| `run_laptop_moe.py` | Real-text mode + failure artifact saving |
+| `run_laptop_moe.py` | MoE acceptance checks: dropped_token_pct, utilization_cv, router_entropy |
+| `run_laptop_resume_test.py` | `out = model(input_ids=input_ids, labels=labels)` → `loss = out["loss"]` |
+| `run_laptop_resume_test.py` | `torch.load(path)` → `torch.load(path, weights_only=True)` (FutureWarning removed) |
+| `tests/test_runner_integration.py` | 54 new CPU-compatible integration tests (10 test classes) |
+
+### What Run 2 Validates
+
+- Model dict output API is correctly consumed by all runners
+- GradScaler uses the non-deprecated `torch.amp` namespace
+- Wikitext-2 real-text training mode works (with synthetic fallback)
+- Failure artifacts are saved on crash for post-mortem analysis
+- MoE router metrics are read from the forward output dict
+- Checkpoint save/load with `weights_only=True` works correctly
+
+### What Run 2 Does NOT Validate
+
+- 8× A100 distributed training
+- DeepSpeed NCCL multi-node communication
+- Full 1.3B parameter training run
+- 20T scalability
+- Thermal behaviour on the Kuwait laptop (requires physical execution)
+
+### Next Step for Kishore
+
+Run `scripts\windows\run_all_laptop_validation.bat` on the Kuwait RTX 5060 laptop. A successful run confirms:
+1. CUDA execution on sm_120 (Blackwell)
+2. Dense training loop (forward, backward, optimizer, checkpoint)
+3. Small MoE routing (expert utilization, aux loss, router entropy)
+4. Checkpoint resume (integrity and continuity)
+5. Thermal and memory controls
+
+A successful Kuwait laptop test may authorize Stage B (8× A100 distributed validation). It does **not** automatically authorize 47B MoE training.
 
 ---
 
@@ -256,7 +318,7 @@ The PyTorch 2.7.1+cu128 wheel is approximately 2.5 GB. If the download stalls:
 These results are from a single laptop GPU and do not represent production-scale training:
 
 - **No distributed training** — single GPU only; multi-node not tested
-- **Synthetic data** — results use random token sequences, not real text
+- **Real-text or synthetic data** — runners now support Wikitext-2 (MIT) via `--synthetic` flag to force synthetic; default attempts real text with synthetic fallback
 - **Thermal throttling** — laptop GPUs may throttle after 10–20 minutes; tokens/sec may decrease
 - **Windows overhead** — ~1–1.5 GB VRAM used by Windows/CUDA before training starts
 - **No DeepSpeed** — single-GPU validation does not use DeepSpeed ZeRO
@@ -288,4 +350,4 @@ Once all stages pass, the team will:
 
 ---
 
-*Last updated: 2026-08-03 | Branch: fix/rtx50-blackwell-validation | Repair: RTX 5060 Blackwell (sm_120) compatibility*
+*Last updated: 2026-08-03 (Run 2) | Branch: fix/rtx50-blackwell-validation | Run 1: Blackwell environment unblocked | Run 2: Training runner dict API, GradScaler, real-text mode repaired*

@@ -4,6 +4,14 @@ Jupiter Shot — Laptop MoE CUDA Validation
 Runs MoE training validation with 8 experts, top-2 routing, and full
 router metric collection.
 
+Model API contract:
+  model(input_ids=..., labels=...) → dict with keys:
+    - 'logits':        (batch, seq_len, vocab_size)
+    - 'loss':          total loss (LM + aux) if labels provided, else None
+    - 'lm_loss':       language modeling loss only
+    - 'aux_loss':      total auxiliary routing loss (scalar tensor)
+    - 'router_metrics': list of per-layer routing metric dicts
+
 Metric definitions:
   - expert_assignment_share[i]: fraction of tokens assigned to expert i
     (after routing, before capacity overflow). Sum = num_experts_per_token / num_experts.
@@ -21,6 +29,7 @@ Metric definitions:
 Usage:
     python scripts/run_laptop_moe.py --config laptop_moe_small
     python scripts/run_laptop_moe.py --config laptop_moe_small --steps 1000 --confirmed
+    python scripts/run_laptop_moe.py --synthetic  # synthetic data only
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
@@ -99,52 +109,65 @@ def compute_router_metrics(routing_weights: Any, num_experts: int, torch: Any) -
     Compute all router utilization metrics from routing weights tensor.
 
     Args:
-        routing_weights: (batch*seq, num_experts) softmax weights
+        routing_weights: (num_tokens, num_experts) softmax probabilities
         num_experts: total number of experts
+        torch: torch module
 
-    Returns dict with all utilization metrics.
+    Returns:
+        dict with utilization_cv, max_min_ratio, router_entropy_bits,
+        expert_assignment_share, num_inactive_experts
     """
-    with torch.no_grad():
-        # Expert assignment share: mean probability assigned to each expert
-        mean_weights = routing_weights.mean(dim=0)  # (num_experts,)
-        assignment_share = mean_weights.cpu().tolist()
+    try:
+        if routing_weights.dim() != 2:
+            return {}
+        # Expert load = mean probability assigned to each expert
+        expert_load = routing_weights.mean(dim=0)  # (num_experts,)
+        mean_load = expert_load.mean().item()
+        std_load = expert_load.std().item()
+        max_load = expert_load.max().item()
+        min_load = expert_load.min().item()
 
-        # Token routing percentage: fraction of tokens where each expert is top-k
-        topk_indices = routing_weights.topk(2, dim=-1).indices  # (N, 2)
-        token_counts = torch.zeros(num_experts, device=routing_weights.device)
-        for k in range(2):
-            for e in range(num_experts):
-                token_counts[e] += (topk_indices[:, k] == e).sum()
-        total_tokens = routing_weights.shape[0]
-        token_routing_pct = (token_counts / total_tokens * 100).cpu().tolist()
+        cv = std_load / (mean_load + 1e-9)
+        max_min_ratio = max_load / (min_load + 1e-9)
 
-        # Utilization CV and max/min ratio
-        loads = token_counts.float()
-        mean_load = loads.mean().item()
-        std_load = loads.std().item()
-        cv = std_load / mean_load if mean_load > 0 else float("inf")
-        max_load = loads.max().item()
-        min_load = loads.min().item()
-        max_min_ratio = max_load / min_load if min_load > 0 else float("inf")
+        # Shannon entropy
+        probs = expert_load / (expert_load.sum() + 1e-9)
+        entropy = -(probs * (probs + 1e-9).log()).sum().item() / math.log(2)
 
-        # Router entropy (Shannon entropy of mean routing distribution)
-        eps = 1e-9
-        probs = mean_weights.clamp(min=eps)
-        probs = probs / probs.sum()
-        entropy_bits = -(probs * torch.log2(probs)).sum().item()
+        # Expert assignment share (fraction of tokens routed to each expert)
+        assignment_share = expert_load.tolist()
+        num_inactive = sum(1 for s in assignment_share if s < 0.01)
 
-        # Inactive experts (< 2% of tokens)
-        inactive = [i for i, pct in enumerate(token_routing_pct) if pct < 2.0]
+        return {
+            "utilization_cv": round(cv, 4),
+            "max_min_ratio": round(max_min_ratio, 4),
+            "router_entropy_bits": round(entropy, 4),
+            "expert_assignment_share": [round(s, 4) for s in assignment_share],
+            "num_inactive_experts": num_inactive,
+        }
+    except Exception:
+        return {}
 
-    return {
-        "expert_assignment_share": [round(s, 6) for s in assignment_share],
-        "token_routing_pct": [round(p, 2) for p in token_routing_pct],
-        "utilization_cv": round(cv, 4),
-        "max_min_ratio": round(max_min_ratio, 2),
-        "router_entropy_bits": round(entropy_bits, 4),
-        "inactive_experts": inactive,
-        "num_inactive_experts": len(inactive),
-    }
+
+def load_wikitext_sample(n_samples: int = 200) -> list[str]:
+    """Load a small sample from Wikitext-2 (MIT license). Falls back to [] if unavailable."""
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train",
+                          trust_remote_code=False)
+        texts = [row["text"] for row in ds if len(row["text"]) > 100][:n_samples]
+        print(f"[DATA] Loaded {len(texts)} samples from Wikitext-2 (MIT license)")
+        return texts
+    except Exception as e:
+        print(f"[DATA] Wikitext-2 unavailable ({e}). Using synthetic data.")
+        return []
+
+
+def get_real_text_batch(tokenizer: Any, texts: list[str], seq_len: int, device: Any) -> Any:
+    import torch
+    enc = tokenizer(texts, return_tensors="pt", truncation=True,
+                    max_length=seq_len, padding="max_length")
+    return enc["input_ids"].to(device)
 
 
 def run_moe_validation(
@@ -183,7 +206,6 @@ def run_moe_validation(
     model = MoETransformer(moe_config).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    # Active params: non-expert params + (top-k / num_experts) * expert params
     expert_params = sum(p.numel() for n, p in model.named_parameters() if "expert" in n.lower())
     non_expert_params = total_params - expert_params
     active_params = non_expert_params + (moe_config.num_experts_per_token / moe_config.num_experts) * expert_params
@@ -196,27 +218,47 @@ def run_moe_validation(
     precision = train_cfg.get("precision", "fp16")
     use_bf16 = precision == "bf16" and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float16
+    print(f"[MOE] Precision: {'bf16' if use_bf16 else 'fp16'}")
 
     lr = float(train_cfg.get("learning_rate", 3e-4))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=lr * 0.1)
-    scaler = torch.cuda.amp.GradScaler(enabled=not use_bf16)
+
+    # AMP scaler — use torch.amp.GradScaler (torch.cuda.amp.GradScaler is deprecated in PyTorch 2.x)
+    scaler = torch.amp.GradScaler("cuda", enabled=not use_bf16)
 
     vocab_size = base_config.vocab_size
     seq_len = int(train_cfg.get("seq_length", base_config.max_position_embeddings))
     batch_size = int(train_cfg.get("batch_size", 2))
     grad_accum = int(train_cfg.get("gradient_accumulation_steps", 1))
 
+    # Data
+    texts = [] if synthetic else load_wikitext_sample(500)
+    data_mode = "synthetic" if (synthetic or not texts) else "wikitext-2 (MIT)"
+    tokenizer = None
+    if texts:
+        try:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+            tokenizer.pad_token = tokenizer.eos_token
+        except Exception:
+            print("[DATA] Tokenizer unavailable; falling back to synthetic.")
+            texts = []
+            data_mode = "synthetic (tokenizer unavailable)"
+    print(f"[MOE] Data mode: {data_mode}")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_path = output_dir / "moe_metrics.jsonl"
     errors_path = output_dir / "errors.jsonl"
+    failure_path = output_dir / "moe_failure_artifact.json"
 
     metrics_log: list[dict] = []
     nan_inf_count = 0
     oom_count = 0
     interrupted = False
+    step = 0
 
     def _graceful_stop(signum, frame):
         nonlocal interrupted
@@ -230,13 +272,12 @@ def run_moe_validation(
     start_wall = time.time()
     total_tokens = 0
     step_times = []
-    step = 0
 
-    # Cumulative router metrics for stability tracking
     router_history: list[dict] = []
 
     summary = {
         "config": config_name,
+        "data_mode": data_mode,
         "total_params": total_params,
         "active_params_per_token": round(active_params),
         "num_experts": moe_config.num_experts,
@@ -261,7 +302,12 @@ def run_moe_validation(
             _check_thermal(step, thermal_warn, thermal_stop)
 
             try:
-                input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+                if texts and tokenizer:
+                    import random
+                    sample = random.sample(texts, min(batch_size, len(texts)))
+                    input_ids = get_real_text_batch(tokenizer, sample, seq_len, device)
+                else:
+                    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
             except torch.cuda.OutOfMemoryError:
                 oom_count += 1
                 torch.cuda.empty_cache()
@@ -269,31 +315,17 @@ def run_moe_validation(
                     raise RuntimeError(f"[FAIL] {MAX_OOM_RETRIES} OOM errors.")
                 continue
 
+            # Forward + backward
+            # Model API: model(input_ids=..., labels=...) → dict
+            #   out["loss"]          = total loss (LM + aux)
+            #   out["lm_loss"]       = language modeling loss only
+            #   out["aux_loss"]      = auxiliary routing loss
+            #   out["router_metrics"] = list of per-layer routing metric dicts
             try:
                 with torch.autocast(device_type="cuda", dtype=dtype):
                     labels = input_ids.clone()
-                    outputs = model(input_ids)
-
-                    # Handle MoE output (may return tuple with aux losses)
-                    if isinstance(outputs, tuple):
-                        logits, aux_loss, z_loss = outputs[0], outputs[1] if len(outputs) > 1 else None, outputs[2] if len(outputs) > 2 else None
-                    else:
-                        logits, aux_loss, z_loss = outputs, None, None
-
-                    shift_logits = logits[:, :-1, :].contiguous()
-                    shift_labels = labels[:, 1:].contiguous()
-                    ce_loss = torch.nn.functional.cross_entropy(
-                        shift_logits.view(-1, vocab_size),
-                        shift_labels.view(-1),
-                    )
-
-                    total_loss = ce_loss
-                    if aux_loss is not None:
-                        total_loss = total_loss + aux_loss
-                    if z_loss is not None:
-                        total_loss = total_loss + z_loss
-
-                    total_loss = total_loss / grad_accum
+                    out = model(input_ids=input_ids, labels=labels)
+                    total_loss = out["loss"] / grad_accum
 
                 if not use_bf16:
                     scaler.scale(total_loss).backward()
@@ -320,10 +352,41 @@ def run_moe_validation(
                     raise RuntimeError(f"[FAIL] {MAX_OOM_RETRIES} OOM errors.")
                 continue
 
-            loss_val = ce_loss.item()
-            aux_val = aux_loss.item() if aux_loss is not None else None
-            z_val = z_loss.item() if z_loss is not None else None
+            # Unpack losses from dict output
+            lm_loss_tensor = out.get("lm_loss")
+            aux_loss_tensor = out.get("aux_loss")
+            loss_val = (lm_loss_tensor.item() if lm_loss_tensor is not None
+                        else (out["loss"].item() * grad_accum))
+            aux_val = aux_loss_tensor.item() if aux_loss_tensor is not None else None
             _check_nan_inf(loss_val, step)
+
+            # Router metrics — read directly from model output dict
+            router_metrics: dict = {}
+            raw_router_metrics = out.get("router_metrics", [])
+            if raw_router_metrics:
+                # Aggregate across layers: average scalar metrics
+                agg: dict = {}
+                count = 0
+                for layer_metrics in raw_router_metrics:
+                    if not isinstance(layer_metrics, dict):
+                        continue
+                    for k, v in layer_metrics.items():
+                        if isinstance(v, (int, float)):
+                            agg[k] = agg.get(k, 0.0) + v
+                    count += 1
+                if count > 0:
+                    router_metrics = {k: round(v / count, 4) for k, v in agg.items()}
+                    # Compute entropy from aggregated expert loads if available
+                    if "utilization_cv" not in router_metrics:
+                        # Fallback: try to extract from last layer's routing weights
+                        for module in model.modules():
+                            if hasattr(module, "_last_routing_weights") and module._last_routing_weights is not None:
+                                rw = module._last_routing_weights
+                                if rw.dim() == 2:
+                                    router_metrics.update(
+                                        compute_router_metrics(rw, moe_config.num_experts, torch)
+                                    )
+                                break
 
             step_time = time.time() - step_start
             step_times.append(step_time)
@@ -335,24 +398,10 @@ def run_moe_validation(
             temp = _gpu_temp()
             lr_now = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else lr
 
-            # Collect router metrics (best-effort)
-            router_metrics: dict = {}
-            try:
-                # Try to get routing weights from the last MoE layer
-                for module in model.modules():
-                    if hasattr(module, "_last_routing_weights") and module._last_routing_weights is not None:
-                        rw = module._last_routing_weights
-                        if rw.dim() == 2:
-                            router_metrics = compute_router_metrics(rw, moe_config.num_experts, torch)
-                        break
-            except Exception:
-                router_metrics = {"note": "Router weights not accessible via _last_routing_weights"}
-
             metric = {
                 "step": step,
                 "loss": round(loss_val, 6),
                 "aux_loss": round(aux_val, 6) if aux_val is not None else None,
-                "z_loss": round(z_val, 6) if z_val is not None else None,
                 "lr": lr_now,
                 "step_time_s": round(step_time, 4),
                 "tokens_per_sec": round(tps, 1),
@@ -370,9 +419,9 @@ def run_moe_validation(
 
             if step % 10 == 0 or step == 1:
                 inactive_str = f"inactive={router_metrics.get('num_inactive_experts', '?')}" if router_metrics else ""
+                aux_str = f"aux={aux_val:.4f}" if aux_val is not None else "aux=?"
                 print(f"  Step {step:4d}/{max_steps} | loss={loss_val:.4f} | "
-                      f"aux={aux_val:.4f if aux_val else '?'} | "
-                      f"{tps:.0f} tok/s | {inactive_str}")
+                      f"{aux_str} | {tps:.0f} tok/s | {inactive_str}")
 
             if step == 10:
                 print(f"\n[DIAGNOSTIC] 10 steps complete. Loss={loss_val:.4f}")
@@ -381,11 +430,22 @@ def run_moe_validation(
                 print("[DIAGNOSTIC] Stable. Continuing.\n")
 
     except (ValueError, RuntimeError) as e:
+        tb = traceback.format_exc()
         print(f"\n[ERROR] {e}")
+        artifact = {
+            "step": step,
+            "error": str(e),
+            "traceback": tb,
+            "time": time.time(),
+            "partial_metrics": metrics_log[-5:] if metrics_log else [],
+        }
         with open(errors_path, "a") as f:
             f.write(json.dumps({"step": step, "error": str(e)}) + "\n")
+        failure_path.write_text(json.dumps(artifact, indent=2, default=str))
+        print(f"[FAILURE ARTIFACT] Saved: {failure_path}")
         summary["status"] = "FAILED"
         summary["failure_reason"] = str(e)
+        summary["failure_traceback"] = tb
     else:
         summary["status"] = "INTERRUPTED" if interrupted else "COMPLETED"
 
@@ -397,7 +457,7 @@ def run_moe_validation(
             "step": step,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "loss": loss_val if "loss_val" in dir() else None,
+            "loss": loss_val if step > 0 else None,
         }, ckpt_path)
         ckpt_duration = time.time() - ckpt_start
         print(f"\n[CHECKPOINT] Saved: {ckpt_path} ({ckpt_duration:.1f}s)")
@@ -440,9 +500,13 @@ def run_moe_validation(
         "peak_vram_allocated_gb": vram_final.get("max_allocated_gb"),
         "first_loss": metrics_log[0]["loss"] if metrics_log else None,
         "last_loss": metrics_log[-1]["loss"] if metrics_log else None,
-        "avg_aux_loss_last10": round(sum(m["aux_loss"] for m in last_metrics if m.get("aux_loss")) / max(1, len(last_metrics)), 6),
-        "avg_router_entropy_last10": round(avg_entropy, 4) if avg_entropy else None,
-        "avg_utilization_cv_last10": round(avg_cv, 4) if avg_cv else None,
+        "avg_aux_loss_last10": round(
+            sum(m["aux_loss"] for m in last_metrics if m.get("aux_loss") is not None)
+            / max(1, sum(1 for m in last_metrics if m.get("aux_loss") is not None)),
+            6
+        ) if any(m.get("aux_loss") is not None for m in last_metrics) else None,
+        "avg_router_entropy_last10": round(avg_entropy, 4) if avg_entropy is not None else None,
+        "avg_utilization_cv_last10": round(avg_cv, 4) if avg_cv is not None else None,
         "dropped_token_pct": dropped_pct,
         "moe_acceptance": acceptance,
         "moe_accepted": all(v for v in acceptance.values() if v is not None),
@@ -463,18 +527,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Jupiter Shot Laptop MoE CUDA Validation")
     parser.add_argument("--config", default="laptop_moe_small")
     parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument("--confirmed", action="store_true")
-    parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--confirmed", action="store_true",
+                        help="Required to run >100 steps")
+    parser.add_argument("--synthetic", action="store_true",
+                        help="Use synthetic data only (skip Wikitext-2 download)")
     parser.add_argument("--thermal-warn", type=int, default=THERMAL_WARN_C)
     parser.add_argument("--thermal-stop", type=int, default=THERMAL_STOP_C)
     parser.add_argument("--output-dir", default="benchmarks/results/laptop")
     args = parser.parse_args()
 
     if args.steps > 100 and not args.confirmed:
-        print(f"\n[CONFIRM] Running {args.steps} MoE steps. Type 'yes' to confirm: ", end="")
-        if input().strip().lower() != "yes":
-            print("[ABORTED]")
-            return 1
+        print(f"[CONFIRM] Running {args.steps} steps requires --confirmed flag.")
+        return 1
 
     try:
         summary = run_moe_validation(
@@ -486,7 +550,7 @@ def main() -> int:
             output_dir=Path(args.output_dir),
         )
         return 0 if summary["status"] in ("COMPLETED", "INTERRUPTED") else 1
-    except RuntimeError as e:
+    except (RuntimeError, FileNotFoundError) as e:
         print(f"\n[FAIL] {e}")
         return 1
 

@@ -4,6 +4,11 @@ Jupiter Shot — Laptop Dense CUDA Validation
 Runs real CUDA forward and backward passes using the repository's actual
 DenseTransformer implementation. Collects all required metrics.
 
+Model API contract:
+  model(input_ids=..., labels=...) → dict with keys:
+    - 'logits': (batch, seq_len, vocab_size)
+    - 'loss': total loss (LM loss) if labels provided, else None
+
 Execution stages:
   1. 10 diagnostic steps (stop on NaN/Inf)
   2. 100 steps if diagnostics pass
@@ -15,6 +20,7 @@ Safety controls:
   - Stop on repeated CUDA OOM
   - Graceful checkpoint on CTRL+C or SIGTERM
   - Frequent metric persistence
+  - Failure artifact saved on exception
 
 Usage:
     python scripts/run_laptop_dense.py --config laptop_dense_small
@@ -31,6 +37,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
@@ -184,7 +191,6 @@ def run_dense_validation(
 
     # Activation checkpointing
     if train_cfg.get("gradient_checkpointing", False):
-        from torch.utils.checkpoint import checkpoint
         print("[DENSE] Gradient checkpointing: enabled")
 
     # Optimizer
@@ -222,12 +228,14 @@ def run_dense_validation(
 
     metrics_path = output_dir / "dense_metrics.jsonl"
     errors_path = output_dir / "errors.jsonl"
+    failure_path = output_dir / "dense_failure_artifact.json"
 
     # State
     metrics_log: list[dict] = []
     nan_inf_count = 0
     oom_count = 0
     interrupted = False
+    step = 0
 
     # CTRL+C / SIGTERM handler
     def _graceful_stop(signum, frame):
@@ -238,8 +246,8 @@ def run_dense_validation(
     signal.signal(signal.SIGINT, _graceful_stop)
     signal.signal(signal.SIGTERM, _graceful_stop)
 
-    # AMP scaler
-    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+    # AMP scaler — use torch.amp.GradScaler (torch.cuda.amp.GradScaler is deprecated in PyTorch 2.x)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
     torch.cuda.reset_peak_memory_stats()
     start_wall = time.time()
@@ -289,18 +297,14 @@ def run_dense_validation(
                 continue
 
             # Forward + backward
+            # Model API: model(input_ids=..., labels=...) → dict
+            #   out["loss"]   = cross-entropy loss (scalar tensor)
+            #   out["logits"] = (batch, seq_len, vocab_size)
             try:
                 with torch.autocast(device_type="cuda", dtype=dtype):
                     labels = input_ids.clone()
-                    logits = model(input_ids)
-                    # Shift for causal LM loss
-                    shift_logits = logits[:, :-1, :].contiguous()
-                    shift_labels = labels[:, 1:].contiguous()
-                    loss = torch.nn.functional.cross_entropy(
-                        shift_logits.view(-1, vocab_size),
-                        shift_labels.view(-1),
-                    )
-                    loss = loss / grad_accum
+                    out = model(input_ids=input_ids, labels=labels)
+                    loss = out["loss"] / grad_accum
 
                 if use_fp16:
                     scaler.scale(loss).backward()
@@ -374,23 +378,34 @@ def run_dense_validation(
                 print("[DIAGNOSTIC] Stable. Continuing.\n")
 
     except (ValueError, RuntimeError) as e:
+        tb = traceback.format_exc()
         print(f"\n[ERROR] {e}")
+        # Save failure artifact with full traceback and partial metrics
+        artifact = {
+            "step": step,
+            "error": str(e),
+            "traceback": tb,
+            "time": time.time(),
+            "partial_metrics": metrics_log[-5:] if metrics_log else [],
+        }
         with open(errors_path, "a") as f:
             f.write(json.dumps({"step": step, "error": str(e), "time": time.time()}) + "\n")
+        failure_path.write_text(json.dumps(artifact, indent=2, default=str))
+        print(f"[FAILURE ARTIFACT] Saved: {failure_path}")
         summary["status"] = "FAILED"
         summary["failure_reason"] = str(e)
+        summary["failure_traceback"] = tb
     else:
         summary["status"] = "INTERRUPTED" if interrupted else "COMPLETED"
 
     # Save checkpoint
     ckpt_path = ckpt_dir / f"dense_{config_name}_step{step}.pt"
     try:
-        import torch
         torch.save({
             "step": step,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "loss": loss_val if "loss_val" in dir() else None,
+            "loss": loss_val if step > 0 else None,
             "config": config_name,
         }, ckpt_path)
         print(f"\n[CHECKPOINT] Saved: {ckpt_path}")
@@ -450,13 +465,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.steps > 100 and not args.confirmed:
-        print(f"\n[CONFIRM] You are about to run {args.steps} training steps.")
-        print(f"  Config: {args.config}")
-        print(f"  This may take significant time and GPU resources.")
-        resp = input("  Type 'yes' to confirm: ").strip().lower()
-        if resp != "yes":
-            print("[ABORTED] Run cancelled.")
-            return 1
+        print(f"[CONFIRM] Running {args.steps} steps requires --confirmed flag.")
+        print("  Add --confirmed to proceed with extended run.")
+        return 1
 
     try:
         summary = run_dense_validation(
@@ -468,7 +479,7 @@ def main() -> int:
             output_dir=Path(args.output_dir),
         )
         return 0 if summary["status"] in ("COMPLETED", "INTERRUPTED") else 1
-    except RuntimeError as e:
+    except (RuntimeError, FileNotFoundError) as e:
         print(f"\n[FAIL] {e}")
         return 1
 

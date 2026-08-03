@@ -3,6 +3,11 @@ Jupiter Shot — Laptop Checkpoint Resume Test
 =============================================
 Verifies checkpoint save, load, and training continuity.
 
+Model API contract:
+  model(input_ids=..., labels=...) → dict with keys:
+    - 'loss':   scalar tensor (cross-entropy loss)
+    - 'logits': (batch, seq_len, vocab_size)
+
 Tests:
   1. Run N steps and save checkpoint
   2. Load checkpoint into fresh model
@@ -35,22 +40,21 @@ CKPT_DIR = REPO_ROOT / "checkpoints" / "laptop"
 def run_steps(model: Any, optimizer: Any, scheduler: Any, device: Any,
               vocab_size: int, seq_len: int, batch_size: int,
               n_steps: int, torch: Any) -> list[float]:
-    """Run n_steps and return loss values."""
+    """Run n_steps and return loss values.
+
+    Uses the model's dict output API:
+        out = model(input_ids=input_ids, labels=labels)
+        loss = out["loss"]
+    """
     import torch as th
     losses = []
     model.train()
     for _ in range(n_steps):
         input_ids = th.randint(0, vocab_size, (batch_size, seq_len), device=device)
         labels = input_ids.clone()
-        logits = model(input_ids)
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        loss = th.nn.functional.cross_entropy(
-            shift_logits.view(-1, vocab_size),
-            shift_labels.view(-1),
-        )
+        # Model returns dict — unpack loss directly
+        out = model(input_ids=input_ids, labels=labels)
+        loss = out["loss"]
         optimizer.zero_grad()
         loss.backward()
         th.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -144,7 +148,8 @@ def run_resume_test(
     opt_b = torch.optim.AdamW(model_b.parameters(), lr=lr)
     sched_b = torch.optim.lr_scheduler.CosineAnnealingLR(opt_b, T_max=initial_steps + resume_steps)
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # weights_only=True avoids the FutureWarning in PyTorch 2.x and is safer
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     model_b.load_state_dict(ckpt["model_state_dict"])
     opt_b.load_state_dict(ckpt["optimizer_state_dict"])
     sched_b.load_state_dict(ckpt["scheduler_state_dict"])
@@ -179,11 +184,11 @@ def run_resume_test(
     print(f"  Resumed loss at step {initial_steps + resume_steps}: {loss_resumed_end:.6f}")
     print(f"  Reference loss at same step: {loss_ref_end:.6f}")
 
-    # Loss continuity: resumed loss should be within 5% of reference
+    # Loss continuity: resumed loss should be within 10% of reference
     # (exact match not expected due to random batch sampling)
     continuity_delta = abs(loss_resumed_end - loss_ref_end)
     continuity_pct = continuity_delta / max(abs(loss_ref_end), 1e-9) * 100
-    continuity_pass = continuity_pct < 10.0  # within 10% is acceptable with random batches
+    continuity_pass = continuity_pct < 10.0
     result["tests"]["loss_continuity"] = {
         "passed": continuity_pass,
         "reference_loss": round(loss_ref_end, 6),

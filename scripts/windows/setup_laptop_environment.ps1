@@ -1,10 +1,15 @@
 # Jupiter Shot — Kuwait Laptop Environment Setup
 # PowerShell script for Windows GPU laptop setup
-# Run as Administrator in PowerShell
-
+#
+# RTX 50-series / Blackwell note:
+#   This script auto-detects Blackwell GPUs (sm_120) and installs
+#   PyTorch 2.7.1+cu128 instead of 2.2.2+cu121.
+#
+# Run as Administrator in PowerShell:
+#   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+#   .\scripts\windows\setup_laptop_environment.ps1
 param(
     [string]$PythonVersion = "3.11",
-    [string]$CudaVersion = "cu121",
     [switch]$Force = $false
 )
 
@@ -18,14 +23,32 @@ Write-Host ""
 # ── Step 1: Check prerequisites ───────────────────────────────────────────────
 Write-Host "[1/8] Checking prerequisites..." -ForegroundColor Yellow
 
-# Check Python
+# Check Python — must be 3.10 or 3.11
 try {
-    $pythonVer = python --version 2>&1
-    Write-Host "  Python: $pythonVer" -ForegroundColor Green
+    $pythonVerRaw = python --version 2>&1
+    Write-Host "  Detected: $pythonVerRaw" -ForegroundColor Green
 } catch {
-    Write-Host "  [ERROR] Python not found. Install Python $PythonVersion from https://python.org" -ForegroundColor Red
+    Write-Host "  [ERROR] Python not found on PATH." -ForegroundColor Red
+    Write-Host "  Install Python 3.11.9 from: https://www.python.org/downloads/release/python-3119/" -ForegroundColor Red
+    Write-Host "  Ensure 'Add Python to PATH' is checked during installation." -ForegroundColor Red
     exit 1
 }
+
+# Enforce Python 3.10 or 3.11 — reject all other versions
+$pyVersionCheck = python -c "import sys; v=sys.version_info; ok=(v.major==3 and v.minor in (10,11)); print('OK' if ok else f'UNSUPPORTED_{v.major}.{v.minor}')" 2>&1
+if ($pyVersionCheck -notmatch "^OK") {
+    $detected = $pyVersionCheck -replace "UNSUPPORTED_", ""
+    Write-Host "" -ForegroundColor Red
+    Write-Host "  [ERROR] Unsupported Python version: $detected" -ForegroundColor Red
+    Write-Host "  Jupiter Shot requires Python 3.10 or 3.11." -ForegroundColor Red
+    Write-Host "  Python 3.12+ is not yet supported." -ForegroundColor Red
+    Write-Host "  Python 3.9 and below are not supported." -ForegroundColor Red
+    Write-Host "" -ForegroundColor Red
+    Write-Host "  Download Python 3.11.9 (recommended):" -ForegroundColor Yellow
+    Write-Host "    https://www.python.org/downloads/release/python-3119/" -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "  Python version is supported." -ForegroundColor Green
 
 # Check pip
 try {
@@ -45,10 +68,23 @@ try {
     exit 1
 }
 
-# Check NVIDIA driver
+# Check NVIDIA driver and detect compute capability
+$isBlackwell = $false
+$gpuCC = "unknown"
 try {
     $nvidiaSmi = nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1
     Write-Host "  NVIDIA GPU: $nvidiaSmi" -ForegroundColor Green
+    # Detect compute capability
+    $ccRaw = nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>&1
+    $gpuCC = $ccRaw.Trim().Split("`n")[0].Trim()
+    Write-Host "  Compute capability: $gpuCC" -ForegroundColor Green
+    # Blackwell = compute capability >= 12.0
+    $ccMajor = [int]($gpuCC.Split(".")[0])
+    if ($ccMajor -ge 12) {
+        $isBlackwell = $true
+        Write-Host "  RTX 50-series / Blackwell GPU detected (sm_120)." -ForegroundColor Cyan
+        Write-Host "  Will install PyTorch 2.7.1+cu128 for sm_120 support." -ForegroundColor Cyan
+    }
 } catch {
     Write-Host "  [WARNING] nvidia-smi not found. CUDA validation will fail." -ForegroundColor Yellow
     Write-Host "  Install NVIDIA drivers from https://www.nvidia.com/drivers" -ForegroundColor Yellow
@@ -83,43 +119,85 @@ Write-Host "[3/8] Upgrading pip..." -ForegroundColor Yellow
 python -m pip install --upgrade pip setuptools wheel
 Write-Host "  pip upgraded" -ForegroundColor Green
 
-# ── Step 4: Install PyTorch with CUDA ────────────────────────────────────────
+# ── Step 4: Select and install PyTorch (architecture-aware) ──────────────────
 Write-Host ""
-Write-Host "[4/8] Installing PyTorch with CUDA ($CudaVersion)..." -ForegroundColor Yellow
-Write-Host "  This may take 5–15 minutes depending on internet speed."
+Write-Host "[4/8] Installing PyTorch (architecture-aware)..." -ForegroundColor Yellow
 
-$torchIndex = "https://download.pytorch.org/whl/$CudaVersion"
-pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url $torchIndex
-
-# Verify CUDA
-$cudaCheck = python -c "import torch; print('CUDA:', torch.cuda.is_available(), '| Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')" 2>&1
-Write-Host "  $cudaCheck" -ForegroundColor Green
-
-# ── Step 5: Install core dependencies ────────────────────────────────────────
-Write-Host ""
-Write-Host "[5/8] Installing pinned dependencies from requirements.txt..." -ForegroundColor Yellow
-Write-Host "  This installs exactly the versions pinned in requirements.txt."
-
-if (Test-Path "requirements.txt") {
-    pip install -r requirements.txt
-    Write-Host "  All pinned dependencies installed from requirements.txt" -ForegroundColor Green
+if ($isBlackwell) {
+    $torchVersion = "2.7.1"
+    $cudaVersion = "cu128"
+    $torchIndex = "https://download.pytorch.org/whl/cu128"
+    Write-Host "  Blackwell GPU: installing PyTorch $torchVersion+$cudaVersion" -ForegroundColor Cyan
 } else {
-    Write-Host "  [ERROR] requirements.txt not found. Ensure you are in the repo root." -ForegroundColor Red
+    $torchVersion = "2.2.2"
+    $cudaVersion = "cu121"
+    $torchIndex = "https://download.pytorch.org/whl/cu121"
+    Write-Host "  Pre-Blackwell GPU: installing PyTorch $torchVersion+$cudaVersion" -ForegroundColor Cyan
+}
+
+Write-Host ""
+Write-Host "  Download size: approximately 2.3-2.5 GB." -ForegroundColor Yellow
+Write-Host "  This may take 5-30 minutes depending on your internet connection." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  Manual fallback (if this step stalls):" -ForegroundColor Gray
+Write-Host "    pip install torch==$torchVersion --index-url $torchIndex" -ForegroundColor Gray
+Write-Host "  Then re-run this script with -Force." -ForegroundColor Gray
+Write-Host ""
+Write-Host "  Antivirus note: if the download stalls at a fixed percentage," -ForegroundColor Gray
+Write-Host "  temporarily disable real-time scanning for the .venv directory." -ForegroundColor Gray
+Write-Host ""
+
+# Install PyTorch only (no torchvision/torchaudio — not needed for validation)
+pip install "torch==$torchVersion" --index-url $torchIndex
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "" -ForegroundColor Red
+    Write-Host "  [ERROR] Failed to install PyTorch $torchVersion+$cudaVersion." -ForegroundColor Red
+    Write-Host "  Troubleshooting:" -ForegroundColor Yellow
+    Write-Host "    1. Check internet connection" -ForegroundColor Yellow
+    Write-Host "    2. Try manual install:" -ForegroundColor Yellow
+    Write-Host "       pip install torch==$torchVersion --index-url $torchIndex" -ForegroundColor Yellow
+    Write-Host "    3. Disable antivirus real-time scanning for .venv during install" -ForegroundColor Yellow
+    Write-Host "    4. Ensure 20 GB free disk space" -ForegroundColor Yellow
+    exit 1
+}
+
+# Verify arch list for Blackwell
+if ($isBlackwell) {
+    $sm120Check = python -c "import torch; print('True' if 'sm_120' in torch.cuda.get_arch_list() else 'False')" 2>&1
+    if ($sm120Check.Trim() -ne "True") {
+        Write-Host "  [WARN] sm_120 not in arch list. Preflight will fail." -ForegroundColor Yellow
+        Write-Host "  Ensure you installed torch==2.7.1+cu128, not an older wheel." -ForegroundColor Yellow
+    } else {
+        Write-Host "  sm_120 support: confirmed" -ForegroundColor Green
+    }
+}
+
+# ── Step 5: Install laptop dependencies ──────────────────────────────────────
+Write-Host ""
+Write-Host "[5/8] Installing laptop-specific dependencies..." -ForegroundColor Yellow
+if (Test-Path "requirements-laptop.txt") {
+    pip install -r requirements-laptop.txt
+    Write-Host "  Installed from requirements-laptop.txt" -ForegroundColor Green
+} elseif (Test-Path "requirements.txt") {
+    Write-Host "  [WARN] requirements-laptop.txt not found, falling back to requirements.txt" -ForegroundColor Yellow
+    pip install -r requirements.txt
+    Write-Host "  Installed from requirements.txt" -ForegroundColor Green
+} else {
+    Write-Host "  [ERROR] Neither requirements-laptop.txt nor requirements.txt found." -ForegroundColor Red
     exit 1
 }
 
 # ── Step 6: Install test dependencies ─────────────────────────────────────────────
 Write-Host ""
 Write-Host "[6/8] Installing test dependencies (pinned)..." -ForegroundColor Yellow
-pip install pytest==8.1.1 pytest-asyncio==0.23.6 datasketch==1.6.4
+pip install pytest==8.2.1 pytest-cov==5.0.0
 Write-Host "  Test dependencies installed" -ForegroundColor Green
 
-# ── Step 7: Optional — DeepSpeed ─────────────────────────────────────────────
+# ── Step 7: Skip DeepSpeed (not needed for laptop validation) ────────────────
 Write-Host ""
-Write-Host "[7/8] DeepSpeed (optional, skip if install fails)..." -ForegroundColor Yellow
-Write-Host "  DeepSpeed on Windows requires Visual Studio Build Tools."
-Write-Host "  Skipping DeepSpeed — single-GPU validation does not require it."
-Write-Host "  To install: pip install deepspeed (requires MSVC)" -ForegroundColor Gray
+Write-Host "[7/8] DeepSpeed (skipped — not required for laptop validation)..." -ForegroundColor Gray
+Write-Host "  DeepSpeed requires Linux + NCCL for multi-GPU training." -ForegroundColor Gray
+Write-Host "  Single-GPU laptop validation does not need it." -ForegroundColor Gray
 
 # ── Step 8: Verify installation ───────────────────────────────────────────────
 Write-Host ""
@@ -143,11 +221,14 @@ if torch.cuda.is_available():
     print(f'  Compute:    {cc[0]}.{cc[1]}')
     print(f'  BF16:       {cc[0] >= 8}')
     print(f'  FP16:       {cc[0] >= 5}')
+    arch_list = torch.cuda.get_arch_list()
+    print(f'  Arch list:  {arch_list}')
 print(f'  NumPy:      {np.__version__}')
 print(f'  PyYAML:     {yaml.__version__}')
 "@
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Setup complete. Run: scripts\windows\run_preflight.bat" -ForegroundColor Cyan
+Write-Host "  Setup complete." -ForegroundColor Cyan
+Write-Host "  Next step: scripts\windows\run_preflight.bat" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan

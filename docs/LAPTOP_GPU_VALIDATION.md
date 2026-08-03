@@ -1,9 +1,12 @@
 # Jupiter Shot — Kuwait Laptop GPU Validation Guide
 
-> **Branch:** `validation/kuwait-laptop-gpu`  
-> **Operator:** Kishore  
-> **Purpose:** Execute Month 1 GPU gates on a single laptop GPU in Kuwait  
-> **Status:** READY — all scripts written and tested on CPU; awaiting GPU execution
+> **Branch:** `fix/rtx50-blackwell-validation`
+> **Operator:** Kishore
+> **Purpose:** Execute Month 1 GPU gates on a single laptop GPU in Kuwait
+> **Status:** ENVIRONMENT BLOCKED — REPAIRABLE
+> **Blocker:** RTX 5060 Laptop GPU (Blackwell, sm_120) requires PyTorch 2.7.1+cu128. Installed version was 2.2.2+cu121 which does not include sm_120 kernels.
+> **Resolution:** Run `scripts/windows/run_all_laptop_validation.bat` — it now auto-detects Blackwell and installs the correct wheel.
+> **See also:** [docs/BLACKWELL_ENVIRONMENT.md](BLACKWELL_ENVIRONMENT.md)
 
 ---
 
@@ -11,7 +14,7 @@
 
 This guide walks Kishore through running the complete Jupiter Shot GPU validation on a Windows laptop with an NVIDIA GPU. The validation covers:
 
-1. Hardware preflight (GPU detection, VRAM measurement, precision support)
+1. Hardware preflight (GPU detection, VRAM measurement, precision support, kernel test)
 2. Dense transformer CUDA training (forward/backward, loss decrease, memory)
 3. Sparse MoE training (routing stability, expert utilization, aux loss)
 4. Checkpoint save and resume (integrity, continuity)
@@ -25,13 +28,15 @@ This guide walks Kishore through running the complete Jupiter Shot GPU validatio
 
 | Requirement | Minimum | Recommended |
 |-------------|---------|-------------|
-| GPU | NVIDIA GTX 1650 (4 GB VRAM) | RTX 3060+ (8 GB VRAM) |
+| GPU | NVIDIA GTX 1650 (4 GB VRAM) | RTX 3060+ (8 GB VRAM) — RTX 5060 Laptop GPU supported |
 | VRAM | 4 GB | 8 GB+ |
 | RAM | 8 GB | 16 GB |
-| CUDA | 11.8 | 12.1 |
+| CUDA | 11.8 | 12.8 (required for RTX 50-series / Blackwell) |
 | Python | 3.10 | 3.11 |
 | OS | Windows 10 | Windows 11 |
-| Disk | 5 GB free | 10 GB free |
+| Disk | 5 GB free | 20 GB free (PyTorch 2.7.1+cu128 is ~2.5 GB) |
+
+> **RTX 50-series (Blackwell) users:** The setup script auto-detects your GPU and installs PyTorch 2.7.1+cu128. No manual action required. See [BLACKWELL_ENVIRONMENT.md](BLACKWELL_ENVIRONMENT.md) for details.
 
 ---
 
@@ -46,19 +51,15 @@ cd C:\path\to\jupiter-shot
 # Allow script execution (one-time)
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
-# Run setup (installs PyTorch, HuggingFace, test deps)
+# Run setup (auto-detects GPU architecture, installs correct PyTorch)
 .\scripts\windows\setup_laptop_environment.ps1
 ```
 
-**If your GPU uses CUDA 11.8 instead of 12.1:**
-```powershell
-.\scripts\windows\setup_laptop_environment.ps1 -CudaVersion cu118
-```
-
 The setup script will:
-- Create a Python virtual environment in `.\venv`
-- Install PyTorch with the correct CUDA version
-- Install all dependencies from `requirements.txt`
+- Check Python version (3.10 or 3.11 required — 3.12+ not yet supported)
+- Detect GPU compute capability (Blackwell sm_120 auto-detected)
+- Install PyTorch 2.7.1+cu128 (Blackwell) or 2.2.2+cu121 (pre-Blackwell)
+- Install all dependencies from `requirements-laptop.txt`
 - Print a summary of your GPU, VRAM, and precision support
 
 ---
@@ -83,7 +84,7 @@ scripts\windows\run_all_laptop_validation.bat 1000
 If the full suite fails at a specific stage, run stages individually:
 
 ```batch
-REM Stage 1: Hardware check
+REM Stage 1: Hardware check (includes CUDA kernel test)
 scripts\windows\run_preflight.bat
 
 REM Stage 2: Dense training
@@ -108,6 +109,8 @@ The preflight script auto-selects the appropriate config. Manual override:
 | 6–8 GB | `laptop_dense_small` | `laptop_moe_small` | 85M / 180M |
 | 10–16 GB | `laptop_dense_medium` | `laptop_moe_medium` | 350M / 700M |
 
+> **RTX 5060 (8 GB VRAM):** Uses `laptop_dense_small` / `laptop_moe_small`. The 1.3B model is not attempted on 8 GB VRAM.
+
 ---
 
 ## What the Scripts Measure
@@ -117,6 +120,7 @@ The preflight script auto-selects the appropriate config. Manual override:
 | Metric | Pass Criterion |
 |--------|----------------|
 | CUDA available | Required |
+| CUDA kernel test | Real matmul must succeed (not just is_available()) |
 | Forward pass | No exception |
 | Backward pass | No exception |
 | NaN/Inf count | 0 |
@@ -153,7 +157,7 @@ All results are saved to `benchmarks/results/laptop/`:
 
 ```
 benchmarks/results/laptop/
-  preflight.json          ← Hardware report
+  preflight.json          ← Hardware report (includes kernel_test section)
   preflight.txt           ← Human-readable preflight summary
   dense_metrics.jsonl     ← Per-step dense metrics (one JSON per line)
   dense_summary.json      ← Dense training summary
@@ -217,6 +221,34 @@ ModuleNotFoundError: No module named 'torch'
 - Right-click `run_all_laptop_validation.bat` → Properties → Unblock
 - Or add the repo folder to Windows Defender exclusions.
 
+### RTX 50-series / Blackwell GPU (sm_120)
+```
+[FAIL] CUDA kernel test failed: CUDA error: no kernel image is available
+       for execution on the device
+Environment is BLOCKED — REPAIRABLE
+```
+This is the expected error when PyTorch 2.2.2+cu121 is installed on a Blackwell GPU.
+**Fix:** The updated `run_all_laptop_validation.bat` auto-detects Blackwell and installs PyTorch 2.7.1+cu128.
+
+If you are running the setup manually:
+```powershell
+pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+```
+Then verify:
+```python
+import torch
+print(torch.cuda.get_arch_list())  # Must include 'sm_120'
+print(torch.cuda.is_available())   # Must be True
+```
+See [docs/BLACKWELL_ENVIRONMENT.md](BLACKWELL_ENVIRONMENT.md) for the full repair guide.
+
+### PyTorch download stalls on Blackwell
+The PyTorch 2.7.1+cu128 wheel is approximately 2.5 GB. If the download stalls:
+1. Temporarily disable antivirus real-time scanning for the `.venv` directory.
+2. Try the manual fallback: `pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128`
+3. Ensure at least 20 GB free disk space.
+4. Check your internet connection — the download requires sustained throughput.
+
 ---
 
 ## Known Limitations
@@ -256,4 +288,4 @@ Once all stages pass, the team will:
 
 ---
 
-*Last updated: 2026-08-02 | Branch: validation/kuwait-laptop-gpu*
+*Last updated: 2026-08-03 | Branch: fix/rtx50-blackwell-validation | Repair: RTX 5060 Blackwell (sm_120) compatibility*

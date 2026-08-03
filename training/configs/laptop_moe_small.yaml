@@ -1,7 +1,15 @@
 # Jupiter Shot — Laptop MoE Small Config
 # Target hardware: 6–8 GB VRAM
+#   Tested: RTX 5060 Laptop GPU (8,151 MiB, Blackwell sm_120)
+#   Also suitable: RTX 3060 6GB, RTX 2070 8GB, RTX 3070 8GB
 # Architecture: 8 experts, top-2 routing, ~180M total / ~55M active
 # Effective VRAM budget: ~5.5 GB
+#
+# RTX 50-series / Blackwell (sm_120) notes:
+#   - Requires PyTorch 2.7.1+cu128 (NOT 2.2.2+cu121)
+#   - BF16 is natively supported and preferred over FP16 on Blackwell
+#   - The run_all_laptop_validation.bat script enforces this config for 8 GB VRAM
+#   - Maximum steps for 8 GB: 10 diagnostic + 100 full validation
 
 model:
   base:
@@ -31,19 +39,26 @@ training:
   weight_decay: 0.1
   max_grad_norm: 1.0
   warmup_steps: 100
-  precision: fp16
+  # Use bf16 on Blackwell (sm_120) / Ampere+; fp16 on older GPUs.
+  # The validation script selects precision automatically via the preflight.
+  precision: bf16  # bf16 preferred on RTX 50-series; change to fp16 for pre-Ampere GPUs
   gradient_checkpointing: true
 
-  # Estimated VRAM (FP16):
+  # Estimated VRAM (BF16, RTX 5060 8 GB):
   # Weights:    ~0.36 GB  (180M × 2 bytes)
   # Gradients:  ~0.36 GB
   # Optimizer:  ~1.08 GB  (180M × 12 bytes)
   # Activations: ~1.0 GB
-  # Total est:  ~2.8 GB   (within 5.5 GB budget)
+  # Total est:  ~2.8 GB   (within 5.5 GB budget; ~2.7 GB headroom on 8 GB VRAM)
 
 metadata:
   tier: "6-8GB"
   total_params_approx_m: 180
   active_params_approx_m: 55
   sparsity_pct: 69
-  notes: "Standard MoE validation config. Tests routing stability and expert utilization at meaningful scale."
+  blackwell_compatible: true
+  min_pytorch_version: "2.7.1+cu128"  # Required for sm_120 (Blackwell)
+  notes: >
+    Standard MoE validation config. Tests routing stability and expert utilization
+    at meaningful scale. Required config for RTX 5060 Laptop GPU (8 GB VRAM,
+    Blackwell sm_120). Gradient checkpointing is required for 8 GB VRAM.

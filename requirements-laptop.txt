@@ -35,6 +35,11 @@ click==8.1.7
 requests==2.32.2
 filelock==3.14.0
 packaging==24.0
+# Run 8 change: fsspec==2024.5.0 → fsspec[http]==2024.3.1
+#   Root cause: datasets==2.19.1 requires fsspec<=2024.3.1
+#   fsspec==2024.5.0 violated that upper bound, making the set unsatisfiable.
+#   fsspec[http] installs the aiohttp extra required by HuggingFace Hub.
+#   Added: pyarrow-hotfix==0.6 (patches CVE-2023-47248; safe with pyarrow 16.1.0)
 # ── Real-text data (required for --data-mode real) ────────────────────────────
 # Dataset:   wikitext-2-raw-v1 (Merity et al., 2016)
 #   Identifier:    "Salesforce/wikitext", config="wikitext-2-raw-v1", split="train"
@@ -58,11 +63,15 @@ tokenizers==0.19.1
 huggingface-hub==0.23.2
 sentencepiece==0.2.0
 safetensors==0.4.3
-fsspec==2024.5.0
+# FIX (Run 8): was fsspec==2024.5.0 — datasets==2.19.1 requires fsspec<=2024.3.1
+# The [http] extra installs aiohttp for HuggingFace Hub streaming support.
+fsspec[http]==2024.3.1
 aiohttp==3.9.5
 multiprocess==0.70.16
 dill==0.3.8
 pyarrow==16.1.0
+# pyarrow-hotfix: patches CVE-2023-47248 in pyarrow <14.0.1; safe with 16.1.0
+pyarrow-hotfix==0.6
 xxhash==3.4.1
 regex==2024.5.15
 # ── Testing ───────────────────────────────────────────────────────────────────

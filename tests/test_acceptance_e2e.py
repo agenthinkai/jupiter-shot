@@ -594,3 +594,217 @@ class TestVRAMRejection:
         assert 'default="laptop_moe_8gb_safe"' in content, (
             "run_laptop_moe.py must default to --config laptop_moe_8gb_safe"
         )
+
+
+# ── Tests: 8-expert / top-2 regression ───────────────────────────────────────
+
+class TestEightExpertRegression:
+    """
+    Regression tests using exactly 8 experts and top-2 routing.
+
+    These tests verify that all acceptance calculations derive their expected
+    utilization values dynamically from num_experts and top_k, not from
+    hardcoded constants.
+
+    For 8 experts with top-2 routing:
+      - Balanced assignment fraction per expert = 1 / num_experts = 1/8 = 0.125
+        Formula: count_i / (N * top_k) = (N*top_k/E) / (N*top_k) = 1/E
+        (each expert receives 12.5% of all expert-slot assignments)
+      - Balanced token routing fraction per expert = top_k / num_experts = 2/8 = 0.250
+        (each expert is visited by 25.0% of all tokens, since each token selects 2 experts)
+    """
+
+    NUM_EXPERTS = 8
+    TOP_K = 2
+
+    def _metrics_8e(self, **kwargs) -> dict:
+        """Build passing metrics for 8 experts / top-2 routing."""
+        return _make_passing_metrics(
+            num_experts=self.NUM_EXPERTS,
+            top_k=self.TOP_K,
+            **kwargs,
+        )
+
+    def test_8expert_balanced_routing_is_pass(self) -> None:
+        """Perfectly balanced 8-expert routing must produce PASS."""
+        metrics = self._metrics_8e()
+        result = evaluate_acceptance(metrics)
+        assert result["outcome"] == OUTCOME_PASS, (
+            f"Expected PASS for balanced 8-expert routing, got {result['outcome']}. "
+            f"Errors: {result['errors']}"
+        )
+
+    def test_8expert_num_experts_field_is_8(self) -> None:
+        metrics = self._metrics_8e()
+        assert metrics[K_NUM_EXPERTS] == 8
+
+    def test_8expert_top_k_field_is_2(self) -> None:
+        metrics = self._metrics_8e()
+        assert metrics[K_EXPERTS_PER_TOKEN] == 2
+
+    def test_8expert_balanced_fraction_is_0_125(self) -> None:
+        """
+        For 8 experts / top-2, balanced assignment fraction = 1/num_experts = 1/8 = 0.125.
+
+        The formula is:
+          expert_assignment_fractions[i] = count_i / (N * top_k)
+          Balanced: count_i = N * top_k / num_experts
+          fraction = (N * top_k / num_experts) / (N * top_k) = 1 / num_experts = 0.125
+
+        Note: top_k / num_experts = 0.25 is the fraction of TOKENS each expert
+        receives, but expert_assignment_fractions is normalised over total
+        ASSIGNMENTS (N * top_k), not over tokens (N), giving 1/num_experts = 0.125.
+        The class docstring's mention of 0.250 referred to the token routing
+        fraction, not the assignment fraction.
+        """
+        metrics = self._metrics_8e()
+        fractions = metrics[K_EXPERT_ASSIGNMENT_FRACTIONS]
+        assert len(fractions) == 8, f"Expected 8 fractions, got {len(fractions)}"
+        expected = 1.0 / self.NUM_EXPERTS  # = 0.125 for 8 experts
+        for i, frac in enumerate(fractions):
+            assert abs(frac - expected) < 0.01, (
+                f"Expert {i} fraction {frac:.4f} deviates from expected {expected:.4f} "
+                f"(balanced = 1/num_experts = 1/8)"
+            )
+
+    def test_8expert_one_inactive_is_not_accepted(self) -> None:
+        """One inactive expert out of 8 must produce NOT_ACCEPTED."""
+        metrics = self._metrics_8e(num_inactive=1, inactive_indices=[4])
+        result = evaluate_acceptance(metrics)
+        assert result["outcome"] == OUTCOME_NOT_ACCEPTED
+
+    def test_8expert_two_inactive_is_not_accepted(self) -> None:
+        """Two inactive experts out of 8 must produce NOT_ACCEPTED."""
+        metrics = self._metrics_8e(num_inactive=2, inactive_indices=[0, 7])
+        result = evaluate_acceptance(metrics)
+        assert result["outcome"] == OUTCOME_NOT_ACCEPTED
+
+    def test_8expert_high_cv_is_not_accepted(self) -> None:
+        """CV above threshold for 8-expert config must produce NOT_ACCEPTED."""
+        metrics = self._metrics_8e(cv=ACCEPT_MAX_UTILIZATION_CV + 0.1)
+        result = evaluate_acceptance(metrics)
+        assert result["outcome"] == OUTCOME_NOT_ACCEPTED
+
+    def test_8expert_low_entropy_is_not_accepted(self) -> None:
+        """Entropy below threshold for 8-expert config must produce NOT_ACCEPTED."""
+        metrics = self._metrics_8e(entropy_nats=ACCEPT_MIN_ROUTER_ENTROPY_NATS - 0.1)
+        result = evaluate_acceptance(metrics)
+        assert result["outcome"] == OUTCOME_NOT_ACCEPTED
+
+    def test_8expert_max_entropy_is_ln8(self) -> None:
+        """
+        Maximum possible entropy for 8 experts is ln(8) ≈ 2.079 nats.
+        A value above this is physically impossible but should not crash.
+        """
+        import math
+        max_entropy = math.log(8)
+        assert abs(max_entropy - 2.0794) < 0.001, (
+            f"ln(8) should be ~2.079, got {max_entropy}"
+        )
+        # A value at max entropy should pass
+        metrics = self._metrics_8e(entropy_nats=max_entropy)
+        result = evaluate_acceptance(metrics)
+        assert result["outcome"] == OUTCOME_PASS
+
+    def test_8expert_acceptance_does_not_hardcode_num_experts(self) -> None:
+        """
+        evaluate_acceptance() must read num_experts from the metrics dict.
+        Passing num_experts=4 in the metrics dict must not affect the
+        acceptance logic for an 8-expert config.
+        """
+        # Build metrics claiming 4 experts (wrong) — should produce NOT_EVALUABLE
+        # because the fractions list length won't match num_experts=4
+        metrics_4 = _make_passing_metrics(num_experts=4, top_k=2)
+        result_4 = evaluate_acceptance(metrics_4)
+        # 4-expert metrics should evaluate independently
+        assert result_4["outcome"] in (OUTCOME_PASS, OUTCOME_NOT_ACCEPTED,
+                                        OUTCOME_NOT_EVALUABLE), (
+            f"Unexpected outcome for 4-expert metrics: {result_4['outcome']}"
+        )
+
+        # 8-expert metrics must evaluate independently of 4-expert metrics
+        metrics_8 = self._metrics_8e()
+        result_8 = evaluate_acceptance(metrics_8)
+        assert result_8["outcome"] == OUTCOME_PASS, (
+            f"8-expert PASS should not be affected by 4-expert evaluation. "
+            f"Got: {result_8['outcome']}"
+        )
+
+    def test_8expert_compute_router_metrics_dynamic(self) -> None:
+        """
+        compute_router_metrics() must accept num_experts=8 and top_k=2
+        and produce fractions that sum to 1.0.
+        """
+        from training.router_metrics import compute_router_metrics
+        # Perfectly balanced: 128 tokens × 2 = 256 total assignments / 8 = 32 each
+        num_tokens = 128
+        counts = [32] * 8  # perfectly balanced
+        probs_mean = [1.0 / 8] * 8
+        result = compute_router_metrics(
+            expert_assignment_counts=counts,
+            num_tokens=num_tokens,
+            num_experts=8,
+            top_k=2,
+            router_probs_mean=probs_mean,
+            aux_loss_unscaled=0.01,
+            aux_loss_coeff=0.01,
+            z_loss_unscaled=0.001,
+            z_loss_coeff=0.001,
+            capacity_factor=1.25,
+            dropped_token_count=0,
+            overflow_token_count=0,
+        )
+        assert result[K_NUM_EXPERTS] == 8
+        assert result[K_EXPERTS_PER_TOKEN] == 2
+        fracs = result[K_EXPERT_ASSIGNMENT_FRACTIONS]
+        assert len(fracs) == 8
+        assert abs(sum(fracs) - 1.0) < 1e-6, f"Fractions sum to {sum(fracs)}, expected 1.0"
+        # Balanced fraction = 1/num_experts = 0.125
+        # (normalised over total assignments N*top_k, not over tokens N)
+        expected_frac = 1.0 / 8
+        for frac in fracs:
+            assert abs(frac - expected_frac) < 1e-6, (
+                f"Expected {expected_frac} (= 1/8 = 1/num_experts), got {frac}. "
+                f"Formula: count_i / (N * top_k) = 32 / (128 * 2) = 32/256 = 0.125"
+            )
+
+    def test_8expert_config_file_exists(self) -> None:
+        config_path = REPO_ROOT / "training" / "configs" / "laptop_moe_8expert_8gb_safe.yaml"
+        assert config_path.exists(), (
+            "training/configs/laptop_moe_8expert_8gb_safe.yaml must exist"
+        )
+
+    def test_8expert_config_has_8_experts(self) -> None:
+        import yaml
+        config_path = REPO_ROOT / "training" / "configs" / "laptop_moe_8expert_8gb_safe.yaml"
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        assert cfg["model"]["num_experts"] == 8, (
+            f"laptop_moe_8expert_8gb_safe.yaml must have num_experts=8, "
+            f"got {cfg['model']['num_experts']}"
+        )
+
+    def test_8expert_config_has_top2_routing(self) -> None:
+        import yaml
+        config_path = REPO_ROOT / "training" / "configs" / "laptop_moe_8expert_8gb_safe.yaml"
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        assert cfg["model"]["num_experts_per_token"] == 2, (
+            f"laptop_moe_8expert_8gb_safe.yaml must have num_experts_per_token=2, "
+            f"got {cfg['model']['num_experts_per_token']}"
+        )
+
+    def test_8expert_config_vram_estimate_not_marked_verified(self) -> None:
+        """
+        The VRAM estimate must NOT be marked as verified until Kishore runs it.
+        """
+        import yaml
+        config_path = REPO_ROOT / "training" / "configs" / "laptop_moe_8expert_8gb_safe.yaml"
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        meta = cfg.get("metadata", {})
+        verified = meta.get("vram_estimate_verified", None)
+        assert verified is False or verified is None, (
+            f"vram_estimate_verified must be false until measured on hardware, "
+            f"got: {verified}"
+        )

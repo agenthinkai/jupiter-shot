@@ -5,10 +5,19 @@ setlocal enabledelayedexpansion
 :: Jupiter Shot — Kuwait Laptop GPU Validation
 :: run_all_laptop_validation.bat
 ::
+:: Usage:
+::   scripts\windows\run_all_laptop_validation.bat [--data-mode MODE]
+::
+::   --data-mode real       Use Wikitext-2 real text (default).
+::                          Halts with REAL_TEXT_DATA_UNAVAILABLE if the
+::                          dataset or tokenizer cannot be downloaded.
+::   --data-mode synthetic  Use random token IDs. Forces outcome=NOT_ACCEPTED.
+::   --data-mode auto       Try real; fall back to synthetic silently.
+::
 :: What this script validates:
 ::   - CUDA execution on a single NVIDIA GPU
 ::   - Dense transformer training (small config)
-::   - Small MoE routing (8-expert prototype)
+::   - MoE routing validation (8-expert, top-2)
 ::   - Checkpoint save, interrupt, and resume
 ::   - Metrics collection and thermal monitoring
 ::
@@ -55,9 +64,58 @@ echo [INFO] Project root: %PROJECT_ROOT%
 echo.
 
 :: ----------------------------------------------------------------------------
+:: Parse command-line arguments
+:: --data-mode real | synthetic | auto
+:: ----------------------------------------------------------------------------
+set "DATA_MODE=real"
+set "ARG_PARSE_ERROR=0"
+
+:parse_args
+if "%~1"=="" goto args_done
+if /i "%~1"=="--data-mode" (
+    if "%~2"=="" (
+        echo [ERROR] --data-mode requires a value: real, synthetic, or auto
+        set ARG_PARSE_ERROR=1
+        goto args_done
+    )
+    set "DATA_MODE=%~2"
+    shift
+    shift
+    goto parse_args
+)
+echo [WARN] Unknown argument: %~1 (ignored)
+shift
+goto parse_args
+
+:args_done
+if !ARG_PARSE_ERROR! EQU 1 (
+    echo [ERROR] Argument parsing failed. Exiting.
+    pause
+    exit /b 1
+)
+
+:: Validate --data-mode value
+if /i "!DATA_MODE!"=="real"      goto data_mode_ok
+if /i "!DATA_MODE!"=="synthetic" goto data_mode_ok
+if /i "!DATA_MODE!"=="auto"      goto data_mode_ok
+echo [ERROR] Invalid --data-mode value: !DATA_MODE!
+echo         Valid values: real, synthetic, auto
+pause
+exit /b 1
+
+:data_mode_ok
+echo [INFO] Data mode: !DATA_MODE!
+if /i "!DATA_MODE!"=="synthetic" (
+    echo [WARN] --data-mode synthetic: outcome will be forced to NOT_ACCEPTED.
+    echo        Synthetic runs cannot produce a PASS result.
+    echo        Use --data-mode real for a valid validation run.
+)
+echo.
+
+:: ----------------------------------------------------------------------------
 :: Step 1: Check Python version (must be 3.10 or 3.11)
 :: ----------------------------------------------------------------------------
-echo [STEP 1/7] Checking Python installation...
+echo [STEP 1/8] Checking Python installation...
 python --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python not found on PATH.
@@ -92,7 +150,7 @@ echo.
 :: Step 2: Create isolated virtual environment (does NOT touch system Python)
 :: ----------------------------------------------------------------------------
 set "VENV_DIR=%PROJECT_ROOT%\.venv"
-echo [STEP 2/7] Setting up isolated virtual environment at .venv\...
+echo [STEP 2/8] Setting up isolated virtual environment at .venv\...
 
 if exist "%VENV_DIR%\Scripts\activate.bat" (
     echo [OK]   Virtual environment already exists, reusing it.
@@ -116,7 +174,7 @@ echo.
 :: ----------------------------------------------------------------------------
 :: Step 3: Detect GPU architecture and install correct PyTorch wheel
 :: ----------------------------------------------------------------------------
-echo [STEP 3/7] Detecting GPU architecture and installing dependencies...
+echo [STEP 3/8] Detecting GPU architecture and installing dependencies...
 echo.
 
 python -m pip install --upgrade pip --quiet
@@ -152,37 +210,48 @@ echo [INFO] PyTorch version : !TORCH_VERSION!
 echo [INFO] CUDA wheel      : !TORCH_WHEEL!
 echo [INFO] Index URL       : !TORCH_INDEX!
 echo.
-echo [WARN] Download size is approximately 2.3-2.5 GB. This may take
-echo        5-30 minutes depending on your internet connection.
-echo        If the download stalls, see the manual fallback below.
-echo.
-echo        Manual fallback ^(if pip stalls^):
-echo          pip install torch==!TORCH_VERSION! --index-url !TORCH_INDEX!
-echo        Then re-run this script.
-echo.
-echo        If your antivirus blocks the download, temporarily disable
-echo        real-time scanning for the .venv directory only.
-echo.
 
-:: Install PyTorch (no torchvision/torchaudio unless actually needed)
-pip install torch==!TORCH_VERSION! --index-url !TORCH_INDEX!
-if errorlevel 1 (
+:: Check if the correct PyTorch version is already installed
+python -c "import torch; v=torch.__version__; print('TORCH_OK' if '!TORCH_VERSION!' in v else 'TORCH_MISSING')" >"%TEMP%\torch_check.txt" 2>&1
+set /p TORCH_STATUS=<"%TEMP%\torch_check.txt"
+
+if /i "!TORCH_STATUS!"=="TORCH_OK" (
+    echo [OK]   PyTorch !TORCH_VERSION! already installed. Skipping download.
+    echo        ^(Kishore's .venv is preserved — PyTorch will NOT be re-downloaded.^)
+) else (
+    echo [WARN] Download size is approximately 2.3-2.5 GB. This may take
+    echo        5-30 minutes depending on your internet connection.
+    echo        If the download stalls, see the manual fallback below.
     echo.
-    echo [ERROR] Failed to install PyTorch !TORCH_VERSION!+!TORCH_WHEEL!.
+    echo        Manual fallback ^(if pip stalls^):
+    echo          pip install torch==!TORCH_VERSION! --index-url !TORCH_INDEX!
+    echo        Then re-run this script.
     echo.
-    echo         Troubleshooting:
-    echo           1. Check internet connection
-    echo           2. Try manual download:
-    echo              pip install torch==!TORCH_VERSION! --index-url !TORCH_INDEX!
-    echo           3. If download stalls at a specific percentage, your antivirus
-    echo              may be scanning the wheel. Temporarily disable it.
-    echo           4. Ensure 20 GB free disk space ^(check with: dir C:\^)
+    echo        If your antivirus blocks the download, temporarily disable
+    echo        real-time scanning for the .venv directory only.
     echo.
-    pause
-    exit /b 1
+
+    :: Install PyTorch (no torchvision/torchaudio unless actually needed)
+    pip install torch==!TORCH_VERSION! --index-url !TORCH_INDEX!
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Failed to install PyTorch !TORCH_VERSION!+!TORCH_WHEEL!.
+        echo.
+        echo         Troubleshooting:
+        echo           1. Check internet connection
+        echo           2. Try manual download:
+        echo              pip install torch==!TORCH_VERSION! --index-url !TORCH_INDEX!
+        echo           3. If download stalls at a specific percentage, your antivirus
+        echo              may be scanning the wheel. Temporarily disable it.
+        echo           4. Ensure 20 GB free disk space ^(check with: dir C:\^)
+        echo.
+        pause
+        exit /b 1
+    )
 )
 
 echo [INFO] Installing laptop-specific dependencies from requirements-laptop.txt...
+echo        ^(Existing packages in .venv will be reused; only new packages installed.^)
 if exist "%PROJECT_ROOT%\requirements-laptop.txt" (
     pip install -r "%PROJECT_ROOT%\requirements-laptop.txt"
 ) else (
@@ -199,9 +268,89 @@ echo [OK]   All dependencies installed.
 echo.
 
 :: ----------------------------------------------------------------------------
-:: Step 4: Run real-kernel preflight (STOP if kernel test fails)
+:: Step 4: Real-text data preflight (only for --data-mode real)
 :: ----------------------------------------------------------------------------
-echo [STEP 4/7] Running hardware preflight check ^(real CUDA kernel test^)...
+echo [STEP 4/8] Real-text data availability check...
+echo.
+
+if /i "!DATA_MODE!"=="real" (
+    echo [INFO] --data-mode real: verifying Wikitext-2 and tokenizer availability...
+    echo        Dataset:   wikitext / wikitext-2-raw-v1 / train  ^(CC BY-SA 4.0^)
+    echo        Tokenizer: EleutherAI/gpt-neox-20b               ^(Apache 2.0^)
+    echo.
+
+    python -c "
+import sys
+errors = []
+# Check datasets package
+try:
+    from datasets import load_dataset
+except ImportError:
+    errors.append('datasets package not installed (pip install datasets==2.19.1)')
+else:
+    try:
+        ds = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train',
+                          streaming=True, trust_remote_code=False)
+        sample = next(iter(ds))
+        if not sample.get('text'):
+            errors.append('Wikitext-2 loaded but returned empty text')
+        else:
+            print('  [OK] Wikitext-2 available: ' + repr(sample['text'][:60]))
+    except Exception as e:
+        errors.append(f'Wikitext-2 unavailable: {e}')
+# Check transformers package
+try:
+    from transformers import AutoTokenizer
+except ImportError:
+    errors.append('transformers package not installed (pip install transformers==4.40.2)')
+else:
+    try:
+        tok = AutoTokenizer.from_pretrained('EleutherAI/gpt-neox-20b')
+        ids = tok('Hello world', return_tensors='pt')
+        print('  [OK] Tokenizer available: EleutherAI/gpt-neox-20b (vocab=' + str(tok.vocab_size) + ')')
+    except Exception as e:
+        errors.append(f'Tokenizer unavailable: {e}')
+if errors:
+    print()
+    print('REAL_TEXT_DATA_UNAVAILABLE')
+    for err in errors:
+        print('  ERROR: ' + err)
+    sys.exit(1)
+else:
+    print('  [OK] Real-text data preflight passed.')
+    sys.exit(0)
+"
+    if errorlevel 1 (
+        echo.
+        echo [FAIL] REAL_TEXT_DATA_UNAVAILABLE
+        echo.
+        echo        The validation requires real text data but it cannot be loaded.
+        echo        Do NOT silently fall back to synthetic mode.
+        echo.
+        echo        To fix:
+        echo          1. Ensure internet access is available
+        echo          2. Re-run: pip install datasets==2.19.1 transformers==4.40.2
+        echo          3. If HuggingFace is blocked, configure HF_ENDPOINT:
+        echo             set HF_ENDPOINT=https://huggingface.co
+        echo          4. If you must run without real data, use:
+        echo             run_all_laptop_validation.bat --data-mode synthetic
+        echo             WARNING: synthetic runs produce outcome=NOT_ACCEPTED
+        echo.
+        pause
+        exit /b 1
+    )
+) else if /i "!DATA_MODE!"=="synthetic" (
+    echo [INFO] --data-mode synthetic: skipping real-text preflight.
+    echo [WARN] Synthetic runs will produce outcome=NOT_ACCEPTED.
+) else (
+    echo [INFO] --data-mode auto: real-text will be attempted; synthetic fallback enabled.
+)
+echo.
+
+:: ----------------------------------------------------------------------------
+:: Step 5: Run real-kernel preflight (STOP if kernel test fails)
+:: ----------------------------------------------------------------------------
+echo [STEP 5/8] Running hardware preflight check ^(real CUDA kernel test^)...
 echo.
 
 mkdir "%PROJECT_ROOT%\benchmarks\results\laptop" 2>nul
@@ -229,31 +378,37 @@ echo.
 
 :: Read recommended configs from preflight output
 for /f "tokens=*" %%i in ('python -c "import json; d=json.load^(open^('%PROJECT_ROOT:\=/%/benchmarks/results/laptop/preflight.json'^)^); print^(d.get^('recommended_dense_config','laptop_dense_small'^)^)" 2^>nul') do set DENSE_CONFIG=%%i
-for /f "tokens=*" %%i in ('python -c "import json; d=json.load^(open^('%PROJECT_ROOT:\=/%/benchmarks/results/laptop/preflight.json'^)^); print^(d.get^('recommended_moe_config','laptop_moe_small'^)^)" 2^>nul') do set MOE_CONFIG=%%i
+for /f "tokens=*" %%i in ('python -c "import json; d=json.load^(open^('%PROJECT_ROOT:\=/%/benchmarks/results/laptop/preflight.json'^)^); print^(d.get^('recommended_moe_config','laptop_moe_8expert_8gb_safe'^)^)" 2^>nul') do set MOE_CONFIG=%%i
 if "!DENSE_CONFIG!"=="" set DENSE_CONFIG=laptop_dense_small
-if "!MOE_CONFIG!"=="" set MOE_CONFIG=laptop_moe_small
+if "!MOE_CONFIG!"==""  set MOE_CONFIG=laptop_moe_8expert_8gb_safe
 
 echo [INFO] Selected dense config: !DENSE_CONFIG!
 echo [INFO] Selected MoE config:   !MOE_CONFIG!
 echo.
 
-:: Force SMALL config for RTX 5060 / 8 GB VRAM
+:: Force 8GB-safe config for RTX 5060 / 8 GB VRAM
 python -c "import json; d=json.load(open('%PROJECT_ROOT:\=/%/benchmarks/results/laptop/preflight.json')); vram=d.get('gpu',{}).get('vram_total_gb',0); print('SMALL' if float(vram)<10 else 'OK')" >"%TEMP%\vram_check.txt" 2>&1
 set /p VRAM_TIER=<"%TEMP%\vram_check.txt"
 if /i "!VRAM_TIER!"=="SMALL" (
-    echo [INFO] 8 GB VRAM detected. Enforcing SMALL configuration.
+    echo [INFO] 8 GB VRAM detected. Enforcing 8GB-safe configuration.
+    echo        Dense config: laptop_dense_small
+    echo        MoE config:   laptop_moe_8expert_8gb_safe  ^(8 experts, top-2^)
     echo        First run: 10 diagnostic steps only.
     echo        Full run: 100 steps after diagnostics pass.
     echo        The 1.3B model will NOT be attempted.
     set DENSE_CONFIG=laptop_dense_small
-    set MOE_CONFIG=laptop_moe_small
+    set MOE_CONFIG=laptop_moe_8expert_8gb_safe
 )
 echo.
 
 :: ----------------------------------------------------------------------------
-:: Step 5: Confirm before running longer tests
+:: Step 6: Confirm before running longer tests
 :: ----------------------------------------------------------------------------
-echo [STEP 5/7] Confirmation required before running GPU training tests.
+echo [STEP 6/8] Confirmation required before running GPU training tests.
+echo.
+echo   Data mode:    !DATA_MODE!
+echo   Dense config: !DENSE_CONFIG!
+echo   MoE config:   !MOE_CONFIG!
 echo.
 echo   The following tests will run:
 echo     - Dense transformer training  ^(estimated: 20-60 minutes^)
@@ -274,13 +429,13 @@ if /i not "!CONFIRM!"=="YES" (
 echo.
 
 :: ----------------------------------------------------------------------------
-:: Step 6: Run 10 diagnostic steps first (SMALL / 8 GB VRAM safety)
+:: Step 7: Run 10 diagnostic steps first (8GB-safe config)
 :: ----------------------------------------------------------------------------
-echo [STEP 6/7] Running 10 diagnostic steps ^(SMALL config safety check^)...
+echo [STEP 7/8] Running 10 diagnostic steps ^(8GB-safe config check^)...
 echo.
 
-echo [DIAG 1/2] Dense diagnostic ^(10 steps^)...
-python "%PROJECT_ROOT%\scripts\run_laptop_dense.py" --config !DENSE_CONFIG! --steps 10
+echo [DIAG 1/2] Dense diagnostic ^(10 steps, --data-mode !DATA_MODE!^)...
+python "%PROJECT_ROOT%\scripts\run_laptop_dense.py" --config !DENSE_CONFIG! --steps 10 --data-mode !DATA_MODE!
 if errorlevel 1 (
     echo [FAIL] Dense diagnostic failed. Do not proceed to full run.
     echo        Review output above for CUDA/memory errors.
@@ -290,8 +445,8 @@ if errorlevel 1 (
 echo [OK]   Dense diagnostic passed.
 echo.
 
-echo [DIAG 2/2] MoE diagnostic ^(10 steps^)...
-python "%PROJECT_ROOT%\scripts\run_laptop_moe.py" --config !MOE_CONFIG! --steps 10
+echo [DIAG 2/2] MoE diagnostic ^(10 steps, --data-mode !DATA_MODE!^)...
+python "%PROJECT_ROOT%\scripts\run_laptop_moe.py" --config !MOE_CONFIG! --steps 10 --data-mode !DATA_MODE!
 if errorlevel 1 (
     echo [FAIL] MoE diagnostic failed. Do not proceed to full run.
     pause
@@ -301,17 +456,17 @@ echo [OK]   MoE diagnostic passed.
 echo.
 
 :: ----------------------------------------------------------------------------
-:: Step 7: Run 100-step validation tests
+:: Step 8: Run 100-step validation tests
 :: ----------------------------------------------------------------------------
-echo [STEP 7/7] Running 100-step GPU validation tests...
+echo [STEP 8/8] Running 100-step GPU validation tests...
 echo.
 
 set PASS_COUNT=0
 set FAIL_COUNT=0
 
 :: --- Dense validation ---
-echo [TEST 1/3] Dense transformer training ^(!DENSE_CONFIG!^)...
-python "%PROJECT_ROOT%\scripts\run_laptop_dense.py" --config !DENSE_CONFIG! --steps 100
+echo [TEST 1/3] Dense transformer training ^(!DENSE_CONFIG!, --data-mode !DATA_MODE!^)...
+python "%PROJECT_ROOT%\scripts\run_laptop_dense.py" --config !DENSE_CONFIG! --steps 100 --data-mode !DATA_MODE!
 if errorlevel 1 (
     echo [FAIL] Dense training validation failed. Review output above.
     set /a FAIL_COUNT+=1
@@ -322,8 +477,8 @@ if errorlevel 1 (
 echo.
 
 :: --- MoE validation ---
-echo [TEST 2/3] MoE routing validation ^(!MOE_CONFIG!^)...
-python "%PROJECT_ROOT%\scripts\run_laptop_moe.py" --config !MOE_CONFIG! --steps 100
+echo [TEST 2/3] MoE routing validation ^(!MOE_CONFIG!, --data-mode !DATA_MODE!^)...
+python "%PROJECT_ROOT%\scripts\run_laptop_moe.py" --config !MOE_CONFIG! --steps 100 --data-mode !DATA_MODE!
 if errorlevel 1 (
     echo [FAIL] MoE validation failed. Review output above.
     set /a FAIL_COUNT+=1
@@ -334,7 +489,7 @@ if errorlevel 1 (
 echo.
 
 :: --- Resume test ---
-echo [TEST 3/3] Checkpoint resume test...
+echo [TEST 3/3] Checkpoint resume test ^(!DENSE_CONFIG!^)...
 python "%PROJECT_ROOT%\scripts\run_laptop_resume_test.py" --config !DENSE_CONFIG! --steps 20
 if errorlevel 1 (
     echo [FAIL] Checkpoint resume test failed. Review output above.
@@ -364,7 +519,8 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo  VALIDATION COMPLETE
-echo  Passed: !PASS_COUNT!   Failed: !FAIL_COUNT!
+echo  Data mode: !DATA_MODE!
+echo  Passed:    !PASS_COUNT!   Failed: !FAIL_COUNT!
 echo ============================================================
 echo.
 echo  Generated report ^(send this to the team^):

@@ -457,12 +457,38 @@ def main() -> int:
                         help="Number of training steps (10=diagnostic, 100=standard, 1000=full)")
     parser.add_argument("--confirmed", action="store_true",
                         help="Required to run >100 steps without interactive confirmation")
+    parser.add_argument(
+        "--data-mode",
+        choices=["real", "synthetic", "auto"],
+        default="auto",
+        help=(
+            "real: Wikitext-2 only (halts if unavailable). "
+            "synthetic: random tokens (diagnostic only, cannot produce PASS). "
+            "auto: tries real, falls back to synthetic."
+        ),
+    )
+    # Legacy flag kept for backward compatibility
     parser.add_argument("--synthetic", action="store_true",
-                        help="Use synthetic data only (skip Wikitext-2 download)")
+                        help="Alias for --data-mode synthetic (deprecated)")
     parser.add_argument("--thermal-warn", type=int, default=THERMAL_WARN_C)
     parser.add_argument("--thermal-stop", type=int, default=THERMAL_STOP_C)
     parser.add_argument("--output-dir", default="benchmarks/results/laptop")
     args = parser.parse_args()
+
+    # Resolve --synthetic alias
+    if args.synthetic and args.data_mode == "auto":
+        args.data_mode = "synthetic"
+
+    # Resolve --data-mode to synthetic bool for run_dense_validation
+    # real: force real text; halt if unavailable
+    # synthetic: force synthetic
+    # auto: try real, fall back to synthetic (existing behaviour)
+    if args.data_mode == "real":
+        use_synthetic = False
+    elif args.data_mode == "synthetic":
+        use_synthetic = True
+    else:  # auto
+        use_synthetic = False  # load_wikitext_sample handles the fallback
 
     if args.steps > 100 and not args.confirmed:
         print(f"[CONFIRM] Running {args.steps} steps requires --confirmed flag.")
@@ -473,7 +499,7 @@ def main() -> int:
         summary = run_dense_validation(
             config_name=args.config,
             max_steps=args.steps,
-            synthetic=args.synthetic,
+            synthetic=use_synthetic,
             thermal_warn=args.thermal_warn,
             thermal_stop=args.thermal_stop,
             output_dir=Path(args.output_dir),

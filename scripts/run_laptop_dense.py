@@ -216,6 +216,23 @@ def run_dense_validation(
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
             tokenizer.pad_token = tokenizer.eos_token
+            # ── Vocabulary contract check ─────────────────────────────────
+            # model_config.vocab_size MUST be >= len(tokenizer)
+            # Halt immediately if not — do NOT remap with modulo arithmetic.
+            actual_tokenizer_size = len(tokenizer)
+            if vocab_size < actual_tokenizer_size:
+                raise RuntimeError(
+                    f"TOKENIZER_VOCABULARY_MISMATCH: "
+                    f"model vocab_size={vocab_size} < "
+                    f"tokenizer vocab_size={actual_tokenizer_size} "
+                    f"(EleutherAI/gpt-neox-20b). "
+                    f"Update the config to vocab_size={actual_tokenizer_size} "
+                    f"before running real-text validation."
+                )
+            print(
+                f"[VOCAB] Contract OK: model vocab_size={vocab_size} "
+                f">= tokenizer vocab_size={actual_tokenizer_size}"
+            )
         except Exception:
             print("[DATA] Tokenizer unavailable; falling back to synthetic.")
             texts = []
@@ -286,6 +303,16 @@ def run_dense_validation(
                     import random
                     sample = random.sample(texts, min(batch_size, len(texts)))
                     input_ids = get_real_text_batch(tokenizer, sample, seq_len, device)
+                    # Per-batch token ID range guard
+                    id_min = int(input_ids.min().item())
+                    id_max = int(input_ids.max().item())
+                    if id_min < 0 or id_max >= vocab_size:
+                        raise RuntimeError(
+                            f"TOKENIZER_VOCABULARY_MISMATCH: "
+                            f"batch token IDs [{id_min}, {id_max}] out of range "
+                            f"[0, {vocab_size - 1}] at step {step}. "
+                            f"Model vocab_size={vocab_size} is too small for this tokenizer."
+                        )
                 else:
                     input_ids = get_synthetic_batch(batch_size, seq_len, vocab_size, device)
             except torch.cuda.OutOfMemoryError:

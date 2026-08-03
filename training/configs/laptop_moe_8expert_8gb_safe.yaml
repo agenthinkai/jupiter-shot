@@ -25,37 +25,42 @@
 #   - All acceptance checks (evaluate_acceptance())
 #   - Gradient checkpointing
 #
-# ── Parameter counts (computed by scripts/count_moe_params.py) ───────────────
+# ── Tokenizer contract ───────────────────────────────────────────────────────
+#   tokenizer_id:    EleutherAI/gpt-neox-20b  (Apache 2.0)
+#   vocab_size:      50,277  (was 32,000 — corrected in Run 6)
+#   Runtime guard:   model_config.vocab_size >= len(tokenizer)
+#                    input_ids.max() < model_config.vocab_size
+#   Halt code:       TOKENIZER_VOCABULARY_MISMATCH
+#
+# ── Parameter counts (vocab=50277, hidden=384, layers=6, intermediate=768) ───
 #
 #   Component                   Parameters
 #   ─────────────────────────── ──────────
-#   Token embedding             32000 × 384 = 12.29 M
+#   Token embedding             50277 × 384 = 19.31 M
+#   Positional embedding          256 × 384 =  0.10 M
 #   Attention (6 layers)        6 × 4 × 384² = 3.54 M
-#   RMS norms (6 layers + 1)    7 × 2 × 384 = 5.4 K
 #   Dense FFN (3 layers)        3 × 3 × 384 × 768 = 2.65 M
 #   MoE FFN (3 layers):
 #     8 experts × (3 × 384 × 768) = 7.08 M per layer × 3 = 21.23 M
 #     Router (384 × 8) = 3.1 K per layer × 3 = 9.2 K
 #   LM head (tied to embedding) 0
 #   ─────────────────────────── ──────────
-#   Total parameters:           ~39.73 M
-#   Active parameters/token:    ~23.80 M  (attn + top-2 experts + dense FFN)
-#   Parameters per expert:      ~0.885 M  (3 × 384 × 768)
-#   Sparsity:                   ~40%      (1 - active/total)
+#   Total parameters:           46,849,920  (~46.85 M)
+#   Active parameters/token:    30,924,672  (~30.92 M)
+#   Parameters per expert:      ~1.77 M     (3 × 384 × 768)
+#   Sparsity:                   ~34%        (1 - active/total)
 #
-# ── VRAM estimate (BF16, RTX 5060 8 GB, gradient checkpointing ON) ───────────
+# ── VRAM estimate (BF16, vocab=50277, RTX 5060 8 GB, grad-ckpt ON) ───────────
 #
 #   Component                   Estimate    Assumptions
 #   ─────────────────────────── ─────────── ─────────────────────────────────
-#   Weights (BF16)              0.074 GB    39.73M × 2 bytes
-#   Gradients (BF16)            0.074 GB    39.73M × 2 bytes
-#   Optimizer (AdamW, FP32)     0.296 GB    39.73M × 2 states × 4 bytes
-#   Activations (grad-ckpt)     0.001 GB    sqrt(6)≈2 checkpoints × batch×seq×hidden×2
-#   Temporary buffers           0.001 GB    2× one-layer activation
-#   CUDA/Windows overhead       0.850 GB    CUDA context + Windows GPU driver baseline
+#   Weights (BF16)              0.094 GB    46.85M × 2 bytes
+#   Gradients (BF16)            0.094 GB    46.85M × 2 bytes
+#   Optimizer (AdamW, FP32)     0.375 GB    46.85M × 2 states × 4 bytes
+#   Activations (grad-ckpt)     0.007 GB    batch=2, seq=256, hidden=384
 #   ─────────────────────────── ─────────── ─────────────────────────────────
-#   ESTIMATED PEAK              ~1.30 GB    NOT verified on hardware
-#   Target (< 80% of 8,151 MiB) 6.50 GB    Margin: ~5.2 GB
+#   ESTIMATED PEAK              ~0.57 GB    NOT verified on hardware
+#   Target (< 80% of 8,151 MiB) 6.50 GB    Margin: ~5.93 GB
 #
 #   NOTE: This estimate is NOT verified. It will be updated with the measured
 #   peak_vram_allocated_gb from Kishore's RTX 5060 run. Do not label it
@@ -88,7 +93,7 @@
 
 model:
   base:
-    vocab_size: 32000
+    vocab_size: 50277
     hidden_size: 384
     num_hidden_layers: 6
     num_attention_heads: 6
@@ -122,14 +127,30 @@ metadata:
   config_name: "laptop_moe_8expert_8gb_safe"
   num_experts: 8
   num_experts_per_token: 2
-  total_params_approx_m: 39.73
-  active_params_approx_m: 23.80
-  params_per_expert_approx_m: 0.885
-  sparsity_pct: 40
-  # VRAM estimates — NOT verified on hardware (see note above)
-  peak_vram_estimate_gb: 1.30
+  # Tokenizer contract
+  tokenizer_id: "EleutherAI/gpt-neox-20b"   # Apache 2.0, vocab=50277
+  tokenizer_vocab_size: 50277
+  # vocab_size MUST be >= tokenizer_vocab_size at runtime (enforced by runner)
+  # Parameter counts (vocab=50277, hidden=384, layers=6, intermediate=768)
+  total_params: 46849920
+  total_params_approx_m: 46.85
+  active_params_per_token: 30924672
+  active_params_approx_m: 30.92
+  params_per_expert_approx_m: 1.77
+  sparsity_pct: 34
+  # VRAM estimates (vocab=50277) — NOT verified on hardware
+  weight_memory_gb: 0.094
+  estimated_peak_vram_gb: 0.57
+  peak_vram_estimate_gb: 0.57
   vram_target_gb: 6.50
   vram_estimate_verified: false
+  # Dataset license note
+  dataset_id: "Salesforce/wikitext"
+  dataset_config: "wikitext-2-raw-v1"
+  dataset_split: "train"
+  dataset_license_note: >-
+    Hugging Face metadata lists CC BY-SA 3.0 and GFDL. Dataset card text states
+    CC BY-SA 4.0. Use for technical validation only pending governance review.
   blackwell_compatible: true
   min_pytorch_version: "2.7.1+cu128"
   run3_issue: >

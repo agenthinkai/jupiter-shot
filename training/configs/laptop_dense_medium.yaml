@@ -5,7 +5,7 @@
 # Effective VRAM budget: ~9.5 GB (after 1.5 GB Windows/CUDA overhead)
 
 model:
-  vocab_size: 32000
+  vocab_size: 50277
   hidden_size: 1024
   num_hidden_layers: 16
   num_attention_heads: 16

@@ -250,13 +250,44 @@ if /i "!TORCH_STATUS!"=="TORCH_OK" (
     )
 )
 
-echo [INFO] Installing laptop-specific dependencies from requirements-laptop.txt...
-echo        ^(Existing packages in .venv will be reused; only new packages installed.^)
-if exist "%PROJECT_ROOT%\requirements-laptop.txt" (
-    pip install -r "%PROJECT_ROOT%\requirements-laptop.txt"
+echo [INFO] Installing real-text dependencies (transformers, datasets, tokenizers)...
+echo        PyTorch is already handled above and will NOT be re-downloaded.
+echo        Only packages missing from .venv will be installed.
+echo.
+
+:: Install real-text deps without touching torch.
+:: --no-deps is NOT used here because transformers/datasets have legitimate deps.
+:: We exclude torch explicitly so pip does not re-resolve or re-download it.
+python -c "import transformers" >nul 2>&1
+if errorlevel 1 (
+    echo [INFO] transformers not found. Installing transformers==4.40.2...
+    pip install transformers==4.40.2 --no-deps
+    pip install tokenizers==0.19.1 regex safetensors huggingface-hub filelock packaging requests tqdm
 ) else (
-    echo [WARN] requirements-laptop.txt not found, falling back to requirements.txt
-    pip install -r "%PROJECT_ROOT%\requirements.txt"
+    echo [OK]   transformers already installed. Skipping.
+)
+
+python -c "import datasets" >nul 2>&1
+if errorlevel 1 (
+    echo [INFO] datasets not found. Installing datasets==2.19.1...
+    pip install datasets==2.19.1 --no-deps
+    pip install multiprocess dill pyarrow xxhash aiohttp fsspec
+) else (
+    echo [OK]   datasets already installed. Skipping.
+)
+
+:: Install remaining non-torch project deps from requirements-laptop.txt
+:: but exclude torch/torchvision/torchaudio lines to prevent re-download.
+if exist "%PROJECT_ROOT%\requirements-laptop.txt" (
+    python -c "
+import re, pathlib, sys
+lines = pathlib.Path(r'%PROJECT_ROOT%\requirements-laptop.txt').read_text().splitlines()
+filtered = [l for l in lines if not re.match(r'\s*(torch|torchvision|torchaudio)', l, re.I)]
+pathlib.Path(r'%TEMP%\reqs_no_torch.txt').write_text('\n'.join(filtered))
+"
+    pip install -r "%TEMP%\reqs_no_torch.txt" --quiet
+) else (
+    echo [WARN] requirements-laptop.txt not found. Skipping project deps.
 )
 if errorlevel 1 (
     echo [ERROR] Failed to install project dependencies.
@@ -264,7 +295,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [OK]   All dependencies installed.
+echo [OK]   All dependencies installed. PyTorch was NOT re-downloaded.
 echo.
 
 :: ----------------------------------------------------------------------------

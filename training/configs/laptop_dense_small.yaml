@@ -2,7 +2,6 @@
 # Target hardware: 6–8 GB VRAM
 #   Tested: RTX 5060 Laptop GPU (8,151 MiB, Blackwell sm_120)
 #   Also suitable: RTX 3060 6GB, RTX 2070 8GB, RTX 3070 8GB
-# Model size: ~85M parameters
 # Gradient checkpointing: required for 8 GB VRAM
 # Effective VRAM budget: ~5.5 GB (after 1.5 GB Windows/CUDA overhead)
 #
@@ -12,9 +11,40 @@
 #   - The run_all_laptop_validation.bat script enforces this config for 8 GB VRAM
 #   - Maximum steps for 8 GB: 10 diagnostic + 100 full validation
 #   - The 1.3B model is NOT attempted on 8 GB VRAM
+#
+# ── Tokenizer contract ────────────────────────────────────────────────────────
+#   tokenizer_id:    EleutherAI/gpt-neox-20b  (Apache 2.0)
+#   vocab_size:      50,277
+#   Runtime guard:   model_config.vocab_size >= len(tokenizer)
+#                    input_ids.max() < model_config.vocab_size
+#   Halt code:       TOKENIZER_VOCABULARY_MISMATCH
+#
+# ── Parameter counts (vocab=50277, hidden=512, layers=8, intermediate=1408) ──
+#   Token embedding:       50277 × 512 = 25.74 M
+#   Positional embedding:    512 × 512 =  0.26 M
+#   Attention (8 layers):  8 × 4 × 512² = 8.39 M
+#   FFN SwiGLU (8 layers): 8 × 3 × 512 × 1408 = 17.30 M
+#   LayerNorm (8 layers):  8 × 4 × 512 = 0.02 M
+#   LM head (tied):        0
+#   ─────────────────────────────────────────────────────────────
+#   Total parameters:      51,710,464  (~51.7 M)
+#
+# ── VRAM estimate (BF16, batch=2, seq=512, gradient_checkpointing=true) ──────
+#   Weights (BF16):        0.103 GB  (51.7M × 2 bytes)
+#   Gradients (BF16):      0.103 GB
+#   Optimizer (AdamW fp32):0.414 GB  (51.7M × 2 states × 4 bytes)
+#   Activations (grad-ckpt):0.025 GB
+#   ─────────────────────────────────────────────────────────────
+#   Estimated peak:        ~0.65 GB  (NOT verified on hardware)
+#   Target (< 80% of 8,151 MiB): 6.50 GB  — well within budget
+#
+# ── Dataset license note ──────────────────────────────────────────────────────
+#   Hugging Face metadata lists CC BY-SA 3.0 and GFDL.
+#   Dataset card text states CC BY-SA 4.0.
+#   Use for technical validation only pending final governance review.
 
 model:
-  vocab_size: 32000
+  vocab_size: 50277          # EleutherAI/gpt-neox-20b tokenizer (50,277 tokens)
   hidden_size: 512
   num_hidden_layers: 8
   num_attention_heads: 8
@@ -39,20 +69,30 @@ training:
   precision: bf16  # bf16 preferred on RTX 50-series; change to fp16 for pre-Ampere GPUs
   gradient_checkpointing: true
 
-  # Estimated VRAM breakdown (BF16, RTX 5060 8 GB):
-  # Weights:    ~0.17 GB  (85M × 2 bytes)
-  # Gradients:  ~0.17 GB
-  # Optimizer:  ~0.51 GB  (85M × 12 bytes AdamW fp32)
-  # Activations: ~1.0 GB  (batch=2, seq=512, with checkpointing)
-  # CUDA buffers: ~0.5 GB
-  # Total est:  ~2.4 GB   (within 5.5 GB budget; ~3.1 GB headroom on 8 GB VRAM)
-
 metadata:
   tier: "6-8GB"
-  param_count_approx_m: 85
+  # Tokenizer contract
+  tokenizer_id: "EleutherAI/gpt-neox-20b"   # Apache 2.0, vocab=50277
+  tokenizer_vocab_size: 50277
+  # vocab_size MUST be >= tokenizer_vocab_size at runtime (enforced by runner)
+  # Parameter counts (vocab=50277, hidden=512, layers=8, intermediate=1408)
+  param_count_total: 51710464
+  param_count_approx_m: 51.7
+  # VRAM estimate (BF16, batch=2, seq=512, gradient_checkpointing=true)
+  weight_memory_gb: 0.103
+  estimated_peak_vram_gb: 0.65
+  vram_estimate_verified: false   # pending hardware measurement
   vram_budget_gb: 5.5
   blackwell_compatible: true
   min_pytorch_version: "2.7.1+cu128"  # Required for sm_120 (Blackwell)
+  # Dataset identity
+  dataset_id: "Salesforce/wikitext"
+  dataset_config: "wikitext-2-raw-v1"
+  dataset_split: "train"
+  dataset_license_note: >
+    Hugging Face metadata lists CC BY-SA 3.0 and GFDL.
+    Dataset card text states CC BY-SA 4.0.
+    Use for technical validation only pending final governance review.
   notes: >
     Standard small validation config. Required config for RTX 5060 Laptop GPU
     (8 GB VRAM, Blackwell sm_120). Also suitable for most gaming laptops with

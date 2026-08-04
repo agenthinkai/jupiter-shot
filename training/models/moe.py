@@ -33,6 +33,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint  # explicit — do not rely on side-effects
 
 from training.models.dense import (
     DenseConfig,
@@ -562,7 +563,7 @@ class MoETransformer(nn.Module):
                         out, aux, metrics = layer(*inputs)
                         return out, aux
                     return custom_forward
-                x, aux_loss = torch.utils.checkpoint.checkpoint(
+                x, aux_loss = gradient_checkpoint(
                     create_custom_forward(layer), x, cos, sin, attention_mask,
                     use_reentrant=False
                 )

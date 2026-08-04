@@ -261,7 +261,15 @@ def step03_real_text_dataset(data_mode: str, errors_path: pathlib.Path) -> dict:
 
 
 def step04_tokenizer_load(data_mode: str, errors_path: pathlib.Path) -> dict:
-    """Step 4: Load tokenizer and verify vocab size."""
+    """Step 4: Load tokenizer and verify vocabulary contract.
+
+    Distinguishes three vocabulary values:
+      tokenizer_base_vocab_size      = tok.vocab_size  (e.g. 50,254 for gpt-neox-20b)
+      tokenizer_effective_vocab_size = len(tok)        (e.g. 50,277 after added special tokens)
+      model_vocab_size               = config.vocab_size (must equal effective, not base)
+
+    The model config must use tokenizer_effective_vocab_size, not the base value.
+    """
     print("[Preflight 04/14] Tokenizer load ...", flush=True)
     if data_mode == "synthetic":
         print("  data_mode=synthetic: skipping tokenizer load", flush=True)
@@ -269,11 +277,23 @@ def step04_tokenizer_load(data_mode: str, errors_path: pathlib.Path) -> dict:
     try:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
-        vocab_size = tok.vocab_size
-        print(f"  Tokenizer: EleutherAI/gpt-neox-20b, vocab_size={vocab_size}  [OK]", flush=True)
+        base_vocab_size = tok.vocab_size           # base vocabulary (e.g. 50,254)
+        effective_vocab_size = len(tok)            # includes added special tokens (e.g. 50,277)
+        all_ids = list(tok.get_vocab().values())
+        max_token_id = max(all_ids) if all_ids else -1
+        print(
+            f"  Tokenizer: EleutherAI/gpt-neox-20b "
+            f"base_vocab={base_vocab_size}  effective_vocab={effective_vocab_size}  "
+            f"max_token_id={max_token_id}  [OK]",
+            flush=True,
+        )
         return {
             "tokenizer_id": "EleutherAI/gpt-neox-20b",
-            "vocab_size": vocab_size,
+            "tokenizer_base_vocab_size": base_vocab_size,
+            "tokenizer_effective_vocab_size": effective_vocab_size,
+            "tokenizer_max_token_id": max_token_id,
+            # Legacy field kept for backward compatibility; equals effective_vocab_size
+            "vocab_size": effective_vocab_size,
             "tokenizer_loaded": True,
         }
     except Exception as e:
@@ -284,7 +304,12 @@ def step04_tokenizer_load(data_mode: str, errors_path: pathlib.Path) -> dict:
 
 def step05_token_id_range(data_mode: str, tokenizer_info: dict,
                           errors_path: pathlib.Path) -> dict:
-    """Step 5: Verify token IDs are within [0, vocab_size)."""
+    """Step 5: Verify token IDs are within [0, effective_vocab_size).
+
+    Uses len(tok) (effective vocabulary) as the upper bound, not tok.vocab_size
+    (base vocabulary), so that added special tokens (IDs 50,254–50,276) are accepted.
+    Also verifies max_token_id < effective_vocab_size.
+    """
     print("[Preflight 05/14] Token ID range check ...", flush=True)
     if data_mode == "synthetic" or not tokenizer_info.get("tokenizer_loaded"):
         print("  Skipping (no real tokenizer)", flush=True)
@@ -293,14 +318,37 @@ def step05_token_id_range(data_mode: str, tokenizer_info: dict,
     tok = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     sample = "The quick brown fox jumps over the lazy dog."
     ids = tok.encode(sample)
-    vocab_size = tok.vocab_size
-    bad = [i for i in ids if i < 0 or i >= vocab_size]
+    # Use effective vocabulary (len) as the upper bound, not base vocab_size
+    effective_vocab_size = len(tok)
+    # Validate per-batch token ID range against effective vocabulary
+    bad = [i for i in ids if i < 0 or i >= effective_vocab_size]
     if bad:
         raise PreflightError(
-            f"Step 5 FAILED — token IDs out of range [0, {vocab_size}): {bad}"
+            f"Step 5 FAILED — token IDs out of range [0, {effective_vocab_size}): {bad}"
         )
-    print(f"  Sample encoded: {len(ids)} tokens, all in [0, {vocab_size})  [OK]", flush=True)
-    return {"sample_tokens": len(ids), "vocab_size": vocab_size, "out_of_range": []}
+    # Validate max token ID in the full vocabulary
+    max_token_id = tokenizer_info.get(
+        "tokenizer_max_token_id", max(tok.get_vocab().values())
+    )
+    if max_token_id >= effective_vocab_size:
+        raise PreflightError(
+            f"Step 5 FAILED — max token ID {max_token_id} >= "
+            f"effective vocab size {effective_vocab_size}"
+        )
+    print(
+        f"  Sample encoded: {len(ids)} tokens, all in [0, {effective_vocab_size})  "
+        f"max_token_id={max_token_id}  [OK]",
+        flush=True,
+    )
+    return {
+        "sample_tokens": len(ids),
+        "tokenizer_effective_vocab_size": effective_vocab_size,
+        "tokenizer_max_token_id": max_token_id,
+        # Legacy field
+        "vocab_size": effective_vocab_size,
+        "out_of_range": [],
+        "vocabulary_contract_passed": True,
+    }
 
 
 def step06_strict_config_validation(dense_config_path: pathlib.Path,
@@ -755,8 +803,26 @@ def main() -> int:
 
     if not preflight_passed:
         print(f"\n[PIPELINE] Preflight FAILED. See {run_dir / 'preflight.json'}", flush=True)
-        print(f"[PIPELINE] Exit code: {EXIT_SAFETY_STOP} (SAFETY_STOP)", flush=True)
-        return EXIT_SAFETY_STOP
+        # Classify the exit code based on the failure type.
+        # SAFETY_STOP (4) is reserved for genuine hardware/thermal safety conditions.
+        # Any software exception, import error, missing attribute, invalid config,
+        # or dependency failure must return EXECUTION_ERROR (3).
+        last_step_result = list(preflight_results.values())[-1] if preflight_results else {}
+        last_error = last_step_result.get("error", "")
+        # Only use SAFETY_STOP for explicit hardware safety conditions
+        _hardware_safety_keywords = (
+            "temperature", "thermal", "overheat", "power", "gpu safety",
+            "safety monitor", "operator safety", "runner safety",
+        )
+        is_hardware_safety = any(
+            kw in last_error.lower() for kw in _hardware_safety_keywords
+        )
+        if is_hardware_safety:
+            print(f"[PIPELINE] Exit code: {EXIT_SAFETY_STOP} (SAFETY_STOP)", flush=True)
+            return EXIT_SAFETY_STOP
+        else:
+            print(f"[PIPELINE] Exit code: {EXIT_EXECUTION_ERROR} (EXECUTION_ERROR)", flush=True)
+            return EXIT_EXECUTION_ERROR
 
     print(f"\n[PIPELINE] All 14 preflight steps PASSED.", flush=True)
 

@@ -215,11 +215,53 @@ def run_resume_test(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Jupiter Shot Laptop Resume Test")
-    parser.add_argument("--config", default="laptop_dense_small")
-    parser.add_argument("--steps", type=int, default=20, help="Initial steps before checkpoint")
-    parser.add_argument("--output-dir", default="benchmarks/results/laptop")
+    parser = argparse.ArgumentParser(
+        description="Jupiter Shot Laptop Checkpoint Resume Test",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "DATA NOTE: This test uses deterministic synthetic random tensors "
+            "(torch.randint) for all training steps. It does NOT use Wikitext-2 "
+            "or any real text data. The --data-mode flag is accepted for CLI "
+            "contract compatibility with the pipeline but does not change the "
+            "data source. Resume correctness is independent of training-data mode."
+        ),
+    )
+    parser.add_argument("--config", default="laptop_dense_small",
+                        help="Training config name (e.g., laptop_dense_small)")
+    parser.add_argument("--steps", type=int, default=20,
+                        help="Initial steps before checkpoint")
+    parser.add_argument("--output-dir", default="benchmarks/results/laptop",
+                        help="Directory for result artifacts")
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help=(
+            "Unique run identifier (e.g., 20260804_082957_UTC). "
+            "Embedded in resume_test.json for artifact traceability. "
+            "Generated automatically if not provided."
+        ),
+    )
+    parser.add_argument(
+        "--data-mode",
+        choices=["real", "synthetic", "auto"],
+        default="synthetic",
+        help=(
+            "Accepted for CLI contract compatibility with the pipeline. "
+            "This test always uses deterministic synthetic random tensors "
+            "(torch.randint) regardless of this flag."
+        ),
+    )
     args = parser.parse_args()
+
+    import datetime as _dt
+    run_id = args.run_id or _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+    print(f"[RESUME] Run ID: {run_id}", flush=True)
+    print(
+        f"[RESUME] Data mode: {args.data_mode} (accepted; "
+        "test uses deterministic synthetic tensors regardless)",
+        flush=True,
+    )
 
     try:
         result = run_resume_test(
@@ -227,6 +269,17 @@ def main() -> int:
             initial_steps=args.steps,
             output_dir=Path(args.output_dir),
         )
+        # Embed run_id and data_mode into the result artifact
+        result["run_id"] = run_id
+        result["data_mode_arg"] = args.data_mode
+        result["data_source"] = "deterministic_synthetic_tensors"
+        result_path = Path(args.output_dir) / "resume_test.json"
+        if result_path.exists():
+            existing = json.loads(result_path.read_text())
+            existing["run_id"] = run_id
+            existing["data_mode_arg"] = args.data_mode
+            existing["data_source"] = "deterministic_synthetic_tensors"
+            result_path.write_text(json.dumps(existing, indent=2, default=str))
         return 0 if result["passed"] else 1
     except RuntimeError as e:
         print(f"\n[FAIL] {e}")

@@ -611,7 +611,18 @@ def main() -> int:
                         help="Alias for --data-mode synthetic (deprecated)")
     parser.add_argument("--thermal-warn", type=int, default=THERMAL_WARN_C)
     parser.add_argument("--thermal-stop", type=int, default=THERMAL_STOP_C)
-    parser.add_argument("--output-dir", default="benchmarks/results/laptop")
+    parser.add_argument("--output-dir", default="benchmarks/results/laptop",
+                        help="Directory for result artifacts")
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help=(
+            "Unique run identifier (e.g., 20260804_082957_UTC). "
+            "Embedded in moe_summary.json for artifact traceability. "
+            "Generated automatically if not provided."
+        ),
+    )
     args = parser.parse_args()
 
     # Resolve --synthetic alias
@@ -622,6 +633,10 @@ def main() -> int:
         print(f"[CONFIRM] Running {args.steps} steps requires --confirmed flag.")
         return EXIT_EXECUTION_ERROR
 
+    import datetime as _dt
+    run_id = args.run_id or _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+    print(f"[MOE] Run ID: {run_id}", flush=True)
+
     try:
         summary = run_moe_validation(
             config_name=args.config,
@@ -631,6 +646,14 @@ def main() -> int:
             thermal_stop=args.thermal_stop,
             output_dir=Path(args.output_dir),
         )
+        # Embed run_id into the summary artifact for pipeline artifact validation
+        summary["run_id"] = run_id
+        import json as _json
+        summary_path = Path(args.output_dir) / "moe_summary.json"
+        if summary_path.exists():
+            existing = _json.loads(summary_path.read_text())
+            existing["run_id"] = run_id
+            summary_path.write_text(_json.dumps(existing, indent=2, default=str))
         return int(summary.get("exit_code", EXIT_EXECUTION_ERROR))
     except SystemExit as e:
         # Thermal stop propagated as SystemExit

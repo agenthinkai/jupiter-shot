@@ -886,9 +886,28 @@ def main() -> int:
     _write_json(run_dir / "gpu_results.json", gpu_results)
 
     # ── Final verdict ─────────────────────────────────────────────────────────
+    # Exit-code aggregation precedence (highest severity wins):
+    #   EXIT_SAFETY_STOP (4) > EXIT_EXECUTION_ERROR (3) > EXIT_NOT_EVALUABLE (2)
+    #   > EXIT_NOT_ACCEPTED (1) > EXIT_PASS (0)
+    # This ensures that a hardware safety event is never masked by a lower-severity
+    # code, and a software execution error is never reported as a mere NOT_ACCEPTED.
+    runner_exit_codes = [
+        r["exit_code"] for r in gpu_results.values() if "exit_code" in r
+    ]
     if all_gpu_passed:
         verdict = "PASS"
         exit_code = EXIT_PASS
+    elif EXIT_SAFETY_STOP in runner_exit_codes:
+        # Hardware safety event — highest severity, reported verbatim
+        verdict = "SAFETY_STOP"
+        exit_code = EXIT_SAFETY_STOP
+    elif EXIT_EXECUTION_ERROR in runner_exit_codes:
+        # Software execution error (AttributeError, ImportError, argparse, etc.)
+        verdict = "EXECUTION_ERROR"
+        exit_code = EXIT_EXECUTION_ERROR
+    elif EXIT_NOT_EVALUABLE in runner_exit_codes:
+        verdict = "NOT_EVALUABLE"
+        exit_code = EXIT_NOT_EVALUABLE
     elif args.data_mode == "synthetic":
         verdict = "NOT_ACCEPTED (synthetic data)"
         exit_code = EXIT_NOT_ACCEPTED

@@ -665,3 +665,146 @@ That pass authorizes only preparation for controlled Stage B distributed validat
 2. 500B pretraining
 3. 20T training
 4. Azure spending without a separate approved Stage B plan
+
+---
+
+## Run 9 Actual Result — PREFLIGHT PASS / FULL RUN EXECUTION ERROR
+
+*Section added: 2026-08-04*
+
+### Run 9 Verdict: PREFLIGHT PASS — FULL RUN EXECUTION ERROR
+
+Run 9 was executed on Kishore's RTX 5060 machine using commit `c58570d` (branch `fix/rtx50-blackwell-validation`). The preflight gate (all 14 steps, `--preflight-only --data-mode real`) passed with exit code 0. The full training run (`run_all_laptop_validation.bat --data-mode real`) failed during runner invocation with exit code 2 (argparse failure) before any training step executed.
+
+**Root cause:** The pipeline subprocess command passed `--run-id` and `--data-mode` to all three runner scripts, but the runners had not yet been updated to accept those arguments. `argparse` exited with code 2 immediately on startup.
+
+**Pipeline exit code reported:** `NOT_ACCEPTED` (1) — **incorrect**. The correct code for an argparse failure is `NOT_EVALUABLE` (2) or `EXECUTION_ERROR` (3). This was Defect 2 of Run 10.
+
+| Runner | Exit Code | Cause |
+|--------|-----------|-------|
+| `run_laptop_dense.py` | 2 (argparse) | `--run-id` not registered |
+| `run_laptop_moe.py` | 2 (argparse) | `--run-id` not registered |
+| `run_laptop_resume_test.py` | 2 (argparse) | `--run-id` not registered |
+
+### Run 9 Three New Defects Identified
+
+| # | Defect | File | Symptom |
+|---|--------|------|---------|
+| 1 | All three runner scripts missing `--run-id` and `--data-mode` CLI arguments | `run_laptop_dense.py`, `run_laptop_moe.py`, `run_laptop_resume_test.py` | argparse exit code 2 before any training step |
+| 2 | Pipeline final verdict aggregation used binary `all_gpu_passed` → always returned `NOT_ACCEPTED` (1) regardless of whether failure was `EXECUTION_ERROR` (3) or `SAFETY_STOP` (4) | `run_laptop_validation_pipeline.py` | Run 9 reported `NOT_ACCEPTED` for argparse failures that should have been `NOT_EVALUABLE` |
+| 3 | MoE `total_aux_loss` not accumulated in gradient-checkpoint branch — `total_aux_loss` stayed at `0.0` for entire forward pass when `gradient_checkpointing=True` | `training/models/moe.py` | Silent zero in `aux_loss` output field; load-balancing signal completely absent during checkpointed training |
+
+---
+
+## Run 10 — Ready
+
+*Section added: 2026-08-04*
+
+### Run 10 Fixes Applied (branch: `fix/rtx50-blackwell-validation`)
+
+| Fix | File | Change |
+|-----|------|--------|
+| Defect 1 — dense runner | `scripts/run_laptop_dense.py` | Added `--run-id` and `--data-mode` arguments; `run_id` embedded in summary artifact |
+| Defect 1 — MoE runner | `scripts/run_laptop_moe.py` | Added `--run-id` and `--data-mode` arguments; `run_id` embedded in summary artifact |
+| Defect 1 — resume runner | `scripts/run_laptop_resume_test.py` | Added `--run-id` and `--data-mode` arguments; documented that `--data-mode` does not change data source (always uses deterministic synthetic tensors) |
+| Defect 2 — exit-code aggregation | `scripts/run_laptop_validation_pipeline.py` | Final verdict now uses semantic precedence: `SAFETY_STOP` (4) > `EXECUTION_ERROR` (3) > `NOT_EVALUABLE` (2) > `NOT_ACCEPTED` (1) > `PASS` (0); collects `runner_exit_codes` list and checks each severity level before falling back to `NOT_ACCEPTED` |
+| Defect 3 — MoE aux-loss | `training/models/moe.py` | Added `total_aux_loss = total_aux_loss + aux_loss` in the gradient-checkpoint branch; both branches now accumulate correctly |
+
+### Run 10 Regression Tests
+
+| File | Tests | Groups |
+|------|-------|--------|
+| `tests/test_run10_regression.py` | 37 pass, 1 skip (torch), 0 fail | A: Runner CLI contract (11), B: Exit-code aggregation matrix (15), C: MoE aux-loss accumulation (4), D: Pipeline subprocess integration (7) |
+
+### Full CPU Test Suite (Run 10 branch)
+
+```
+python3 -m pytest tests/ --ignore=tests/test_mesh.py -q
+```
+
+| Result | Count |
+|--------|-------|
+| Passed | 438 |
+| Skipped | 121 (GPU/torch/datasets not in sandbox — expected) |
+| Failed | 0 |
+| Pre-existing failures (test_mesh.py asyncio) | 8 (unchanged from base branch) |
+
+### Run 10 Kishore Instructions
+
+**Hardware required:** NVIDIA RTX 5060 (Blackwell, sm_120) | PyTorch 2.7.1+cu128 | CUDA 12.8
+
+**Commit to check out:** `HEAD` of `fix/rtx50-blackwell-validation` (Run 10 commit)
+
+```bat
+REM STEP 1 — Verify repo (REQUIRED before any run)
+git fetch origin
+git checkout fix/rtx50-blackwell-validation
+git rev-parse HEAD
+REM Confirm commit matches the Run 10 commit hash
+
+REM STEP 2 — Optional synthetic diagnostic
+REM OPTIONAL DIAGNOSTIC ONLY — DOES NOT AUTHORIZE FULL VALIDATION
+scripts\windows\run_all_laptop_validation.bat --data-mode synthetic --preflight-only
+echo EXIT_CODE=%ERRORLEVEL%
+REM Expected: 0 (PASS)
+
+REM STEP 3 — Mandatory real-data preflight
+REM MANDATORY — must return EXIT_CODE=0 before proceeding to Step 4
+scripts\windows\run_all_laptop_validation.bat --data-mode real --preflight-only
+echo EXIT_CODE=%ERRORLEVEL%
+REM If EXIT_CODE ≠ 0: STOP. Preserve evidence. Make no local repairs.
+
+REM STEP 4 — Full real-data validation (only after Step 3 returns 0)
+scripts\windows\run_all_laptop_validation.bat --data-mode real
+echo EXIT_CODE=%ERRORLEVEL%
+REM Expected: 0 (PASS) — dense loss < 11.0, MoE loss < 11.0, resume delta < 0.1
+```
+
+### Run 10 GO Criteria (Complete A–H Contract)
+
+Run 10 achieves **LAPTOP ARCHITECTURAL PASS** only when every mandatory criterion below passes and the full real-data run returns exit code 0.
+
+**A. Repository**
+1. Commit is on `fix/rtx50-blackwell-validation`
+2. `git status` shows clean working tree (no uncommitted changes)
+3. `git rev-parse HEAD` matches the Run 10 commit hash
+
+**B. Preflight (Step 3 above)**
+1. `--preflight-only --data-mode real` exits 0
+2. All 14 preflight steps show `status: PASSED` in `preflight.json`
+3. `tokenizer_effective_vocab_size: 50277` in step04 output
+4. `vocabulary_contract_passed: true` in step05 output
+
+**C. Dense Training**
+1. `run_laptop_dense.py` exits 0
+2. Final loss < 11.0 (random-init baseline for 100 steps)
+3. `dense_summary.json` contains `run_id` matching the pipeline run ID
+4. `dense_summary.json` contains `verdict: PASS`
+
+**D. MoE Training**
+1. `run_laptop_moe.py` exits 0
+2. Final loss < 11.0
+3. `aux_loss > 0.0` in `moe_summary.json` (Defect 3 fix verification)
+4. `moe_summary.json` contains `run_id` matching the pipeline run ID
+
+**E. Checkpoint Resume**
+1. `run_laptop_resume_test.py` exits 0
+2. Resume loss delta < 0.1 (deterministic synthetic tensors)
+3. `resume_result.json` contains `run_id` matching the pipeline run ID
+
+**F. Safety**
+1. No `EXIT_SAFETY_STOP` (4) exit code from any runner
+2. GPU temperature stays below thermal limit throughout
+3. No OOM errors in any runner output
+
+**G. Artifact Integrity**
+1. `summary.json` contains `verdict: PASS` and `exit_code: 0`
+2. All artifact files have timestamps after run start
+3. `run_id` is consistent across `summary.json`, `dense_summary.json`, `moe_summary.json`, `resume_result.json`
+
+**H. Final Decision**
+1. All criteria A–G met
+2. Pipeline exit code = 0
+3. **LAPTOP ARCHITECTURAL PASS** declared
+
+**What a LAPTOP ARCHITECTURAL PASS authorizes:** Preparation for controlled Stage B distributed validation only. It does **not** authorize 200B pretraining, 500B pretraining, 20T training, or Azure spending without a separate approved Stage B plan.

@@ -561,12 +561,21 @@ class MoETransformer(nn.Module):
                 def create_custom_forward(layer):
                     def custom_forward(*inputs):
                         out, aux, metrics = layer(*inputs)
+                        # Return (out, aux) only — gradient_checkpoint requires
+                        # all outputs to be tensors; metrics is a dict and cannot
+                        # be returned through the checkpoint boundary.
                         return out, aux
                     return custom_forward
                 x, aux_loss = gradient_checkpoint(
                     create_custom_forward(layer), x, cos, sin, attention_mask,
                     use_reentrant=False
                 )
+                # FIX (Defect 3): accumulate aux_loss in the checkpoint branch.
+                # Previously this line was absent, causing total_aux_loss to stay
+                # at 0.0 for the entire forward pass when gradient_checkpointing
+                # was enabled. This silently zeroed the load-balancing signal and
+                # produced a false zero in the 'aux_loss' output field.
+                total_aux_loss = total_aux_loss + aux_loss
                 all_router_metrics.append({})
             else:
                 x, aux_loss, router_metrics = layer(x, cos, sin, attention_mask)

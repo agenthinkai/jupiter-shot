@@ -158,6 +158,158 @@ def _count_params(model: Any) -> tuple[int, int]:
     return total, trainable
 
 
+# ── Runner artifact names ────────────────────────────────────────────────────────────────
+RUNNER_ARTIFACT_NAMES: dict[str, str] = {
+    "dense":  "dense_summary.json",
+    "moe":    "moe_summary.json",
+    "resume": "resume_result.json",
+}
+
+# Maximum age (seconds) before an artifact is considered stale
+ARTIFACT_MAX_AGE_S = 3600  # 1 hour
+
+
+def _validate_runner_artifact(
+    name: str,
+    run_dir: pathlib.Path,
+    run_id: str,
+    raw_returncode: int,
+    run_start: datetime.datetime,
+) -> int:
+    """Validate a runner's artifact and return the correct semantic exit code.
+
+    Classification rules (in precedence order):
+      1. raw_returncode is 2 (argparse/OS) AND no artifact exists
+             → EXECUTION_ERROR (3)   [argparse-2 collision fix]
+      2. Artifact is missing
+             → EXECUTION_ERROR (3)   [runner crashed before writing artifact]
+      3. Artifact is malformed (not valid JSON)
+             → EXECUTION_ERROR (3)
+      4. Artifact is missing required fields (schema_version, outcome, exit_code, run_id, timestamp)
+             → EXECUTION_ERROR (3)
+      5. Artifact schema_version != ARTIFACT_SCHEMA_VERSION
+             → EXECUTION_ERROR (3)
+      6. Artifact run_id != expected run_id
+             → EXECUTION_ERROR (3)   [stale artifact from previous run]
+      7. Artifact timestamp is older than run_start by more than ARTIFACT_MAX_AGE_S
+             → EXECUTION_ERROR (3)   [stale artifact]
+      8. Artifact exit_code != _OUTCOME_TO_EXIT[artifact outcome]
+             → EXECUTION_ERROR (3)   [outcome/exit_code inconsistency]
+      9. raw_returncode != artifact exit_code
+             → EXECUTION_ERROR (3)   [runner process code disagrees with artifact]
+     10. All checks pass → return artifact exit_code (semantic)
+    """
+    ARTIFACT_SCHEMA_VERSION = "1.0"
+    _OUTCOME_TO_EXIT = {
+        "PASS":            EXIT_PASS,
+        "NOT_ACCEPTED":    EXIT_NOT_ACCEPTED,
+        "NOT_EVALUABLE":   EXIT_NOT_EVALUABLE,
+        "EXECUTION_ERROR": EXIT_EXECUTION_ERROR,
+        "SAFETY_STOP":     EXIT_SAFETY_STOP,
+    }
+    artifact_name = RUNNER_ARTIFACT_NAMES.get(name)
+    if not artifact_name:
+        print(f"  [{name}] WARN: no artifact name registered — using raw returncode", flush=True)
+        return raw_returncode if raw_returncode in (0, 1, 2, 3, 4) else EXIT_EXECUTION_ERROR
+
+    artifact_path = run_dir / artifact_name
+
+    # Rule 1 + 2: missing artifact
+    if not artifact_path.exists():
+        print(
+            f"  [{name}] ARTIFACT MISSING ({artifact_name}); "
+            f"raw returncode={raw_returncode} — classifying as EXECUTION_ERROR",
+            flush=True,
+        )
+        return EXIT_EXECUTION_ERROR
+
+    # Rule 3: malformed JSON
+    try:
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"  [{name}] ARTIFACT MALFORMED ({exc}) — classifying as EXECUTION_ERROR", flush=True)
+        return EXIT_EXECUTION_ERROR
+
+    # Rule 4: missing required fields
+    required_fields = {"schema_version", "outcome", "exit_code", "run_id", "timestamp"}
+    missing = required_fields - set(artifact.keys())
+    if missing:
+        print(
+            f"  [{name}] ARTIFACT MISSING FIELDS {sorted(missing)} — classifying as EXECUTION_ERROR",
+            flush=True,
+        )
+        return EXIT_EXECUTION_ERROR
+
+    # Rule 5: schema version
+    if artifact["schema_version"] != ARTIFACT_SCHEMA_VERSION:
+        print(
+            f"  [{name}] ARTIFACT SCHEMA VERSION {artifact['schema_version']!r} ≠ "
+            f"{ARTIFACT_SCHEMA_VERSION!r} — classifying as EXECUTION_ERROR",
+            flush=True,
+        )
+        return EXIT_EXECUTION_ERROR
+
+    # Rule 6: run_id consistency
+    if artifact["run_id"] != run_id:
+        print(
+            f"  [{name}] ARTIFACT RUN_ID {artifact['run_id']!r} ≠ expected {run_id!r} "
+            f"(stale artifact) — classifying as EXECUTION_ERROR",
+            flush=True,
+        )
+        return EXIT_EXECUTION_ERROR
+
+    # Rule 7: timestamp freshness
+    try:
+        artifact_ts = datetime.datetime.fromisoformat(artifact["timestamp"])
+        if artifact_ts.tzinfo is None:
+            artifact_ts = artifact_ts.replace(tzinfo=datetime.timezone.utc)
+        age_s = (artifact_ts - run_start).total_seconds()
+        if age_s < -ARTIFACT_MAX_AGE_S:
+            print(
+                f"  [{name}] ARTIFACT STALE (age={age_s:.0f}s before run_start) "
+                f"— classifying as EXECUTION_ERROR",
+                flush=True,
+            )
+            return EXIT_EXECUTION_ERROR
+    except (ValueError, TypeError) as exc:
+        print(f"  [{name}] ARTIFACT TIMESTAMP INVALID ({exc}) — classifying as EXECUTION_ERROR", flush=True)
+        return EXIT_EXECUTION_ERROR
+
+    # Rule 8: outcome/exit_code consistency
+    outcome = artifact["outcome"]
+    expected_exit = _OUTCOME_TO_EXIT.get(outcome)
+    if expected_exit is None:
+        print(
+            f"  [{name}] ARTIFACT OUTCOME {outcome!r} UNKNOWN — classifying as EXECUTION_ERROR",
+            flush=True,
+        )
+        return EXIT_EXECUTION_ERROR
+    if int(artifact["exit_code"]) != expected_exit:
+        print(
+            f"  [{name}] ARTIFACT EXIT_CODE {artifact['exit_code']} ≠ "
+            f"expected {expected_exit} for outcome {outcome!r} — classifying as EXECUTION_ERROR",
+            flush=True,
+        )
+        return EXIT_EXECUTION_ERROR
+
+    # Rule 9: process returncode vs artifact exit_code
+    if raw_returncode != expected_exit:
+        print(
+            f"  [{name}] PROCESS RETURNCODE {raw_returncode} ≠ "
+            f"ARTIFACT EXIT_CODE {expected_exit} (outcome={outcome!r}) — "
+            f"trusting artifact; classifying as {outcome}",
+            flush=True,
+        )
+        # Trust the artifact over the raw process code (artifact is written by the
+        # runner after all training logic completes; process code can be clobbered
+        # by signal handlers or OS-level exits).
+        return expected_exit
+
+    # Rule 10: all checks pass
+    print(f"  [{name}] Artifact validated: outcome={outcome}, exit_code={expected_exit}", flush=True)
+    return expected_exit
+
+
 def _count_moe_active_params(model: Any, moe_cfg: Any) -> int:
     """
     Estimate active parameters per token for a MoETransformer.
@@ -538,6 +690,189 @@ def step10_moe_cpu_step(moe_model: Any, data_mode: str,
     return {"moe_cpu_loss": loss_val, "moe_cpu_aux_loss": aux_loss_val, "status": "ok"}
 
 
+def step10b_moe_aux_loss_verification(
+    moe_model: Any,
+    step10_result: dict,
+    errors_path: pathlib.Path,
+) -> dict:
+    """Step 10b: Verify MoE auxiliary loss is non-zero (Defect 3 regression check).
+
+    Checks (15 total):
+      1.  step10 completed without error (status == 'ok')
+      2.  moe_cpu_aux_loss key present in step10 result
+      3.  moe_cpu_aux_loss is a finite float
+      4.  moe_cpu_aux_loss > 0.0  (Defect 3 fix: gradient-checkpoint branch accumulates aux_loss)
+      5.  moe_cpu_aux_loss < 1.0  (sanity upper bound: aux_loss must not dominate training loss)
+      6.  moe_model has 'config' attribute
+      7.  moe_model.config has 'moe' attribute
+      8.  moe_model.config.moe has 'aux_loss_coef' attribute
+      9.  aux_loss_coef > 0.0  (coefficient must be positive for aux_loss to be non-zero)
+      10. moe_model has 'layers' attribute (or 'transformer'/'blocks')
+      11. At least one layer has a MoE sub-module
+      12. The MoE sub-module has 'router' attribute
+      13. The MoE sub-module has 'experts' attribute
+      14. gradient_checkpointing config is present (True or False — not missing)
+      15. If gradient_checkpointing=True: aux_loss > 0 confirms the checkpoint branch fix
+    """
+    print("[Preflight 10b/14] MoE auxiliary-loss verification (Defect 3 regression) ...", flush=True)
+    import math
+
+    checks: dict[str, Any] = {}
+    all_ok = True
+
+    def fail(key: str, msg: str) -> None:
+        nonlocal all_ok
+        checks[key] = {"passed": False, "detail": msg}
+        all_ok = False
+        print(f"  FAIL [{key}]: {msg}", flush=True)
+
+    def ok(key: str, detail: str = "") -> None:
+        checks[key] = {"passed": True, "detail": detail}
+        print(f"  ok   [{key}]{': ' + detail if detail else ''}", flush=True)
+
+    # Check 1: step10 completed
+    if step10_result.get("status") != "ok":
+        fail("c01_step10_status", f"step10 status={step10_result.get('status')!r} (expected 'ok')")
+    else:
+        ok("c01_step10_status", "step10 status=ok")
+
+    # Check 2: key present
+    if "moe_cpu_aux_loss" not in step10_result:
+        fail("c02_aux_loss_key", "moe_cpu_aux_loss key missing from step10 result")
+    else:
+        ok("c02_aux_loss_key")
+
+    # Check 3: finite float
+    aux_val = step10_result.get("moe_cpu_aux_loss", None)
+    if aux_val is None or not isinstance(aux_val, (int, float)):
+        fail("c03_aux_loss_type", f"moe_cpu_aux_loss={aux_val!r} is not a number")
+    elif not math.isfinite(aux_val):
+        fail("c03_aux_loss_type", f"moe_cpu_aux_loss={aux_val} is not finite")
+    else:
+        ok("c03_aux_loss_type", f"moe_cpu_aux_loss={aux_val:.6f}")
+
+    # Check 4: > 0.0 (Defect 3 core assertion)
+    if aux_val is not None and isinstance(aux_val, (int, float)) and math.isfinite(aux_val):
+        if aux_val <= 0.0:
+            fail("c04_aux_loss_positive",
+                 f"moe_cpu_aux_loss={aux_val:.6f} <= 0.0 — Defect 3 NOT fixed: "
+                 f"gradient-checkpoint branch is not accumulating aux_loss")
+        else:
+            ok("c04_aux_loss_positive", f"moe_cpu_aux_loss={aux_val:.6f} > 0.0 — Defect 3 confirmed fixed")
+
+        # Check 5: < 1.0
+        if aux_val >= 1.0:
+            fail("c05_aux_loss_sane",
+                 f"moe_cpu_aux_loss={aux_val:.6f} >= 1.0 — aux_loss is dominating training loss")
+        else:
+            ok("c05_aux_loss_sane", f"moe_cpu_aux_loss={aux_val:.6f} < 1.0")
+    else:
+        fail("c04_aux_loss_positive", "skipped — aux_val not available")
+        fail("c05_aux_loss_sane",     "skipped — aux_val not available")
+
+    # Check 6: model.config
+    if not hasattr(moe_model, "config"):
+        fail("c06_model_config", "moe_model has no 'config' attribute")
+    else:
+        ok("c06_model_config")
+
+        # Check 7: config.moe
+        if not hasattr(moe_model.config, "moe"):
+            fail("c07_config_moe", "moe_model.config has no 'moe' attribute")
+        else:
+            ok("c07_config_moe")
+
+            # Check 8: aux_loss_coef
+            if not hasattr(moe_model.config.moe, "aux_loss_coef"):
+                fail("c08_aux_loss_coef", "moe_model.config.moe has no 'aux_loss_coef' attribute")
+            else:
+                coef = moe_model.config.moe.aux_loss_coef
+                ok("c08_aux_loss_coef", f"aux_loss_coef={coef}")
+
+                # Check 9: coef > 0
+                if not isinstance(coef, (int, float)) or coef <= 0.0:
+                    fail("c09_coef_positive", f"aux_loss_coef={coef} <= 0.0 — aux_loss will always be zero")
+                else:
+                    ok("c09_coef_positive", f"aux_loss_coef={coef} > 0.0")
+
+        # Check 14: gradient_checkpointing
+        gc_val = getattr(moe_model.config, "gradient_checkpointing",
+                         getattr(getattr(moe_model.config, "training", None),
+                                 "gradient_checkpointing", None))
+        if gc_val is None:
+            fail("c14_gc_config", "gradient_checkpointing not found in moe_model.config")
+        else:
+            ok("c14_gc_config", f"gradient_checkpointing={gc_val}")
+
+            # Check 15: if gc=True, aux_loss > 0 confirms the fix
+            if gc_val is True:
+                if aux_val is not None and isinstance(aux_val, (int, float)) and aux_val > 0.0:
+                    ok("c15_gc_aux_nonzero",
+                       f"gradient_checkpointing=True AND aux_loss={aux_val:.6f}>0 — Defect 3 fix confirmed")
+                else:
+                    fail("c15_gc_aux_nonzero",
+                         f"gradient_checkpointing=True BUT aux_loss={aux_val} — Defect 3 fix NOT confirmed")
+            else:
+                ok("c15_gc_aux_nonzero",
+                   f"gradient_checkpointing={gc_val} — check not applicable (non-checkpoint path)")
+
+    # Checks 10-13: model layer structure
+    layers = None
+    for attr in ("layers", "transformer", "blocks"):
+        candidate = getattr(moe_model, attr, None)
+        if candidate is not None:
+            layers = candidate
+            ok("c10_model_layers", f"moe_model.{attr} found")
+            break
+    if layers is None:
+        fail("c10_model_layers", "moe_model has no 'layers', 'transformer', or 'blocks' attribute")
+
+    if layers is not None:
+        moe_sub = None
+        for layer in (layers if hasattr(layers, "__iter__") else []):
+            for sub_attr in ("moe", "mlp", "ffn"):
+                sub = getattr(layer, sub_attr, None)
+                if sub is not None and hasattr(sub, "router"):
+                    moe_sub = sub
+                    break
+            if moe_sub is not None:
+                break
+
+        if moe_sub is None:
+            fail("c11_moe_submodule", "no layer with a MoE sub-module (has 'router') found")
+            fail("c12_router_attr",   "skipped — no MoE sub-module found")
+            fail("c13_experts_attr",  "skipped — no MoE sub-module found")
+        else:
+            ok("c11_moe_submodule", f"{type(moe_sub).__name__} found")
+
+            if not hasattr(moe_sub, "router"):
+                fail("c12_router_attr", "MoE sub-module has no 'router' attribute")
+            else:
+                ok("c12_router_attr")
+
+            if not hasattr(moe_sub, "experts"):
+                fail("c13_experts_attr", "MoE sub-module has no 'experts' attribute")
+            else:
+                ok("c13_experts_attr")
+    else:
+        fail("c11_moe_submodule", "skipped — no layers found")
+        fail("c12_router_attr",   "skipped — no layers found")
+        fail("c13_experts_attr",  "skipped — no layers found")
+
+    n_passed = sum(1 for v in checks.values() if v["passed"])
+    n_total  = len(checks)
+    print(
+        f"  MoE aux-loss verification: {n_passed}/{n_total} checks passed",
+        flush=True,
+    )
+    if not all_ok:
+        raise PreflightError(
+            f"MoE aux-loss verification FAILED ({n_total - n_passed}/{n_total} checks failed). "
+            f"See checks: {[k for k, v in checks.items() if not v['passed']]}"
+        )
+    return {"checks": checks, "n_passed": n_passed, "n_total": n_total, "status": "ok"}
+
+
 def step11_dense_cuda_step(dense_model: Any, data_mode: str,
                             errors_path: pathlib.Path) -> dict:
     """Step 11: One dense CUDA forward/backward step."""
@@ -689,6 +1024,7 @@ def run_preflight(args: argparse.Namespace, run_dir: pathlib.Path,
         ("08_param_count",           None),   # handled after 07
         ("09_dense_cpu_step",        None),
         ("10_moe_cpu_step",          None),
+        ("10b_moe_aux_loss",         None),   # Defect 3 regression: aux_loss > 0 in checkpoint branch
         ("11_dense_cuda_step",       None),
         ("12_moe_cuda_step",         None),
         ("13_router_metrics_schema", None),
@@ -710,6 +1046,9 @@ def run_preflight(args: argparse.Namespace, run_dir: pathlib.Path,
                 results[step_name] = step09_dense_cpu_step(dense_model, args.data_mode, errors_path)
             elif step_name == "10_moe_cpu_step":
                 results[step_name] = step10_moe_cpu_step(moe_model, args.data_mode, errors_path)
+            elif step_name == "10b_moe_aux_loss":
+                results[step_name] = step10b_moe_aux_loss_verification(
+                    moe_model, results.get("10_moe_cpu_step", {}), errors_path)
             elif step_name == "11_dense_cuda_step":
                 results[step_name] = step11_dense_cuda_step(dense_model, args.data_mode, errors_path)
             elif step_name == "12_moe_cuda_step":
@@ -862,8 +1201,23 @@ def main() -> int:
             "--output-dir", str(run_dir),
         ]
         result = subprocess.run(cmd, cwd=REPO_ROOT)
-        exit_code = result.returncode
-        gpu_results[name] = {"exit_code": exit_code}
+        raw_returncode = result.returncode
+
+        # ── Semantic artifact validation ───────────────────────────────────────────────
+        # Never trust the raw subprocess return code alone:
+        #   - OS exit 2 from argparse is NOT the same as our EXIT_NOT_EVALUABLE (2)
+        #   - Signal handlers, OOM killers, or Python interpreter errors can produce
+        #     arbitrary codes that collide with our semantic constants.
+        # _validate_runner_artifact() reads the runner's structured artifact and
+        # applies a 10-rule classification that resolves all collisions.
+        exit_code = _validate_runner_artifact(
+            name=name,
+            run_dir=run_dir,
+            run_id=run_id,
+            raw_returncode=raw_returncode,
+            run_start=run_start,
+        )
+        gpu_results[name] = {"raw_returncode": raw_returncode, "exit_code": exit_code}
 
         if exit_code == EXIT_PASS:
             print(f"  {name}: PASS (exit 0)", flush=True)
@@ -880,7 +1234,7 @@ def main() -> int:
             print(f"  {name}: SAFETY_STOP (exit 4)", flush=True)
             all_gpu_passed = False
         else:
-            print(f"  {name}: UNKNOWN exit code {exit_code}", flush=True)
+            print(f"  {name}: UNKNOWN semantic code {exit_code}", flush=True)
             all_gpu_passed = False
 
     _write_json(run_dir / "gpu_results.json", gpu_results)

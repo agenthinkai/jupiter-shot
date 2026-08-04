@@ -36,6 +36,19 @@ sys.path.insert(0, str(REPO_ROOT))
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "laptop"
 CKPT_DIR = REPO_ROOT / "checkpoints" / "laptop"
 
+# ── Semantic artifact contract ────────────────────────────────────────────────
+ARTIFACT_SCHEMA_VERSION  = "1.0"
+EXIT_PASS                = 0
+EXIT_NOT_ACCEPTED        = 1
+EXIT_NOT_EVALUABLE       = 2
+EXIT_EXECUTION_ERROR     = 3
+EXIT_SAFETY_STOP         = 4
+OUTCOME_PASS             = "PASS"
+OUTCOME_NOT_ACCEPTED     = "NOT_ACCEPTED"
+OUTCOME_NOT_EVALUABLE    = "NOT_EVALUABLE"
+OUTCOME_EXECUTION_ERROR  = "EXECUTION_ERROR"
+OUTCOME_SAFETY_STOP      = "SAFETY_STOP"
+
 
 def run_steps(model: Any, optimizer: Any, scheduler: Any, device: Any,
               vocab_size: int, seq_len: int, batch_size: int,
@@ -269,21 +282,41 @@ def main() -> int:
             initial_steps=args.steps,
             output_dir=Path(args.output_dir),
         )
-        # Embed run_id and data_mode into the result artifact
-        result["run_id"] = run_id
-        result["data_mode_arg"] = args.data_mode
-        result["data_source"] = "deterministic_synthetic_tensors"
-        result_path = Path(args.output_dir) / "resume_test.json"
-        if result_path.exists():
-            existing = json.loads(result_path.read_text())
-            existing["run_id"] = run_id
-            existing["data_mode_arg"] = args.data_mode
-            existing["data_source"] = "deterministic_synthetic_tensors"
-            result_path.write_text(json.dumps(existing, indent=2, default=str))
-        return 0 if result["passed"] else 1
+        # Inject semantic artifact contract fields
+        _outcome  = OUTCOME_PASS if result["passed"] else OUTCOME_NOT_ACCEPTED
+        _exit     = EXIT_PASS    if result["passed"] else EXIT_NOT_ACCEPTED
+        result.update({
+            "run_id":         run_id,
+            "outcome":        _outcome,
+            "exit_code":      _exit,
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "timestamp":      _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "data_mode_arg":  args.data_mode,
+            "data_source":    "deterministic_synthetic_tensors",
+        })
+        result_path = Path(args.output_dir) / "resume_result.json"
+        result_path.write_text(json.dumps(result, indent=2, default=str))
+        return _exit
     except RuntimeError as e:
         print(f"\n[FAIL] {e}")
-        return 1
+        # Write a minimal failure artifact so the pipeline can read it
+        import datetime as _dt2
+        failure_artifact = {
+            "run_id":         run_id,
+            "outcome":        OUTCOME_EXECUTION_ERROR,
+            "exit_code":      EXIT_EXECUTION_ERROR,
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "timestamp":      _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
+            "error":          str(e),
+        }
+        try:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(args.output_dir) / "resume_result.json").write_text(
+                json.dumps(failure_artifact, indent=2)
+            )
+        except Exception:
+            pass
+        return EXIT_EXECUTION_ERROR
 
 
 if __name__ == "__main__":

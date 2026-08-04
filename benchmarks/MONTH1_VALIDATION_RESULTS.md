@@ -808,3 +808,46 @@ Run 10 achieves **LAPTOP ARCHITECTURAL PASS** only when every mandatory criterio
 3. **LAPTOP ARCHITECTURAL PASS** declared
 
 **What a LAPTOP ARCHITECTURAL PASS authorizes:** Preparation for controlled Stage B distributed validation only. It does **not** authorize 200B pretraining, 500B pretraining, 20T training, or Azure spending without a separate approved Stage B plan.
+
+
+---
+
+## Run 11 — Exit-Code Contract Repair (2026-08-04)
+
+**Status:** DOCUMENTATION CORRECTION + IMPLEMENTATION FIX
+
+### Run 9 Exit-Code Correction
+
+Previous documentation incorrectly classified the Run 9 full-run failure as `NOT_EVALUABLE` (2). The correct classification is `EXECUTION_ERROR` (3).
+
+| Field | Previous (incorrect) | Corrected |
+|---|---|---|
+| Run 9 full-run exit code | NOT_EVALUABLE (2) | **EXECUTION_ERROR (3)** |
+| Cause | argparse unrecognized arguments | argparse unrecognized arguments |
+| Classification rule | Raw OS exit 2 → NOT_EVALUABLE | Raw OS exit 2 with no artifact → EXECUTION_ERROR |
+
+**Why this matters:** `NOT_EVALUABLE` (2) means the hardware was present but the test could not be evaluated (e.g., CUDA driver mismatch). `EXECUTION_ERROR` (3) means the software itself failed before any evaluation could begin. The Run 9 runners exited with argparse code 2 before a single training step executed — this is a software defect, not a hardware evaluation gap.
+
+### Changes in This Commit
+
+1. **`_validate_runner_artifact()` added to pipeline** — reads structured artifact after each runner subprocess; maps raw argparse exit 2 (no artifact) to EXECUTION_ERROR (3); only maps to NOT_EVALUABLE (2) when artifact explicitly says `outcome=NOT_EVALUABLE`
+
+2. **Dense runner + resume runner artifact contract** — both now write `outcome`, `exit_code`, `schema_version`, `timestamp` into their summary artifacts (MoE runner already had this contract)
+
+3. **`step10b_moe_aux_loss_verification()` added to preflight** — 15-check gate verifying `aux_loss > 0` after gradient-checkpoint branch fix (Defect 3); halts preflight with `PreflightError` if any check fails
+
+4. **16-scenario exit-code test matrix** — `tests/test_run11_exit_code_matrix.py` — executable logic tests calling `_validate_runner_artifact()` directly; all 16 pass
+
+5. **8 MoE aux-loss regression tests** — `TestStep10bMoeAuxLoss` class in same file; all 8 pass
+
+### Exit-Code Contract (Authoritative)
+
+| Code | Name | Meaning | When raised |
+|---|---|---|---|
+| 0 | PASS | All acceptance criteria met | Artifact present, outcome=PASS, exit_code=0 |
+| 1 | NOT_ACCEPTED | Training ran but loss/metrics outside acceptance bounds | Artifact present, outcome=NOT_ACCEPTED |
+| 2 | NOT_EVALUABLE | Hardware present but test could not be evaluated | Artifact present, outcome=NOT_EVALUABLE (e.g., CUDA driver mismatch) |
+| 3 | EXECUTION_ERROR | Software failure before or during evaluation | No artifact, malformed artifact, stale artifact, argparse exit, or artifact says EXECUTION_ERROR |
+| 4 | SAFETY_STOP | Hardware safety condition triggered | Artifact present, outcome=SAFETY_STOP |
+
+**Critical rule:** Raw OS exit code 2 (argparse unrecognized arguments) with **no artifact** is always EXECUTION_ERROR (3). It is never NOT_EVALUABLE (2) without a valid artifact explicitly stating so.

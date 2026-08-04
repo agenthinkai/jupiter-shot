@@ -55,6 +55,29 @@ THERMAL_STOP_C = 90
 MAX_OOM_RETRIES = 3
 METRIC_FLUSH_INTERVAL = 10  # steps
 
+# ── Semantic artifact contract ────────────────────────────────────────────────
+# All runners must write these fields so the pipeline can validate artifacts
+# without relying on raw subprocess exit codes.
+ARTIFACT_SCHEMA_VERSION = "1.0"
+EXIT_PASS             = 0
+EXIT_NOT_ACCEPTED     = 1
+EXIT_NOT_EVALUABLE    = 2
+EXIT_EXECUTION_ERROR  = 3
+EXIT_SAFETY_STOP      = 4
+OUTCOME_PASS             = "PASS"
+OUTCOME_NOT_ACCEPTED     = "NOT_ACCEPTED"
+OUTCOME_NOT_EVALUABLE    = "NOT_EVALUABLE"
+OUTCOME_EXECUTION_ERROR  = "EXECUTION_ERROR"
+OUTCOME_SAFETY_STOP      = "SAFETY_STOP"
+# Mapping from outcome string to exit code (used when writing the artifact)
+_OUTCOME_TO_EXIT = {
+    OUTCOME_PASS:            EXIT_PASS,
+    OUTCOME_NOT_ACCEPTED:    EXIT_NOT_ACCEPTED,
+    OUTCOME_NOT_EVALUABLE:   EXIT_NOT_EVALUABLE,
+    OUTCOME_EXECUTION_ERROR: EXIT_EXECUTION_ERROR,
+    OUTCOME_SAFETY_STOP:     EXIT_SAFETY_STOP,
+}
+
 
 def _gpu_temp() -> Optional[int]:
     """Read GPU temperature from nvidia-smi. Returns None if unavailable."""
@@ -463,6 +486,23 @@ def run_dense_validation(
         ),
     })
 
+    # ── Semantic artifact contract fields ──────────────────────────────────────────────
+    # These fields are required by the pipeline's _validate_runner_artifact().
+    # outcome and exit_code are derived from status; run_id and timestamp are
+    # injected by main() after this function returns.
+    if summary["status"] == "COMPLETED":
+        _outcome = OUTCOME_PASS
+    elif summary["status"] == "INTERRUPTED":
+        # Interrupted by SIGTERM/CTRL+C — treated as NOT_EVALUABLE (ran but no
+        # final acceptance verdict); pipeline will read the artifact and classify.
+        _outcome = OUTCOME_NOT_EVALUABLE
+    else:
+        _outcome = OUTCOME_EXECUTION_ERROR
+    summary["outcome"]        = _outcome
+    summary["exit_code"]      = _OUTCOME_TO_EXIT[_outcome]
+    summary["schema_version"] = ARTIFACT_SCHEMA_VERSION
+    # timestamp is written by main() after run_id is known
+
     summary_path = output_dir / "dense_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, default=str))
     print(f"\n[SUMMARY] Saved: {summary_path}")
@@ -546,17 +586,34 @@ def main() -> int:
             thermal_stop=args.thermal_stop,
             output_dir=Path(args.output_dir),
         )
-        # Embed run_id into the summary artifact for pipeline artifact validation
-        summary["run_id"] = run_id
+        # Inject run_id and timestamp into the summary artifact so the pipeline
+        # can validate artifact freshness and run_id consistency.
+        summary["run_id"]    = run_id
+        summary["timestamp"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
         summary_path = Path(args.output_dir) / "dense_summary.json"
-        if summary_path.exists():
-            existing = json.loads(summary_path.read_text())
-            existing["run_id"] = run_id
-            summary_path.write_text(json.dumps(existing, indent=2, default=str))
-        return 0 if summary["status"] in ("COMPLETED", "INTERRUPTED") else 1
+        summary_path.write_text(json.dumps(summary, indent=2, default=str))
+        # Return the semantic exit_code written by run_dense_validation()
+        return int(summary.get("exit_code", EXIT_EXECUTION_ERROR))
     except (RuntimeError, FileNotFoundError) as e:
         print(f"\n[FAIL] {e}")
-        return 1
+        # Write a minimal failure artifact so the pipeline can read it
+        import datetime as _dt2
+        failure_artifact = {
+            "run_id":         run_id,
+            "outcome":        OUTCOME_EXECUTION_ERROR,
+            "exit_code":      EXIT_EXECUTION_ERROR,
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "timestamp":      _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
+            "error":          str(e),
+        }
+        try:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(args.output_dir) / "dense_summary.json").write_text(
+                json.dumps(failure_artifact, indent=2)
+            )
+        except Exception:
+            pass
+        return EXIT_EXECUTION_ERROR
 
 
 if __name__ == "__main__":

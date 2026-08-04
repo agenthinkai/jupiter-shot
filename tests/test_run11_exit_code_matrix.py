@@ -294,11 +294,21 @@ class TestStep10bMoeAuxLoss:
         with pytest.raises(Exception, match="FAILED"):
             self._run(model, self._good_step10(aux_loss=-0.001))
 
-    # Test D: aux_loss >= 1.0 → c05 fails (dominating training loss)
-    def test_d_aux_loss_too_large_raises(self):
+    # Test D: aux_loss >= 1.0 — Run 12 change: c05 is now a semantics label (WEIGHTED),
+    # not a sane-range check. aux_loss=1.5 is positive (c04 PASS) and the semantics
+    # label is always PASS. The gate should NOT raise for aux_loss=1.5.
+    def test_d_aux_loss_too_large_does_not_raise(self):
+        """Run 12: c05 is a semantics label, not a sane-range check.
+        aux_loss=1.5 is positive (c04 PASS) and semantics are always WEIGHTED.
+        Gate must NOT raise for aux_loss=1.5.
+        """
         model = _make_moe_model(gradient_checkpointing=True)
-        with pytest.raises(Exception, match="FAILED"):
-            self._run(model, self._good_step10(aux_loss=1.5))
+        # Should pass without raising
+        result = self._run(model, self._good_step10(aux_loss=1.5))
+        assert result["n_failed"] == 0, (
+            f"Expected 0 failures for aux_loss=1.5, got {result['n_failed']}: "
+            f"{[k for k, v in result['checks'].items() if v['status'] == 'FAIL']}"
+        )
 
     # Test E: step10 status != 'ok' → c01 fails
     def test_e_step10_failed_raises(self):

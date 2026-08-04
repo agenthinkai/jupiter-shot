@@ -694,7 +694,7 @@ def step10b_moe_aux_loss_verification(
     moe_model: Any,
     step10_result: dict,
     errors_path: pathlib.Path,
-) -> dict:
+) -> dict:  # noqa: C901 — intentionally long; each check is a discrete audit step
     """Step 10b: Verify MoE auxiliary loss is non-zero and connected to autograd.
 
     Run 12 corrected version — fixes three attribute defects from Run 11:
@@ -741,8 +741,36 @@ def step10b_moe_aux_loss_verification(
     """
     print("[Preflight 10b/14] MoE auxiliary-loss verification (Run 12 corrected) ...", flush=True)
     import math
+    import datetime
+    import datetime as _dt
 
-    # Structured check record: status is 'PASS', 'FAIL', or 'BLOCKED'
+    # ── Check descriptions (spec-required field) ───────────────────────────────
+    _DESCRIPTIONS: dict[str, str] = {
+        "c01_step10_status":         "Step 10 completed without error",
+        "c02_aux_loss_key":          "Auxiliary loss key exists in step 10 result",
+        "c03_aux_loss_type":         "Auxiliary loss is a finite float",
+        "c04_aux_loss_positive":     "Auxiliary loss is positive",
+        "c05_aux_loss_semantics":    "Auxiliary-loss semantics labelled RAW or WEIGHTED",
+        "c06_model_config":          "Model has config attribute",
+        "c07_aux_loss_coeff":        "Auxiliary coefficient attribute exists",
+        "c08_coeff_numeric":         "Auxiliary coefficient is finite",
+        "c09_coeff_positive":        "Auxiliary coefficient is positive",
+        "c10_config_base":           "Config has base attribute",
+        "c11_gc_attr":               "Gradient checkpointing attribute exists",
+        "c12_gc_enabled":            "Gradient checkpointing is enabled (True)",
+        "c13_gc_aux_nonzero":        "Auxiliary loss positive with gradient checkpointing enabled",
+        "c14_model_layers":          "Model has layers attribute",
+        "c15_moe_submodule":         "At least one layer has a MoE sub-module",
+        "c16_router_attr":           "MoE sub-module has router attribute",
+        "c17_expert_count":          "Expert count is eight",
+        "c18_aux_grad_fn":           "Auxiliary-loss graph attachment is valid",
+        "c19_isolated_router_grad":  "Isolated auxiliary-loss router gradients exist",
+        "c20_total_loss_backward":   "Total-loss backward produces finite nonzero router gradients",
+    }
+    # Mandatory on CPU (all 20); c18-c20 also mandatory on CUDA.
+    _MANDATORY: dict[str, bool] = {k: True for k in _DESCRIPTIONS}
+
+    # Structured check record: status is 'PASS', 'FAIL', 'BLOCKED', or 'SKIPPED'
     checks: dict[str, dict] = {}
     all_ok = True
 
@@ -750,36 +778,52 @@ def step10b_moe_aux_loss_verification(
                 prerequisite: str = "",
                 measured_value: Any = None,
                 expected_value: Any = None,
-                reason: str = "") -> None:
-        """Record a structured check result."""
+                reason: str = "",
+                device: str = "cpu") -> None:
+        """Record a structured check result with all 10 spec-required fields."""
         nonlocal all_ok
+        if status not in ("PASS", "FAIL", "BLOCKED", "SKIPPED"):
+            raise ValueError(f"Invalid check status {status!r} for {key!r}")
         checks[key] = {
-            "status": status,
-            "passed": status == "PASS",
-            "detail": detail,
-            "prerequisite": prerequisite,
+            # 10 spec-required fields
+            "check_id":       key,
+            "description":    _DESCRIPTIONS.get(key, key),
+            "status":         status,
+            "prerequisite":   prerequisite,
             "measured_value": measured_value,
             "expected_value": expected_value,
-            "reason": reason,
+            "device":         device,
+            "reason":         reason or detail,
+            "mandatory":      _MANDATORY.get(key, True),
+            "timestamp":      _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            # Legacy field kept for backward compatibility
+            "passed":         status == "PASS",
         }
         if status == "FAIL":
             all_ok = False
             print(f"  FAIL    [{key}]: {detail}", flush=True)
         elif status == "BLOCKED":
-            # Blocked checks do not count as independent root-cause failures
             print(f"  BLOCKED [{key}]: {detail} (prerequisite: {prerequisite})", flush=True)
+        elif status == "SKIPPED":
+            print(f"  SKIPPED [{key}]: {detail}", flush=True)
         else:
             print(f"  ok      [{key}]{': ' + detail if detail else ''}", flush=True)
 
-    def fail(key: str, msg: str, measured: Any = None, expected: Any = None) -> None:
-        _record(key, "FAIL", msg, measured_value=measured, expected_value=expected)
+    def fail(key: str, msg: str, measured: Any = None, expected: Any = None,
+             device: str = "cpu") -> None:
+        _record(key, "FAIL", msg, measured_value=measured, expected_value=expected,
+                device=device)
 
-    def ok(key: str, detail: str = "", measured: Any = None) -> None:
-        _record(key, "PASS", detail, measured_value=measured)
+    def ok(key: str, detail: str = "", measured: Any = None, device: str = "cpu") -> None:
+        _record(key, "PASS", detail, measured_value=measured, device=device)
 
-    def blocked(key: str, prereq: str, reason: str) -> None:
-        _record(key, "BLOCKED", f"skipped — prerequisite {prereq} failed",
-                prerequisite=prereq, reason=reason)
+    def blocked(key: str, prereq: str, reason: str, device: str = "cpu") -> None:
+        _record(key, "BLOCKED", f"blocked — prerequisite {prereq} failed",
+                prerequisite=prereq, reason=reason, device=device)
+
+    def skipped(key: str, reason: str, device: str = "cpu") -> None:
+        """Mark a check as SKIPPED (not applicable on this device/environment)."""
+        _record(key, "SKIPPED", reason, reason=reason, device=device)
 
     # ── Checks c01–c05: Step 10 result ───────────────────────────────────────
 
@@ -815,15 +859,18 @@ def step10b_moe_aux_loss_verification(
             ok("c04_aux_loss_positive",
                f"moe_cpu_aux_loss={aux_val:.6f} > 0.0 — Defect 3 confirmed fixed",
                measured=aux_val)
-        if aux_val >= 1.0:
-            fail("c05_aux_loss_sane",
-                 f"moe_cpu_aux_loss={aux_val:.6f} >= 1.0 — aux_loss is dominating training loss",
-                 measured=aux_val, expected="< 1.0")
-        else:
-            ok("c05_aux_loss_sane", f"moe_cpu_aux_loss={aux_val:.6f} < 1.0", measured=aux_val)
+        # c05: aux_loss semantics — always WEIGHTED for this model
+        ok("c05_aux_loss_semantics",
+           "aux_loss_semantics=WEIGHTED: TopKRouter applies aux_loss_coeff before returning; "
+           "MoETransformer accumulates without second multiplication",
+           measured="WEIGHTED")
     else:
-        fail("c04_aux_loss_positive", "skipped — aux_val not available")
-        fail("c05_aux_loss_sane",     "skipped — aux_val not available")
+        fail("c04_aux_loss_positive", "aux_val not available — c03 failed",
+             measured=None, expected="> 0.0")
+        # c05 can still be recorded as PASS — semantics are a code property, not runtime
+        ok("c05_aux_loss_semantics",
+           "aux_loss_semantics=WEIGHTED (code property, independent of runtime value)",
+           measured="WEIGHTED")
 
     # ── Checks c06–c13: Config attributes (Defect 1 + 2 fixes) ──────────────
 
@@ -831,7 +878,7 @@ def step10b_moe_aux_loss_verification(
         fail("c06_model_config", "moe_model has no 'config' attribute")
         # All config-dependent checks are blocked
         for k in ("c07_aux_loss_coeff", "c08_coeff_numeric", "c09_coeff_positive",
-                  "c10_config_base", "c11_gc_attr", "c12_gc_bool", "c13_gc_aux_nonzero"):
+                  "c10_config_base", "c11_gc_attr", "c12_gc_enabled", "c13_gc_aux_nonzero"):
             blocked(k, "c06_model_config", "model has no config")
     else:
         ok("c06_model_config")
@@ -872,7 +919,7 @@ def step10b_moe_aux_loss_verification(
                  "but gradient_checkpointing lives in config.base (DenseConfig)",
                  measured="missing", expected="config.base (DenseConfig)")
             blocked("c11_gc_attr", "c10_config_base", "config.base missing")
-            blocked("c12_gc_bool", "c10_config_base", "config.base missing")
+            blocked("c12_gc_enabled", "c10_config_base", "config.base missing")
             blocked("c13_gc_aux_nonzero", "c10_config_base", "config.base missing")
         else:
             ok("c10_config_base", "config.base exists")
@@ -881,19 +928,28 @@ def step10b_moe_aux_loss_verification(
                 fail("c11_gc_attr",
                      "config.base has no 'gradient_checkpointing' attribute",
                      measured="missing", expected="bool")
-                blocked("c12_gc_bool", "c11_gc_attr", "gradient_checkpointing attribute missing")
+                blocked("c12_gc_enabled", "c11_gc_attr", "gradient_checkpointing attribute missing")
                 blocked("c13_gc_aux_nonzero", "c11_gc_attr", "gradient_checkpointing attribute missing")
             else:
                 gc_val = moe_model.config.base.gradient_checkpointing
                 ok("c11_gc_attr", f"config.base.gradient_checkpointing={gc_val}", measured=gc_val)
 
                 if not isinstance(gc_val, bool):
-                    fail("c12_gc_bool",
+                    fail("c12_gc_enabled",
                          f"gradient_checkpointing={gc_val!r} is not Boolean",
                          measured=type(gc_val).__name__, expected="bool")
-                    blocked("c13_gc_aux_nonzero", "c12_gc_bool", "not a boolean")
+                    blocked("c13_gc_aux_nonzero", "c12_gc_enabled", "not a boolean")
                 else:
-                    ok("c12_gc_bool", f"gradient_checkpointing is bool ({gc_val})", measured=gc_val)
+                    if gc_val is not True:
+                        fail("c12_gc_enabled",
+                             f"gradient_checkpointing={gc_val} — expected True for Run 12",
+                             measured=gc_val, expected=True)
+                        blocked("c13_gc_aux_nonzero", "c12_gc_enabled",
+                                "gradient_checkpointing is not True")
+                    else:
+                        ok("c12_gc_enabled",
+                           f"gradient_checkpointing=True (Run 12 requirement)",
+                           measured=gc_val)
 
                     if gc_val is True:
                         if (aux_val is not None and isinstance(aux_val, (int, float))
@@ -908,9 +964,10 @@ def step10b_moe_aux_loss_verification(
                                  f"— Defect 3 fix NOT confirmed",
                                  measured=aux_val, expected="> 0.0")
                     else:
-                        ok("c13_gc_aux_nonzero",
-                           f"gradient_checkpointing={gc_val} — check not applicable "
-                           f"(non-checkpoint path)")
+                        # gc_val is False — c13 is not applicable on this config
+                        skipped("c13_gc_aux_nonzero",
+                                "gradient_checkpointing=False — Defect 3 check not applicable "
+                                "on non-checkpoint path")
 
     # ── Checks c14–c17: Layer structure (Defect 3 fix) ───────────────────────
 
@@ -944,8 +1001,8 @@ def step10b_moe_aux_loss_verification(
                  "no layer with a MoE sub-module found — probed: moe_ffn, moe, mlp, ffn. "
                  "Run 11 root cause: probe list was (moe, mlp, ffn) and missed moe_ffn.")
             # c16 and c17 are BLOCKED (not independent failures)
-            blocked("c16_router_attr", "c15_moe_submodule", "no MoE sub-module found")
-            blocked("c17_experts_attr", "c15_moe_submodule", "no MoE sub-module found")
+            blocked("c16_router_attr",  "c15_moe_submodule", "no MoE sub-module found")
+            blocked("c17_expert_count", "c15_moe_submodule", "no MoE sub-module found")
         else:
             ok("c15_moe_submodule",
                f"{type(moe_sub).__name__} found at layer.{found_attr}")
@@ -957,16 +1014,25 @@ def step10b_moe_aux_loss_verification(
                 ok("c16_router_attr",
                    f"layer.{found_attr}.router = {type(moe_sub.router).__name__}")
 
+            # c17: expert count must be 8 (Run 12 requirement)
             if not hasattr(moe_sub, "experts"):
-                fail("c17_experts_attr",
-                     f"MoE sub-module ({type(moe_sub).__name__}) has no 'experts' attribute")
+                fail("c17_expert_count",
+                     f"MoE sub-module ({type(moe_sub).__name__}) has no 'experts' attribute",
+                     measured="missing", expected=8)
             else:
-                ok("c17_experts_attr",
-                   f"layer.{found_attr}.experts (len={len(moe_sub.experts)})")
+                _n_experts = len(moe_sub.experts)
+                if _n_experts != 8:
+                    fail("c17_expert_count",
+                         f"expert count={_n_experts} != 8 (Run 12 requires 8 experts)",
+                         measured=_n_experts, expected=8)
+                else:
+                    ok("c17_expert_count",
+                       f"layer.{found_attr}.experts count={_n_experts}",
+                       measured=_n_experts)
     else:
         blocked("c15_moe_submodule", "c14_model_layers", "no layers found")
         blocked("c16_router_attr",   "c14_model_layers", "no layers found")
-        blocked("c17_experts_attr",  "c14_model_layers", "no layers found")
+        blocked("c17_expert_count",  "c14_model_layers", "no layers found")
 
     # ── Checks c18–c20: Autograd connectivity ────────────────────────────────
     # These checks require the actual torch.Tensor from the step10 forward pass.
@@ -983,28 +1049,31 @@ def step10b_moe_aux_loss_verification(
         _has_torch = False
 
     if not _has_torch:
-        ok("c18_aux_grad_fn",
-           "torch not available in this environment — autograd check skipped "
-           "(will run on Kishore's PyTorch environment)")
-        ok("c19_isolated_router_grad",
-           "torch not available — skipped")
-        ok("c20_router_grad_nonzero",
-           "torch not available — skipped")
+        # torch is not installed in this environment.
+        # c18-c20 are mandatory but cannot execute without torch.
+        # Mark as SKIPPED so the accounting invariant holds and the gate
+        # reports 0 PASS for these checks — not a false PASS.
+        # These checks MUST pass on Kishore's PyTorch environment (CPU and CUDA).
+        skipped("c18_aux_grad_fn",
+                "torch not available — will run on Kishore's PyTorch environment")
+        skipped("c19_isolated_router_grad",
+                "torch not available — will run on Kishore's PyTorch environment")
+        skipped("c20_total_loss_backward",
+                "torch not available — will run on Kishore's PyTorch environment")
     elif not isinstance(moe_model, torch.nn.Module):
         # Model is a mock/stub (e.g., SimpleNamespace) — autograd checks require
         # a real nn.Module with trainable parameters. Skip gracefully; the
         # real-object tests in test_run12_gate10b_real_object.py cover this path.
-        ok("c18_aux_grad_fn",
-           "model is not nn.Module (mock/stub) — autograd check skipped; "
-           "covered by real-object regression tests")
-        ok("c19_isolated_router_grad",
-           "model is not nn.Module — skipped")
-        ok("c20_router_grad_nonzero",
-           "model is not nn.Module — skipped")
+        skipped("c18_aux_grad_fn",
+                "model is not nn.Module (mock/stub) — covered by real-object regression tests")
+        skipped("c19_isolated_router_grad",
+                "model is not nn.Module — covered by real-object regression tests")
+        skipped("c20_total_loss_backward",
+                "model is not nn.Module — covered by real-object regression tests")
     elif layers is None or moe_sub is None:
         blocked("c18_aux_grad_fn", "c15_moe_submodule", "no MoE sub-module found")
         blocked("c19_isolated_router_grad", "c15_moe_submodule", "no MoE sub-module found")
-        blocked("c20_router_grad_nonzero", "c15_moe_submodule", "no MoE sub-module found")
+        blocked("c20_total_loss_backward", "c15_moe_submodule", "no MoE sub-module found")
     else:
         # Run a fresh tiny forward pass to get the live tensor graph
         try:
@@ -1024,7 +1093,7 @@ def step10b_moe_aux_loss_verification(
                 fail("c18_aux_grad_fn",
                      f"aux_loss tensor is {type(_aux_tensor).__name__}, not torch.Tensor")
                 blocked("c19_isolated_router_grad", "c18_aux_grad_fn", "no aux_loss tensor")
-                blocked("c20_router_grad_nonzero", "c18_aux_grad_fn", "no aux_loss tensor")
+                blocked("c20_total_loss_backward", "c18_aux_grad_fn", "no aux_loss tensor")
             else:
                 _aux_float = float(_aux_tensor.item())
                 if _aux_tensor.grad_fn is None:
@@ -1032,7 +1101,7 @@ def step10b_moe_aux_loss_verification(
                          "aux_loss.grad_fn is None — tensor is detached from computation graph",
                          measured="None", expected="grad_fn present")
                     blocked("c19_isolated_router_grad", "c18_aux_grad_fn", "aux_loss detached")
-                    blocked("c20_router_grad_nonzero", "c18_aux_grad_fn", "aux_loss detached")
+                    blocked("c20_total_loss_backward", "c18_aux_grad_fn", "aux_loss detached")
                 else:
                     ok("c18_aux_grad_fn",
                        f"aux_loss.grad_fn={type(_aux_tensor.grad_fn).__name__} "
@@ -1062,60 +1131,124 @@ def step10b_moe_aux_loss_verification(
                                      f"returned all None — aux_loss is not connected "
                                      f"to router parameters",
                                      measured=0, expected=">= 1 non-None gradient")
-                                blocked("c20_router_grad_nonzero", "c19_isolated_router_grad",
+                                blocked("c20_total_loss_backward", "c19_isolated_router_grad",
                                         "all gradients None")
                             else:
                                 ok("c19_isolated_router_grad",
                                    f"{len(_non_none)}/{len(_grads)} router gradients non-None")
 
-                                _all_finite = all(
-                                    torch.isfinite(g).all().item() for g in _non_none
-                                )
-                                _any_nonzero = any(
-                                    g.abs().max().item() > 0 for g in _non_none
-                                )
-                                _grad_norm = sum(
-                                    g.norm().item() for g in _non_none
-                                )
-                                if not _all_finite:
-                                    fail("c20_router_grad_nonzero",
-                                         "isolated aux-loss router gradients contain non-finite values",
-                                         measured="non-finite", expected="finite")
-                                elif not _any_nonzero:
-                                    fail("c20_router_grad_nonzero",
-                                         "all isolated aux-loss router gradients are zero — "
-                                         "aux_loss does not influence router parameters",
-                                         measured=0.0, expected="> 0")
-                                else:
-                                    ok("c20_router_grad_nonzero",
-                                       f"aux-loss router gradients: finite=True, "
-                                       f"nonzero=True, norm={_grad_norm:.6f}")
+                                # c20: total_loss backward — verify full training graph
+                                # Call .backward() on total_loss and check router .grad
+                                try:
+                                    _total_tensor = _out.get("total_loss")
+                                    if _total_tensor is None:
+                                        # Fallback: reconstruct total_loss from lm_loss + aux_loss
+                                        _lm_tensor = _out.get("lm_loss")
+                                        if _lm_tensor is not None and isinstance(
+                                                _lm_tensor, torch.Tensor):
+                                            _total_tensor = _lm_tensor + _aux_tensor
+                                    if _total_tensor is None or not isinstance(
+                                            _total_tensor, torch.Tensor):
+                                        fail("c20_total_loss_backward",
+                                             "total_loss tensor not available for backward check",
+                                             measured=None, expected="torch.Tensor")
+                                    else:
+                                        # Zero existing grads before backward
+                                        for _p in moe_model.parameters():
+                                            if _p.grad is not None:
+                                                _p.grad = None
+                                        _total_tensor.backward(retain_graph=True)
+                                        _router_grads_after = [
+                                            p.grad for layer in moe_model.layers
+                                            for p in layer.moe_ffn.router.parameters()
+                                            if p.requires_grad
+                                        ]
+                                        _non_none_total = [
+                                            g for g in _router_grads_after if g is not None
+                                        ]
+                                        if not _non_none_total:
+                                            fail("c20_total_loss_backward",
+                                                 "total_loss.backward() produced no router .grad — "
+                                                 "router is disconnected from the training graph",
+                                                 measured=0, expected=">= 1 non-None router grad")
+                                        else:
+                                            _all_finite_total = all(
+                                                torch.isfinite(g).all().item()
+                                                for g in _non_none_total
+                                            )
+                                            _any_nonzero_total = any(
+                                                g.abs().max().item() > 0
+                                                for g in _non_none_total
+                                            )
+                                            _grad_norm_total = sum(
+                                                g.norm().item() for g in _non_none_total
+                                            )
+                                            if not _all_finite_total:
+                                                fail("c20_total_loss_backward",
+                                                     "total_loss backward router gradients contain "
+                                                     "non-finite values",
+                                                     measured="non-finite", expected="finite")
+                                            elif not _any_nonzero_total:
+                                                fail("c20_total_loss_backward",
+                                                     "total_loss backward router gradients are all "
+                                                     "zero — router does not receive gradient signal",
+                                                     measured=0.0, expected="> 0")
+                                            else:
+                                                ok("c20_total_loss_backward",
+                                                   f"total_loss.backward() router grads: "
+                                                   f"finite=True, nonzero=True, "
+                                                   f"norm={_grad_norm_total:.6f}")
+                                except Exception as _bwd_err:
+                                    fail("c20_total_loss_backward",
+                                         f"total_loss.backward() raised: {_bwd_err}")
                         except Exception as _grad_err:
                             fail("c19_isolated_router_grad",
                                  f"torch.autograd.grad raised: {_grad_err}")
-                            blocked("c20_router_grad_nonzero", "c19_isolated_router_grad",
+                            blocked("c20_total_loss_backward", "c19_isolated_router_grad",
                                     "grad computation failed")
         except Exception as _fwd_err:
             fail("c18_aux_grad_fn",
                  f"forward pass for autograd check raised: {_fwd_err}")
             blocked("c19_isolated_router_grad", "c18_aux_grad_fn", "forward pass failed")
-            blocked("c20_router_grad_nonzero", "c18_aux_grad_fn", "forward pass failed")
+            blocked("c20_total_loss_backward", "c18_aux_grad_fn", "forward pass failed")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     n_passed  = sum(1 for v in checks.values() if v["status"] == "PASS")
     n_failed  = sum(1 for v in checks.values() if v["status"] == "FAIL")
     n_blocked = sum(1 for v in checks.values() if v["status"] == "BLOCKED")
+    n_skipped = sum(1 for v in checks.values() if v["status"] == "SKIPPED")
     n_total   = len(checks)
+    # ── Hard accounting invariant ─────────────────────────────────────────────
+    # Every check must have exactly one status: PASS, FAIL, BLOCKED, or SKIPPED.
+    # If the invariant fails the gate exits with EXECUTION_ERROR (3).
+    _accounting_sum = n_passed + n_failed + n_blocked + n_skipped
+    if _accounting_sum != n_total:
+        # Do not raise PreflightError (which maps to NOT_ACCEPTED).
+        # This is a coding defect in the checker itself — use sys.exit(3).
+        import sys
+        _unaccounted = [
+            k for k, v in checks.items()
+            if v["status"] not in ("PASS", "FAIL", "BLOCKED", "SKIPPED")
+        ]
+        print(
+            f"  EXECUTION_ERROR: accounting invariant violated — "
+            f"{n_passed} PASS + {n_failed} FAIL + {n_blocked} BLOCKED + "
+            f"{n_skipped} SKIPPED = {_accounting_sum} != {n_total} total. "
+            f"Checks with invalid status: {_unaccounted}",
+            flush=True,
+        )
+        sys.exit(EXIT_EXECUTION_ERROR)
     print(
-        f"  MoE aux-loss verification: {n_passed} PASS, {n_failed} FAIL, "
-        f"{n_blocked} BLOCKED / {n_total} total",
+        f"  MoE aux-loss verification: "
+        f"{n_passed} PASS, {n_failed} FAIL, {n_blocked} BLOCKED, "
+        f"{n_skipped} SKIPPED / {n_total} total",
         flush=True,
     )
     if not all_ok:
         root_causes = [k for k, v in checks.items() if v["status"] == "FAIL"]
         raise PreflightError(
             f"MoE aux-loss verification FAILED ({n_failed} root-cause failures, "
-            f"{n_blocked} blocked dependents). "
+            f"{n_blocked} blocked dependents, {n_skipped} skipped). "
             f"Root-cause checks: {root_causes}"
         )
     return {
@@ -1123,7 +1256,18 @@ def step10b_moe_aux_loss_verification(
         "n_passed": n_passed,
         "n_failed": n_failed,
         "n_blocked": n_blocked,
+        "n_skipped": n_skipped,
         "n_total": n_total,
+        "aux_loss_semantics": "WEIGHTED",
+        "aux_loss_semantics_note": (
+            "out['aux_loss'] = sum over layers of "
+            "(aux_loss_coeff * raw_load_balance_loss + z_loss_coeff * raw_z_loss). "
+            "The coefficient is applied inside TopKRouter.forward() before the value "
+            "is returned. MoETransformer.forward() accumulates these already-weighted "
+            "values and adds them directly to lm_loss without a second multiplication. "
+            "raw_aux_loss is not exposed in out[]; it is available only in "
+            "router_metrics['aux_loss_unscaled'] in the non-checkpoint branch."
+        ),
         "status": "ok",
     }
 

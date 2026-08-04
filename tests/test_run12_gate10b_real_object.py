@@ -347,6 +347,23 @@ class TestGate10bIntegration:
             f"Gate 10b has {result['n_blocked']} blocked checks: "
             f"{[k for k, v in result['checks'].items() if v['status'] == 'BLOCKED']}"
         )
+        assert result["n_skipped"] == 0, (
+            f"Gate 10b has {result['n_skipped']} skipped checks on real model: "
+            f"{[k for k, v in result['checks'].items() if v['status'] == 'SKIPPED']}"
+        )
+        # Accounting invariant: every check must have exactly one status
+        _total = (result["n_passed"] + result["n_failed"]
+                  + result["n_blocked"] + result["n_skipped"])
+        assert _total == result["n_total"], (
+            f"Accounting invariant violated: "
+            f"{result['n_passed']} PASS + {result['n_failed']} FAIL + "
+            f"{result['n_blocked']} BLOCKED + {result['n_skipped']} SKIPPED "
+            f"= {_total} != {result['n_total']} total"
+        )
+        # aux_loss semantics must be labelled WEIGHTED
+        assert result["aux_loss_semantics"] == "WEIGHTED", (
+            f"Expected aux_loss_semantics=WEIGHTED, got {result['aux_loss_semantics']!r}"
+        )
         # Verify all three defect fixes are confirmed
         assert result["checks"]["c07_aux_loss_coeff"]["passed"] is True, \
             "c07 failed — Defect 1 fix not confirmed (router_aux_loss_coeff)"
@@ -360,8 +377,8 @@ class TestGate10bIntegration:
             "c18 failed — aux_loss tensor is detached"
         assert result["checks"]["c19_isolated_router_grad"]["passed"] is True, \
             "c19 failed — isolated aux-loss router gradients are None"
-        assert result["checks"]["c20_router_grad_nonzero"]["passed"] is True, \
-            "c20 failed — isolated aux-loss router gradients are zero"
+        assert result["checks"]["c20_total_loss_backward"]["passed"] is True, \
+            "c20 failed — total_loss.backward() did not produce nonzero router gradients"
 
     def test_gate10b_n_total_is_20(self, moe_model, step10_result):
         """Gate 10b must have exactly 20 checks."""
@@ -376,6 +393,48 @@ class TestGate10bIntegration:
         bad_step10 = {"status": "ok", "moe_cpu_loss": 10.5, "moe_cpu_aux_loss": 0.0}
         with pytest.raises(Exception, match="Defect 3 NOT fixed|FAILED"):
             _run_gate10b(moe_model, bad_step10)
+
+    def test_gate10b_check_10field_structure(self, moe_model, step10_result):
+        """Every check record must have all 10 spec-required fields."""
+        result = _run_gate10b(moe_model, step10_result)
+        required_fields = {
+            "check_id", "description", "status", "prerequisite",
+            "measured_value", "expected_value", "device", "reason",
+            "mandatory", "timestamp",
+        }
+        for check_id, record in result["checks"].items():
+            missing = required_fields - set(record.keys())
+            assert not missing, (
+                f"Check {check_id!r} is missing required fields: {missing}"
+            )
+
+    def test_gate10b_expert_count_is_8(self, moe_model, step10_result):
+        """c17 must confirm expert count == 8."""
+        result = _run_gate10b(moe_model, step10_result)
+        c17 = result["checks"]["c17_expert_count"]
+        assert c17["status"] == "PASS", (
+            f"c17_expert_count failed: {c17}"
+        )
+        assert c17["measured_value"] == 8, (
+            f"Expected expert count 8, got {c17['measured_value']}"
+        )
+
+    def test_gate10b_total_loss_backward(self, moe_model, step10_result):
+        """c20 must confirm total_loss.backward() produces nonzero router gradients."""
+        result = _run_gate10b(moe_model, step10_result)
+        c20 = result["checks"]["c20_total_loss_backward"]
+        assert c20["status"] == "PASS", (
+            f"c20_total_loss_backward failed: {c20}"
+        )
+
+    def test_gate10b_aux_loss_semantics_weighted(self, moe_model, step10_result):
+        """Return dict must label aux_loss_semantics as WEIGHTED."""
+        result = _run_gate10b(moe_model, step10_result)
+        assert result["aux_loss_semantics"] == "WEIGHTED", (
+            f"Expected WEIGHTED, got {result['aux_loss_semantics']!r}"
+        )
+        assert "aux_loss_semantics_note" in result, \
+            "aux_loss_semantics_note missing from return dict"
 
     def test_gate10b_fails_on_detached_aux_loss(self, moe_model, moe_config):
         """Gate 10b must raise PreflightError when aux_loss has no grad_fn."""

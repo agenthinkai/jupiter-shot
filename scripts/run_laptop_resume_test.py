@@ -90,9 +90,12 @@ def run_resume_test(
     if not torch.cuda.is_available():
         raise RuntimeError("[FAIL] CUDA not available.")
 
-    config_path = REPO_ROOT / "training" / "configs" / f"{config_name}.yaml"
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
+    # Use shared resolver to support full paths, relative paths, and bare names
+    from training.config_path import resolve_config_path, format_missing_error
+    _res = resolve_config_path(config_name, repo_root=REPO_ROOT)
+    config_path = _res.resolved_path
+    if not _res.exists:
+        raise FileNotFoundError(format_missing_error(_res))
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
@@ -291,8 +294,16 @@ def main() -> int:
             "exit_code":      _exit,
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "timestamp":      _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "data_mode_arg":  args.data_mode,
-            "data_source":    "deterministic_synthetic_tensors",
+            "data_mode_arg":            args.data_mode,
+            "requested_data_mode":      args.data_mode,
+            "resume_test_data_source":  "deterministic_synthetic_tensors",
+            "resume_uses_wikitext":     False,
+            "data_source":              "deterministic_synthetic_tensors",
+            "data_source_note":         (
+                "The resume runner accepts --data-mode real but uses deterministic "
+                "synthetic tensors internally so that pre-save and post-resume "
+                "behavior can be compared exactly. Real Wikitext-2 is NOT loaded."
+            ),
         })
         result_path = Path(args.output_dir) / "resume_result.json"
         result_path.write_text(json.dumps(result, indent=2, default=str))

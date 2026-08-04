@@ -72,6 +72,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import pathlib
 import subprocess
@@ -694,6 +695,7 @@ def step10b_moe_aux_loss_verification(
     moe_model: Any,
     step10_result: dict,
     errors_path: pathlib.Path,
+    device: str = "cpu",
 ) -> dict:  # noqa: C901 — intentionally long; each check is a discrete audit step
     """Step 10b: Verify MoE auxiliary loss is non-zero and connected to autograd.
 
@@ -1134,9 +1136,52 @@ def step10b_moe_aux_loss_verification(
                                 blocked("c20_total_loss_backward", "c19_isolated_router_grad",
                                         "all gradients None")
                             else:
-                                ok("c19_isolated_router_grad",
-                                   f"{len(_non_none)}/{len(_grads)} router gradients non-None")
-
+                                # Strengthened c19: verify finite, nonzero, and record norm
+                                _iso_all_finite = all(
+                                    torch.isfinite(g).all().item() for g in _non_none
+                                )
+                                _iso_any_nonzero = any(
+                                    g.abs().max().item() > 0 for g in _non_none
+                                )
+                                _iso_grad_norm = sum(
+                                    g.norm().item() for g in _non_none
+                                )
+                                _iso_norm_finite = (
+                                    isinstance(_iso_grad_norm, float)
+                                    and not (math.isnan(_iso_grad_norm)
+                                             or math.isinf(_iso_grad_norm))
+                                )
+                                if not _iso_all_finite:
+                                    fail("c19_isolated_router_grad",
+                                         f"{len(_non_none)}/{len(_grads)} gradients non-None "
+                                         f"but contain non-finite values",
+                                         measured="non-finite", expected="all finite")
+                                    blocked("c20_total_loss_backward",
+                                            "c19_isolated_router_grad",
+                                            "isolated gradients non-finite")
+                                elif not _iso_any_nonzero:
+                                    fail("c19_isolated_router_grad",
+                                         f"{len(_non_none)}/{len(_grads)} gradients non-None, "
+                                         f"all finite, but all zero — "
+                                         f"aux_loss does not drive router gradient",
+                                         measured=0.0, expected="> 0")
+                                    blocked("c20_total_loss_backward",
+                                            "c19_isolated_router_grad",
+                                            "isolated gradients all zero")
+                                elif not _iso_norm_finite:
+                                    fail("c19_isolated_router_grad",
+                                         f"combined isolated-gradient norm is not finite: "
+                                         f"{_iso_grad_norm}",
+                                         measured=_iso_grad_norm, expected="finite > 0")
+                                    blocked("c20_total_loss_backward",
+                                            "c19_isolated_router_grad",
+                                            "isolated grad norm non-finite")
+                                else:
+                                    ok("c19_isolated_router_grad",
+                                       f"{len(_non_none)}/{len(_grads)} router gradients non-None, "
+                                       f"isolated_aux_router_grad_finite=True, "
+                                       f"isolated_aux_router_grad_nonzero=True, "
+                                       f"isolated_aux_router_grad_norm={_iso_grad_norm:.6f}")
                                 # c20: total_loss backward — verify full training graph
                                 # Call .backward() on total_loss and check router .grad
                                 try:
@@ -1268,8 +1313,84 @@ def step10b_moe_aux_loss_verification(
             "raw_aux_loss is not exposed in out[]; it is available only in "
             "router_metrics['aux_loss_unscaled'] in the non-checkpoint branch."
         ),
-        "status": "ok",
+                "status": "ok",
     }
+
+
+def step10b_cuda_gate(
+    moe_model: Any,
+    step10_result: dict,
+    errors_path: pathlib.Path,
+) -> dict:
+    """Run gate 10b on CUDA.  Returns NOT_EVALUABLE dict if CUDA is unavailable."""
+    print("[Preflight 10b-CUDA] MoE aux-loss verification on CUDA ...", flush=True)
+    try:
+        import torch
+    except ImportError:
+        return {
+            "status": "NOT_EVALUABLE",
+            "reason": "torch not importable",
+            "device": "N/A",
+        }
+    if not torch.cuda.is_available():
+        print("  CUDA not available — gate 10b CUDA execution skipped (NOT_EVALUABLE)", flush=True)
+        return {
+            "status": "NOT_EVALUABLE",
+            "reason": "CUDA not available",
+            "device": "cpu",
+        }
+    cuda_device = torch.device("cuda")
+    # Move model to CUDA for the duration of this gate, then move back
+    original_device = next(moe_model.parameters()).device
+    try:
+        moe_model = moe_model.to(cuda_device)
+        result = step10b_moe_aux_loss_verification(
+            moe_model, step10_result, errors_path, device="cuda"
+        )
+        result["device"] = "cuda"
+        result["gpu_name"] = torch.cuda.get_device_name(0)
+        return result
+    finally:
+        moe_model.to(original_device)
+
+
+def collect_device_evidence(
+    run_id: str,
+    git_info: dict,
+    run_dir: pathlib.Path,
+) -> dict:
+    """Collect structured CUDA device evidence for the artifact contract."""
+    evidence: dict = {
+        "schema_version": "1.0",
+        "run_id": run_id,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "branch": git_info.get("branch", "unknown"),
+        "commit": git_info.get("commit", "unknown"),
+    }
+    try:
+        import torch
+        evidence["torch_version"] = torch.__version__
+        if torch.cuda.is_available():
+            evidence["device"] = "cuda"
+            evidence["gpu_name"] = torch.cuda.get_device_name(0)
+            cc = torch.cuda.get_device_capability(0)
+            evidence["compute_capability"] = f"sm_{cc[0]}{cc[1]}"
+            evidence["cuda_runtime_version"] = torch.version.cuda
+            evidence["cuda_arch_list"] = os.environ.get("TORCH_CUDA_ARCH_LIST", "not_set")
+            props = torch.cuda.get_device_properties(0)
+            evidence["physical_vram_bytes"] = props.total_memory
+        else:
+            evidence["device"] = "cpu"
+            evidence["gpu_name"] = None
+            evidence["compute_capability"] = None
+            evidence["cuda_runtime_version"] = getattr(torch.version, "cuda", None)
+            evidence["cuda_arch_list"] = None
+            evidence["physical_vram_bytes"] = None
+    except Exception as exc:
+        evidence["device"] = "error"
+        evidence["error"] = str(exc)
+    _write_json(run_dir / "device_evidence.json", evidence)
+    return evidence
 
 
 def step11_dense_cuda_step(dense_model: Any, data_mode: str,
@@ -1402,9 +1523,15 @@ def step14_artifact_freshness(run_dir: pathlib.Path, run_start: datetime.datetim
 # Main pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_preflight(args: argparse.Namespace, run_dir: pathlib.Path,
-                  run_start: datetime.datetime) -> tuple[bool, dict]:
+def run_preflight(
+    args: argparse.Namespace,
+    run_dir: pathlib.Path,
+    run_start: datetime.datetime,
+    run_id: str = "",
+    git_info: dict | None = None,
+) -> tuple[bool, dict]:
     """Run all 14 preflight steps. Return (all_passed, results_dict)."""
+    git_info = git_info or {}
     errors_path = run_dir / "errors.jsonl"
     results: dict[str, Any] = {}
     dense_model = None
@@ -1423,7 +1550,9 @@ def run_preflight(args: argparse.Namespace, run_dir: pathlib.Path,
         ("08_param_count",           None),   # handled after 07
         ("09_dense_cpu_step",        None),
         ("10_moe_cpu_step",          None),
-        ("10b_moe_aux_loss",         None),   # Defect 3 regression: aux_loss > 0 in checkpoint branch
+        ("10b_moe_aux_loss",         None),   # CPU gate 10b
+        ("10b_moe_aux_loss_cuda",    None),   # CUDA gate 10b (NOT_EVALUABLE if CUDA absent)
+        ("device_evidence",          None),   # Structured CUDA device evidence artifact
         ("11_dense_cuda_step",       None),
         ("12_moe_cuda_step",         None),
         ("13_router_metrics_schema", None),
@@ -1447,7 +1576,19 @@ def run_preflight(args: argparse.Namespace, run_dir: pathlib.Path,
                 results[step_name] = step10_moe_cpu_step(moe_model, args.data_mode, errors_path)
             elif step_name == "10b_moe_aux_loss":
                 results[step_name] = step10b_moe_aux_loss_verification(
+                    moe_model, results.get("10_moe_cpu_step", {}), errors_path, device="cpu")
+            elif step_name == "10b_moe_aux_loss_cuda":
+                cuda_result = step10b_cuda_gate(
                     moe_model, results.get("10_moe_cpu_step", {}), errors_path)
+                results[step_name] = cuda_result
+                # Block training if CUDA gate failed (NOT_EVALUABLE is allowed; FAIL is not)
+                if cuda_result.get("status") not in ("ok", "NOT_EVALUABLE"):
+                    raise PreflightError(
+                        "Gate 10b CUDA failed — full training run blocked. "
+                        f"Result: {cuda_result}"
+                    )
+            elif step_name == "device_evidence":
+                results[step_name] = collect_device_evidence(run_id, git_info, run_dir)
             elif step_name == "11_dense_cuda_step":
                 results[step_name] = step11_dense_cuda_step(dense_model, args.data_mode, errors_path)
             elif step_name == "12_moe_cuda_step":
@@ -1532,7 +1673,9 @@ def main() -> int:
     _write_json(run_dir / "run_manifest.json", manifest)
 
     # ── Run preflight ─────────────────────────────────────────────────────────
-    preflight_passed, preflight_results = run_preflight(args, run_dir, run_start)
+    preflight_passed, preflight_results = run_preflight(
+        args, run_dir, run_start, run_id=run_id, git_info=git
+    )
     _write_json(run_dir / "preflight.json", {
         "run_id": run_id,
         "all_passed": preflight_passed,

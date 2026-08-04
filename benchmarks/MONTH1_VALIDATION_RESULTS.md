@@ -982,3 +982,59 @@ When `torch` is not importable, c18–c20 are recorded as PASS with a skip note.
 | `test_synthetic_cannot_authorize` | Synthetic mode not in official sequence |
 | `test_cuda_requires_device_evidence` | CUDA claim requires `device = cuda` in artifact |
 | `test_run_id_artifact_path` | `<run_id>` path used, not generic `artifacts\` path |
+
+---
+
+## Run 13 — Config Resolver + Dual Gate 10b + Device Evidence (2026-08-04)
+
+### Root Cause of Run 12 Failure (Confirmed)
+
+Run 12 failed with `FileNotFoundError: training/configs/training/configs/laptop_moe_run7.yaml.yaml`.
+
+**Root cause:** The pipeline passes the full config path (e.g., `training/configs/laptop_moe_run7.yaml`) to the runners. Each runner then appended `.yaml` and prepended the configs directory, producing a doubled suffix and doubled path prefix.
+
+This was confirmed by tracing the argument through:
+- `run_laptop_validation_pipeline.py` → `args.moe_config = "training/configs/laptop_moe_run7.yaml"` (full path)
+- `run_laptop_moe.py` → `REPO_ROOT / "training" / "configs" / f"{args.config}.yaml"` (doubled)
+
+### Run 13 Changes
+
+| Component | Change |
+|---|---|
+| `training/config_path.py` | New shared resolver: accepts full path, relative path, bare name, or stem+.yaml; never doubles suffix |
+| `scripts/run_laptop_dense.py` | Uses `resolve_config_path()` instead of f-string construction |
+| `scripts/run_laptop_moe.py` | Uses `resolve_config_path()` instead of f-string construction |
+| `scripts/run_laptop_resume_test.py` | Uses `resolve_config_path()` + adds `requested_data_mode`, `resume_test_data_source`, `resume_uses_wikitext` to artifact |
+| `scripts/run_laptop_validation_pipeline.py` | Adds `step10b_cuda_gate`, `collect_device_evidence`, `10b_moe_aux_loss_cuda` step, `device_evidence` step; strengthens c19 to verify finite+nonzero; adds `import math` |
+| `tests/test_run13_config_resolver.py` | 29 config resolver contract tests |
+| `tests/test_run13_subprocess_smoke.py` | 31 production subprocess smoke tests |
+| `docs/RUNNER_INTERFACE_MANIFEST.md` | New: documents all three runner CLI contracts |
+
+### Test Results
+
+| Scope | Passed | Failed | Skipped |
+|---|---|---|---|
+| Run 13 targeted (config resolver + subprocess smoke) | 60 | 0 | 0 |
+| Full suite | 669 | 11 (pre-existing) | 16 |
+
+### Gate 10b on CPU (verified, seed=42)
+
+```
+MoE aux-loss verification: 20 PASS, 0 FAIL, 0 BLOCKED, 0 SKIPPED / 20 total
+Accounting: 20 + 0 + 0 + 0 = 20 ✓
+aux_loss_semantics: WEIGHTED
+```
+
+### Gate 10b on CUDA
+
+Will produce `NOT_EVALUABLE` on this sandbox (no GPU). On Kishore's RTX 5060 Ti:
+- Expected: `20 PASS, 0 FAIL, 0 BLOCKED, 0 SKIPPED / 20 total`
+- `device_evidence.json` will contain `"device": "cuda"`, `"compute_capability": "sm_120"` (Blackwell)
+
+### Stop Condition
+
+Do not proceed to Azure / 8×A100 / 200B / 500B / 20T until:
+1. Gate 10b CPU: `20 PASS, 0 FAIL, 0 BLOCKED, 0 SKIPPED / 20 total`
+2. Gate 10b CUDA: `20 PASS, 0 FAIL, 0 BLOCKED, 0 SKIPPED / 20 total` (not NOT_EVALUABLE)
+3. `device_evidence.json` contains `"device": "cuda"`
+4. All 60 Run 13 targeted tests pass with 0 skips on CUDA

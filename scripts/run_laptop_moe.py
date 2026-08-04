@@ -173,9 +173,12 @@ def run_moe_validation(
     if not torch.cuda.is_available():
         raise RuntimeError("[FAIL] CUDA is not available.")
 
-    config_path = REPO_ROOT / "training" / "configs" / f"{config_name}.yaml"
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
+    # Use shared resolver to support full paths, relative paths, and bare names
+    from training.config_path import resolve_config_path, format_missing_error
+    _res = resolve_config_path(config_name, repo_root=REPO_ROOT)
+    config_path = _res.resolved_path
+    if not _res.exists:
+        raise FileNotFoundError(format_missing_error(_res))
     with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 

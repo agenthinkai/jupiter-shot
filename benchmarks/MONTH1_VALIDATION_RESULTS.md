@@ -516,17 +516,62 @@ The 4 skips are correct: they require `torch`, `datasets`, and `yaml` which are 
 
 Run the following on Kishore's Windows laptop with the `.venv` activated:
 
+**STEP 1 — Repository Verification**
 ```bat
+cd C:\path\to\jupiter-shot
 git fetch origin
 git checkout fix/rtx50-blackwell-validation
 git pull origin fix/rtx50-blackwell-validation
-
-REM Preflight only (fast, no GPU required):
-.venv\Scripts\python.exe scripts/run_laptop_validation_pipeline.py --preflight-only --data-mode synthetic
-
-REM Full validation (requires RTX 5090 / CUDA):
-run_all_laptop_validation.bat
+git status
+git rev-parse HEAD
 ```
+Kishore must confirm: commit hash = `094b3e4` (or the latest follow-up commit), working tree clean, GPU = RTX 5060.
+
+**STEP 2 — OPTIONAL SYNTHETIC DIAGNOSTIC (does NOT authorize full validation)**
+```bat
+REM OPTIONAL DIAGNOSTIC ONLY — DOES NOT AUTHORIZE FULL VALIDATION
+scripts\windows\run_all_laptop_validation.bat --data-mode synthetic --preflight-only
+echo EXIT_CODE=%ERRORLEVEL%
+```
+This step is optional. A passing result here does not authorize the full GPU run.
+
+**STEP 3 — MANDATORY REAL-DATA PREFLIGHT (must pass before full run)**
+```bat
+REM MANDATORY — must return EXIT_CODE=0 before proceeding to Step 4
+scripts\windows\run_all_laptop_validation.bat --data-mode real --preflight-only
+echo EXIT_CODE=%ERRORLEVEL%
+```
+Required result: `EXIT_CODE=0` and all 14 preflight gates pass.
+If the result is not 0, Kishore must stop, preserve evidence, and make no local repairs.
+
+Real-data preflight must confirm:
+1. Wikitext-2 loads successfully
+2. GPT-NeoX tokenizer loads successfully
+3. `tokenizer.vocab_size` = 50,254
+4. `len(tokenizer)` = 50,277
+5. `tokenizer_max_token_id` = 50,276
+6. Model vocabulary = 50,277
+7. Vocabulary contract passes
+8. All 14 preflight gates pass
+9. Exit code = 0
+
+**STEP 4 — FULL REAL-DATA VALIDATION (only after Step 3 passes)**
+```bat
+REM OFFICIAL FULL RUN — only execute after Step 3 returns EXIT_CODE=0
+scripts\windows\run_all_laptop_validation.bat --data-mode real
+echo EXIT_CODE=%ERRORLEVEL%
+```
+The command must not silently fall back to synthetic data.
+
+**Kishore hardware confirmation required:**
+
+| Item | Required Value |
+|---|---|
+| GPU | NVIDIA RTX 5060 |
+| Architecture | Blackwell |
+| Compute capability | sm_120 |
+| PyTorch | 2.7.1+cu128 |
+| CUDA | 12.8 |
 
 **Expected exit codes after Run 9 fixes:**
 
@@ -537,10 +582,86 @@ run_all_laptop_validation.bat
 | Hardware thermal/power safety condition | 4 | SAFETY_STOP |
 | GPU run passes acceptance criteria | 0 | PASS |
 
-### Run 9 GO Criteria
+### Run 9 GO Criteria (Complete A–H Contract)
 
-Run 9 is **GO** when:
-1. `--preflight-only --data-mode synthetic` exits 0 on Kishore's machine
-2. `--preflight-only --data-mode real` exits 0 (Wikitext-2 loads, tokenizer loads, all 14 steps pass)
-3. Full `run_all_laptop_validation.bat` exits 0 with dense loss < 11.0 and MoE loss < 11.0
-4. No `SAFETY_STOP` (4) exit code appears for any software exception
+Run 9 achieves **LAPTOP ARCHITECTURAL PASS** only when every mandatory criterion below passes and the full real-data run returns exit code 0.
+
+**A. REPOSITORY**
+1. Required Run 9 commit is checked out
+2. Working tree is clean
+3. No local repairs applied by Kishore
+
+**B. PREFLIGHT**
+1. All 14 preflight gates pass
+2. Real Wikitext-2 data confirmed
+3. Effective tokenizer vocabulary = 50,277
+4. Model vocabulary = 50,277
+5. Dense parameter count = exactly 51,440,640
+6. MoE total parameter count = exactly 65,336,064
+7. MoE active parameter count = exactly 33,485,568
+8. Eight experts and top-2 routing confirmed
+9. Exit code = 0
+
+**C. DENSE TRAINING**
+1. Real-text data used
+2. Training reaches required number of steps
+3. Loss values are finite
+4. No NaN or Inf occurs
+5. No out-of-memory event occurs
+6. Loss progression recorded
+7. Throughput recorded
+8. Peak physical VRAM recorded
+9. Exit code = 0
+*(Loss < 11.0 is a diagnostic threshold, not the sole acceptance criterion)*
+
+**D. MOE TRAINING**
+1. Real-text data used
+2. Training reaches required number of steps
+3. Loss values are finite
+4. Auxiliary loss measured
+5. Router entropy populated
+6. Expert utilization populated for all 8 experts
+7. Utilization coefficient of variation evaluated
+8. Inactive-expert status evaluated from actual measurements
+9. No acceptance value passes through a missing-key default
+10. No persistent inactive expert under the defined acceptance contract
+11. `moe_accepted` = true
+12. Acceptance outcome = PASS
+13. Exit code = 0
+
+**E. CHECKPOINT RESUME**
+1. Checkpoint save passes
+2. Checkpoint integrity verification passes
+3. Model reload passes
+4. Resume begins from expected step
+5. Step continuity passes
+6. Loss continuity passes
+7. Output consistency passes
+8. Exit code = 0
+
+**F. SAFETY**
+1. No SAFETY_STOP occurs
+2. GPU temperature remains below defined stop threshold
+3. GPU physical VRAM measured
+4. GPU utilization measured
+5. Power measured where available
+6. Thermal and throttling warnings reported
+7. Software exceptions return exit code 3, not 4
+
+**G. ARTIFACT INTEGRITY**
+1. Earlier result files archived before Run 9
+2. Every Run 9 artifact has a new Run 9 timestamp
+3. No Run 3, 6, 7, or 8 metric included
+4. Generated report identifies correct branch and commit
+5. Generated report identifies RTX 5060, not RTX 5090
+6. Generated report identifies real data mode
+7. Report PASS/FAIL outcome matches internal JSON verdicts and process exit codes
+
+**H. FINAL DECISION**
+Only when every mandatory criterion passes and the full real-data run returns exit code 0 may the result be called **LAPTOP ARCHITECTURAL PASS**.
+
+That pass authorizes only preparation for controlled Stage B distributed validation. It does **not** authorize:
+1. 200B pretraining
+2. 500B pretraining
+3. 20T training
+4. Azure spending without a separate approved Stage B plan

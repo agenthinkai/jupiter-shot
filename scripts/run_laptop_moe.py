@@ -174,7 +174,7 @@ def run_moe_validation(
         raise RuntimeError("[FAIL] CUDA is not available.")
 
     # Use shared resolver to support full paths, relative paths, and bare names
-    from training.config_path import resolve_config_path, format_missing_error
+    from training.config_path import resolve_config_path, format_missing_error, safe_checkpoint_name
     _res = resolve_config_path(config_name, repo_root=REPO_ROOT)
     config_path = _res.resolved_path
     if not _res.exists:
@@ -320,6 +320,13 @@ def run_moe_validation(
         "status": "RUNNING",
         "outcome": None,
         "exit_code": None,
+        # Run 14: aux_loss contract and router metrics fields
+        "aux_loss_semantics": "WEIGHTED",
+        "aux_loss_contract": (
+            "aux_loss = aux_loss_coeff * load_balance_loss + z_loss_coeff * z_loss. "
+            "Weighting applied INSIDE TopKRouter.forward(). No second multiplication in MoETransformer."
+        ),
+        "router_metrics_available_under_gc": True,
     }
 
     model.train()
@@ -481,7 +488,8 @@ def run_moe_validation(
 
     # ── Checkpoint ────────────────────────────────────────────────────────────
     if step > 0:
-        ckpt_path = ckpt_dir / f"moe_{config_name}_step{step}.pt"
+        _ckpt_stem = safe_checkpoint_name(config_name)
+        ckpt_path = ckpt_dir / f"moe_{_ckpt_stem}_step{step}.pt"
         ckpt_start = time.time()
         try:
             torch.save({
@@ -495,8 +503,10 @@ def run_moe_validation(
             summary["checkpoint_path"] = str(ckpt_path)
             summary["checkpoint_size_mb"] = round(ckpt_path.stat().st_size / 1024**2, 1)
             summary["checkpoint_save_duration_s"] = round(ckpt_duration, 2)
+            summary["checkpoint_status"] = "saved"
         except Exception as e:
             print(f"[CHECKPOINT] Failed: {e}")
+            summary["checkpoint_status"] = f"failed: {e}"
 
     # ── Acceptance evaluation ─────────────────────────────────────────────────
     # Only evaluate if training completed or was interrupted (not FAILED/SAFETY_STOP)
@@ -576,8 +586,11 @@ def run_moe_validation(
         })
 
     summary_path = output_dir / "moe_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
-    print(f"\n[SUMMARY] Saved: {summary_path}")
+    # Run 14: atomic write — write to .tmp then rename to prevent partial reads
+    _tmp_path = summary_path.with_suffix(".tmp")
+    _tmp_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    _tmp_path.replace(summary_path)
+    print(f"\n[SUMMARY] Saved (atomic): {summary_path}")
     print(f"[SUMMARY] Outcome: {summary.get('outcome')} (exit {summary.get('exit_code')})")
     print(f"[SUMMARY] MoE Accepted: {summary.get('moe_accepted', False)}")
 
@@ -655,8 +668,19 @@ def main() -> int:
         summary_path = Path(args.output_dir) / "moe_summary.json"
         if summary_path.exists():
             existing = _json.loads(summary_path.read_text())
+            # Run 14: stale artifact rejection — reject if run_id does not match
+            existing_run_id = existing.get("run_id")
+            if existing_run_id and existing_run_id != run_id:
+                print(
+                    f"[ARTIFACT WARNING] Stale artifact detected: "
+                    f"existing run_id={existing_run_id!r} != current run_id={run_id!r}. "
+                    f"Overwriting with current run."
+                )
             existing["run_id"] = run_id
-            summary_path.write_text(_json.dumps(existing, indent=2, default=str))
+            # Atomic write
+            _tmp = summary_path.with_suffix(".tmp")
+            _tmp.write_text(_json.dumps(existing, indent=2, default=str))
+            _tmp.replace(summary_path)
         return int(summary.get("exit_code", EXIT_EXECUTION_ERROR))
     except SystemExit as e:
         # Thermal stop propagated as SystemExit

@@ -576,7 +576,14 @@ class MoETransformer(nn.Module):
                 # was enabled. This silently zeroed the load-balancing signal and
                 # produced a false zero in the 'aux_loss' output field.
                 total_aux_loss = total_aux_loss + aux_loss
-                all_router_metrics.append({})
+                # FIX (Run 14): Extract router metrics via a router-only no-grad
+                # probe pass. The gradient checkpoint boundary cannot return dicts,
+                # so we run just the router (not the full layer) with detached input
+                # to get the metrics without affecting the gradient graph.
+                with torch.no_grad():
+                    _x_flat = x.detach().view(x.shape[0] * x.shape[1], x.shape[2])
+                    _, _, _, _probe_metrics = layer.moe_ffn.router(_x_flat)
+                all_router_metrics.append(_probe_metrics)
             else:
                 x, aux_loss, router_metrics = layer(x, cos, sin, attention_mask)
                 total_aux_loss = total_aux_loss + aux_loss

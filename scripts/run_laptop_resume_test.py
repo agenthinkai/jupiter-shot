@@ -91,7 +91,7 @@ def run_resume_test(
         raise RuntimeError("[FAIL] CUDA not available.")
 
     # Use shared resolver to support full paths, relative paths, and bare names
-    from training.config_path import resolve_config_path, format_missing_error
+    from training.config_path import resolve_config_path, format_missing_error, safe_checkpoint_name
     _res = resolve_config_path(config_name, repo_root=REPO_ROOT)
     config_path = _res.resolved_path
     if not _res.exists:
@@ -131,7 +131,8 @@ def run_resume_test(
 
     # ── Phase 2: Save checkpoint ──────────────────────────────────────────────
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / f"resume_test_{config_name}.pt"
+    _ckpt_stem = safe_checkpoint_name(config_name)
+    ckpt_path = ckpt_dir / f"resume_test_{_ckpt_stem}.pt"
     ckpt_start = time.time()
     torch.save({
         "step": initial_steps,

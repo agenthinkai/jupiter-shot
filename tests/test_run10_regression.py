@@ -424,16 +424,30 @@ class TestMoEAuxLossAccumulation(unittest.TestCase):
         Documents the defect: the old code had total_aux_loss = 0.0 when
         gradient_checkpointing was enabled. The fix adds the accumulation line.
         Verified by checking the source does NOT have the old pattern.
+
+        Run 14 note: the original Run 13 fix used all_router_metrics.append({})
+        as a placeholder.  Run 14 replaced that with all_router_metrics.append(
+        _probe_metrics) to populate real metrics via a router-only no-grad probe.
+        This test is updated to accept either the old empty-dict form (Run 13)
+        or the new probe form (Run 14+), while still verifying that the
+        accumulation line appears BEFORE the append in both cases.
         """
         moe_path = REPO_ROOT / "training" / "models" / "moe.py"
         source = moe_path.read_text()
 
-        # The old defective pattern: checkpoint call followed immediately by
-        # all_router_metrics.append({}) with NO accumulation in between.
-        # We verify the fix is present by checking the accumulation line exists
-        # between the checkpoint call and the append.
         ckpt_call_pos = source.find("x, aux_loss = gradient_checkpoint(")
-        append_pos = source.find("all_router_metrics.append({})", ckpt_call_pos)
+        self.assertGreater(ckpt_call_pos, 0,
+                           "moe.py must contain gradient_checkpoint call")
+
+        # Accept either the Run 13 empty-dict form OR the Run 14 probe form.
+        append_empty_pos = source.find("all_router_metrics.append({})", ckpt_call_pos)
+        append_probe_pos = source.find("all_router_metrics.append(_probe_metrics)", ckpt_call_pos)
+        # At least one form must be present
+        append_pos = append_empty_pos if append_empty_pos != -1 else append_probe_pos
+        self.assertGreater(append_pos, 0,
+                           "moe.py must contain all_router_metrics.append() in the GC branch "
+                           "(either append({}) for Run 13 or append(_probe_metrics) for Run 14)")
+
         accumulation_pos = source.find(
             "total_aux_loss = total_aux_loss + aux_loss",
             ckpt_call_pos,
@@ -441,7 +455,7 @@ class TestMoEAuxLossAccumulation(unittest.TestCase):
         self.assertGreater(accumulation_pos, ckpt_call_pos,
                            "Accumulation must appear after the checkpoint call")
         self.assertLess(accumulation_pos, append_pos,
-                        "Accumulation must appear before all_router_metrics.append({}) — Defect 3 fix")
+                        "Accumulation must appear before all_router_metrics.append() — Defect 3 fix")
 
     def test_moe_both_branches_accumulate_aux_loss(self):
         """

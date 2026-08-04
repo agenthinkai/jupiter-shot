@@ -35,7 +35,7 @@ doubling the suffix. All three runners now use it.
 | `scripts/run_laptop_moe.py` | Uses `resolve_config_path()` |
 | `scripts/run_laptop_resume_test.py` | Uses `resolve_config_path()` + new artifact fields |
 | `scripts/run_laptop_validation_pipeline.py` | Dual gate 10b (CPU + CUDA), device evidence step, c19 strengthened |
-| `tests/test_run13_config_resolver.py` | 29 config resolver contract tests |
+| `tests/test_run13_config_resolver.py` | 24 config resolver contract tests |
 | `tests/test_run13_subprocess_smoke.py` | 31 production subprocess smoke tests |
 | `docs/RUNNER_INTERFACE_MANIFEST.md` | Runner CLI contract documentation |
 
@@ -67,7 +67,8 @@ REM STOP if HEAD does not match the authorized commit
   -v
 ```
 
-**Expected:** 60 + 27 + 25 = 112 passed, 0 failed, 0 skipped  
+**Expected:** 31 + 24 + 26 + 25 = 106 passed, 0 failed, 0 skipped  
+*(Counts: test_run13_subprocess_smoke=31, test_run13_config_resolver=24, test_run12_gate10b_real_object=26, test_run12_operator_package=25 — see `tests/TEST_MANIFEST.md`)*  
 **STOP if any test fails or is skipped.**
 
 ### Step 2: Mandatory real-data preflight
@@ -144,7 +145,7 @@ Do **not** proceed to Azure / 8×A100 / 200B / 500B / 20T training until
 **all** of the following are satisfied:
 
 1. `git log -1` shows the authorized Run 13 commit
-2. All 112 targeted regression tests pass with 0 skips
+2. All 106 targeted regression tests pass with 0 skips (see `tests/TEST_MANIFEST.md`)
 3. `scripts\windows\run_all_laptop_validation.bat --data-mode real` exits 0
 4. `moe_summary.json` contains `"n_passed": 20, "n_failed": 0, "n_blocked": 0, "n_skipped": 0`
 5. `device_evidence.json` contains `"device": "cuda"`

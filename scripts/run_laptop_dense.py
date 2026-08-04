@@ -180,7 +180,7 @@ def run_dense_validation(
         raise RuntimeError("[FAIL] CUDA is not available. Cannot run GPU validation.")
 
     # Load config — use shared resolver to support full paths, relative paths, and bare names
-    from training.config_path import resolve_config_path, format_missing_error
+    from training.config_path import resolve_config_path, format_missing_error, safe_checkpoint_name
     _res = resolve_config_path(config_name, repo_root=REPO_ROOT)
     config_path = _res.resolved_path
     if not _res.exists:
@@ -450,8 +450,9 @@ def run_dense_validation(
     else:
         summary["status"] = "INTERRUPTED" if interrupted else "COMPLETED"
 
-    # Save checkpoint
-    ckpt_path = ckpt_dir / f"dense_{config_name}_step{step}.pt"
+    # Save checkpoint — use safe_checkpoint_name to avoid doubled suffixes
+    _ckpt_stem = safe_checkpoint_name(config_name)
+    ckpt_path = ckpt_dir / f"dense_{_ckpt_stem}_step{step}.pt"
     try:
         torch.save({
             "step": step,
@@ -463,8 +464,10 @@ def run_dense_validation(
         print(f"\n[CHECKPOINT] Saved: {ckpt_path}")
         summary["checkpoint_path"] = str(ckpt_path)
         summary["checkpoint_size_mb"] = round(ckpt_path.stat().st_size / 1024**2, 1)
+        summary["checkpoint_status"] = "saved"
     except Exception as e:
         print(f"[CHECKPOINT] Failed to save: {e}")
+        summary["checkpoint_status"] = f"failed: {e}"
 
     # Final summary
     wall_time = time.time() - start_wall

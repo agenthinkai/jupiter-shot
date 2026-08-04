@@ -1456,7 +1456,13 @@ def step12_moe_cuda_step(moe_model: Any, data_mode: str,
 
 
 def step13_router_metrics_schema(moe_model: Any, errors_path: pathlib.Path) -> dict:
-    """Step 13: Validate router metrics schema from a CPU forward pass."""
+    """Step 13: Validate router metrics schema from a CPU forward pass.
+
+    Run 14 extension: also verifies that router_metrics are non-empty when
+    gradient_checkpointing=True (the Defect 2 fix from Run 14).  The check
+    runs a *training-mode* forward pass with GC enabled and confirms that the
+    router-only no-grad probe populated the metrics list.
+    """
     print("[Preflight 13/14] Router metrics schema validation ...", flush=True)
     import torch
     from training.router_metrics import REQUIRED_ACCEPTANCE_KEYS
@@ -1486,10 +1492,47 @@ def step13_router_metrics_schema(moe_model: Any, errors_path: pathlib.Path) -> d
             f"Present keys: {sorted(first_layer.keys())}"
         )
 
-    print(f"  Router metrics: {len(router_metrics_list)} layers, all {len(REQUIRED_ACCEPTANCE_KEYS)} required keys present  [OK]", flush=True)
+    print(f"  Router metrics (eval mode): {len(router_metrics_list)} layers, "
+          f"all {len(REQUIRED_ACCEPTANCE_KEYS)} required keys present  [OK]", flush=True)
+
+    # ── Run 14 extension: verify router_metrics under gradient_checkpointing ──
+    # This confirms the Defect 2 fix: the router-only no-grad probe pass in
+    # MoETransformer.forward() correctly populates router_metrics even when
+    # gradient_checkpoint() is active (which cannot return dicts).
+    gc_enabled = getattr(moe_model.config.base, "gradient_checkpointing", False)
+    gc_check_result = "not_applicable"
+    if gc_enabled:
+        moe_model.train()  # GC probe only fires in training mode
+        input_ids_train = torch.randint(0, vocab_size, (1, 16))
+        labels_train = torch.randint(0, vocab_size, (1, 16))
+        out_gc = moe_model(input_ids=input_ids_train, labels=labels_train)
+        gc_metrics = out_gc.get("router_metrics", [])
+        if not gc_metrics:
+            raise PreflightError(
+                "Step 13 FAILED (Run 14 GC check) — router_metrics is empty when "
+                "gradient_checkpointing=True. "
+                "The Defect 2 fix (router-only no-grad probe) is not working. "
+                "Check training/models/moe.py MoETransformer.forward()."
+            )
+        gc_first = gc_metrics[0]
+        gc_missing = [k for k in REQUIRED_ACCEPTANCE_KEYS if k not in gc_first]
+        if gc_missing:
+            raise PreflightError(
+                f"Step 13 FAILED (Run 14 GC check) — router_metrics under GC missing "
+                f"required keys: {gc_missing}. Present keys: {sorted(gc_first.keys())}"
+            )
+        gc_check_result = "passed"
+        print(f"  Router metrics (gradient_checkpointing=True): {len(gc_metrics)} layers, "
+              f"all {len(REQUIRED_ACCEPTANCE_KEYS)} required keys present  [OK]", flush=True)
+        moe_model.eval()  # restore eval mode
+    else:
+        print("  Router metrics under GC: gradient_checkpointing=False — check not applicable  [SKIP]",
+              flush=True)
+
     return {
         "num_layers": len(router_metrics_list),
         "required_keys_present": list(REQUIRED_ACCEPTANCE_KEYS),
+        "gc_router_metrics_check": gc_check_result,
         "status": "ok",
     }
 

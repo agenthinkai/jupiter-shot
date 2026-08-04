@@ -172,6 +172,36 @@ def resolve_config_path(
     )
 
 
+def safe_checkpoint_name(config_input: str) -> str:
+    """Return a filesystem-safe stem for use in checkpoint filenames.
+
+    Accepts all five input forms (absolute path, relative path, bare name,
+    name.yaml, full Windows path) and returns a plain alphanumeric-and-dash
+    stem that never contains drive letters, slashes, backslashes, or
+    duplicate .yaml suffixes.
+
+    Examples
+    --------
+    >>> safe_checkpoint_name("laptop_dense_run7")
+    'laptop_dense_run7'
+    >>> safe_checkpoint_name("laptop_dense_run7.yaml")
+    'laptop_dense_run7'
+    >>> safe_checkpoint_name("training/configs/laptop_dense_run7.yaml")
+    'laptop_dense_run7'
+    >>> safe_checkpoint_name("C:\\Users\\Kishore\\jupiter-shot\\training\\configs\\laptop_moe_run7.yaml")
+    'laptop_moe_run7'
+    >>> safe_checkpoint_name("/home/ubuntu/jupiter-shot/training/configs/laptop_moe_run7.yaml")
+    'laptop_moe_run7'
+    """
+    # Normalise Windows backslashes to forward slashes before parsing
+    normalised = config_input.replace("\\", "/")
+    p = pathlib.Path(normalised)
+    # .stem strips the last suffix (.yaml or .yml); for bare names it is
+    # identical to .name.  Drive letters and directory components are
+    # discarded by .name.
+    return p.stem
+
+
 def format_missing_error(res: ConfigResolution) -> str:
     """Return the mandatory EXECUTION_ERROR diagnostic block for a missing config.
 

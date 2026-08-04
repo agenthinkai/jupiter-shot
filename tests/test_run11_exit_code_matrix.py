@@ -208,46 +208,52 @@ class TestValidateRunnerArtifact:
         )
 
 
-# ── 8 MoE aux-loss regression tests ──────────────────────────────────────────
+# ── 8 MoE aux-loss regression tests (Run 12 corrected mock helper) ───────────
 
 def _make_moe_model(
     has_config: bool = True,
-    has_moe_config: bool = True,
-    aux_loss_coef: float = 0.01,
+    router_aux_loss_coeff: float = 0.01,
     gradient_checkpointing: bool = True,
     has_layers: bool = True,
     has_router: bool = True,
     has_experts: bool = True,
 ) -> object:
-    """Build a minimal mock MoE model for testing step10b."""
+    """Build a minimal mock MoE model for testing step10b (Run 12 corrected).
+
+    Attribute layout matches the real MoETransformer:
+      model.config.router_aux_loss_coeff  (Defect 1 fix: was config.moe.aux_loss_coef)
+      model.config.base.gradient_checkpointing  (Defect 2 fix: was config.gradient_checkpointing)
+      model.layers[0].moe_ffn.router / .experts  (Defect 3 fix: was layer.moe)
+    """
     model = types.SimpleNamespace()
 
     if has_config:
         cfg = types.SimpleNamespace()
-        if has_moe_config:
-            moe_cfg = types.SimpleNamespace()
-            if aux_loss_coef is not None:
-                moe_cfg.aux_loss_coef = aux_loss_coef
-            cfg.moe = moe_cfg
-        cfg.gradient_checkpointing = gradient_checkpointing
+        # Defect 1 fix: top-level router_aux_loss_coeff (not cfg.moe.aux_loss_coef)
+        if router_aux_loss_coeff is not None:
+            cfg.router_aux_loss_coeff = router_aux_loss_coeff
+        # Defect 2 fix: gradient_checkpointing lives in config.base (DenseConfig)
+        base = types.SimpleNamespace(gradient_checkpointing=gradient_checkpointing)
+        cfg.base = base
         model.config = cfg
 
     if has_layers:
         router = types.SimpleNamespace() if has_router else None
-        experts = types.SimpleNamespace() if has_experts else None
-        moe_sub = types.SimpleNamespace()
+        experts = [types.SimpleNamespace()] * 8 if has_experts else None
+        # Defect 3 fix: attribute is moe_ffn (not moe)
+        moe_ffn = types.SimpleNamespace()
         if has_router:
-            moe_sub.router = router
+            moe_ffn.router = router
         if has_experts:
-            moe_sub.experts = experts
-        layer = types.SimpleNamespace(moe=moe_sub)
+            moe_ffn.experts = experts
+        layer = types.SimpleNamespace(moe_ffn=moe_ffn)
         model.layers = [layer]
 
     return model
 
 
 class TestStep10bMoeAuxLoss:
-    """8 scenarios for step10b_moe_aux_loss_verification()."""
+    """8 scenarios for step10b_moe_aux_loss_verification() (Run 12 corrected check IDs)."""
 
     def _run(self, model, step10_result: dict) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
@@ -260,14 +266,21 @@ class TestStep10bMoeAuxLoss:
     def _good_step10(self, aux_loss: float = 0.042) -> dict:
         return {"status": "ok", "moe_cpu_loss": 10.5, "moe_cpu_aux_loss": aux_loss}
 
-    # Test A: aux_loss > 0 with gradient_checkpointing=True → all 15 checks pass
+    # Test A: aux_loss > 0 with gradient_checkpointing=True → all checks pass
     def test_a_aux_loss_positive_gc_true(self):
         model = _make_moe_model(gradient_checkpointing=True)
         result = self._run(model, self._good_step10(aux_loss=0.042))
         assert result["status"] == "ok"
-        assert result["n_passed"] == result["n_total"]
+        # n_failed == 0 (no root-cause failures)
+        assert result["n_failed"] == 0
+        assert result["n_blocked"] == 0
         assert result["checks"]["c04_aux_loss_positive"]["passed"] is True
-        assert result["checks"]["c15_gc_aux_nonzero"]["passed"] is True
+        # c13 is the gc+aux_loss confirmation check (Defect 2+3 combined)
+        assert result["checks"]["c13_gc_aux_nonzero"]["passed"] is True
+        # c07 confirms Defect 1 fix: router_aux_loss_coeff read correctly
+        assert result["checks"]["c07_aux_loss_coeff"]["passed"] is True
+        # c15 confirms Defect 3 fix: moe_ffn found
+        assert result["checks"]["c15_moe_submodule"]["passed"] is True
 
     # Test B: aux_loss == 0.0 → c04 fails (Defect 3 not fixed)
     def test_b_aux_loss_zero_raises(self):
@@ -299,13 +312,13 @@ class TestStep10bMoeAuxLoss:
         with pytest.raises(Exception, match="FAILED"):
             self._run(model, {"status": "ok", "moe_cpu_loss": 10.5})
 
-    # Test G: aux_loss_coef == 0 → c09 fails
+    # Test G: router_aux_loss_coeff == 0 → c09 fails (Defect 1 fix: was aux_loss_coef)
     def test_g_aux_loss_coef_zero_raises(self):
-        model = _make_moe_model(aux_loss_coef=0.0)
+        model = _make_moe_model(router_aux_loss_coeff=0.0)
         with pytest.raises(Exception, match="FAILED"):
             self._run(model, self._good_step10(aux_loss=0.042))
 
-    # Test H: gradient_checkpointing=True, aux_loss=0 → c15 fails
+    # Test H: gradient_checkpointing=True, aux_loss=0 → c04 and c13 fail
     def test_h_gc_true_aux_zero_raises(self):
         model = _make_moe_model(gradient_checkpointing=True)
         with pytest.raises(Exception, match="FAILED"):

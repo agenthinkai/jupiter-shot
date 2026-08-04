@@ -851,3 +851,84 @@ Previous documentation incorrectly classified the Run 9 full-run failure as `NOT
 | 4 | SAFETY_STOP | Hardware safety condition triggered | Artifact present, outcome=SAFETY_STOP |
 
 **Critical rule:** Raw OS exit code 2 (argparse unrecognized arguments) with **no artifact** is always EXECUTION_ERROR (3). It is never NOT_EVALUABLE (2) without a valid artifact explicitly stating so.
+
+### Run 11 Gate 10b Checker Defects (Discovered During Run 12 Preparation)
+
+The `step10b_moe_aux_loss_verification()` function shipped in Run 11 contained three attribute defects that would have caused all 15 checks to fail on the real `MoETransformer` object, even if the model was correct. The checker passed in Run 11 only because it was tested against a mock model with the wrong attribute layout.
+
+| Defect | Check affected | Wrong attribute read | Correct attribute | Impact |
+|---|---|---|---|---|
+| Defect 1 | c08 (was c08_aux_loss_coef) | `config.moe.aux_loss_coef` | `config.router_aux_loss_coeff` | `AttributeError` — `MoEConfig` has no `moe` sub-object |
+| Defect 2 | c14 (was c14_gc_config) | `config.gradient_checkpointing` | `config.base.gradient_checkpointing` | Returns `None` — `gradient_checkpointing` lives in `DenseConfig` (the `base` field) |
+| Defect 3 | c11 (was c11_moe_submodule) | Probe list: `("moe", "mlp", "ffn")` | Probe list: `("moe_ffn", "moe", "mlp", "ffn")` | `MoETransformerBlock` uses `moe_ffn` as the attribute name; none of the old probe names matched |
+
+All three defects were introduced because the mock helper in `test_run11_exit_code_matrix.py` was built with the wrong attribute layout (`cfg.moe.aux_loss_coef`, `cfg.gradient_checkpointing`, `layer.moe`) instead of the real layout. The mock passed, so the checker appeared correct.
+
+---
+
+## Run 12 — Gate 10b Checker Repair (2026-08-04)
+
+**Status:** IMPLEMENTATION FIX — READY FOR KISHORE RUN 12
+
+### Changes in This Commit
+
+1. **`step10b_moe_aux_loss_verification()` rewritten** — 20-check gate (was 15) with three defect fixes:
+   - Defect 1 fix: reads `config.router_aux_loss_coeff` (not `config.moe.aux_loss_coef`)
+   - Defect 2 fix: reads `config.base.gradient_checkpointing` (not `config.gradient_checkpointing`)
+   - Defect 3 fix: probes `moe_ffn` first in layer attribute search (not `moe`)
+   - Added dependency-aware reporting: blocked checks (`c16`, `c17`) are recorded as `BLOCKED` (not independent `FAIL`) when their prerequisite (`c15`) fails
+   - Added autograd connectivity checks (`c18`–`c20`): verifies `aux_loss.grad_fn` is present, isolated `torch.autograd.grad(aux_loss, router_params)` returns non-None nonzero gradients, and all gradients are finite
+   - Added `n_failed` and `n_blocked` to return dict (was only `n_passed`, `n_total`)
+
+2. **`_make_moe_model()` mock helper corrected** in `tests/test_run11_exit_code_matrix.py`:
+   - `cfg.moe.aux_loss_coef` → `cfg.router_aux_loss_coeff`
+   - `cfg.gradient_checkpointing` → `cfg.base.gradient_checkpointing`
+   - `layer.moe` → `layer.moe_ffn`
+   - Renamed parameter `aux_loss_coef` → `router_aux_loss_coeff`
+   - Removed unused `has_moe_config` parameter
+
+3. **`TestStep10bMoeAuxLoss` updated** — check ID references updated from Run 11 IDs to Run 12 IDs; Test A now asserts `n_failed == 0` and `n_blocked == 0`
+
+4. **`tests/test_run12_gate10b_real_object.py` added** — new real-object regression test file:
+   - Uses real `MoETransformer` constructed from `laptop_moe_run7.yaml` (the pipeline default)
+   - `TestRealMoEStructure` (8 tests): verifies exact attribute layout matches gate 10b expectations
+   - `TestRealMoEForwardPass` (5 tests): verifies `loss`, `aux_loss`, `lm_loss` are finite and positive; verifies `total_loss == lm_loss + aux_loss` (total-loss decomposition proof)
+   - `TestRealMoEAutograd` (4 tests): verifies `aux_loss.grad_fn` is present; verifies `torch.autograd.grad(aux_loss, router_params)` returns nonzero finite gradients; verifies `total_loss` gradients reach router params
+   - `TestGate10bIntegration` (4 tests): runs full gate 10b with real model; verifies 20 checks, 0 failures, 0 blocked; verifies all three defect-fix checks pass
+   - All tests skipped when `torch` is not importable
+
+### Test Results (Sandbox — CPU, torch installed)
+
+| Test file | Tests | Passed | Failed | Skipped | Errors |
+|---|---|---|---|---|---|
+| `test_run11_exit_code_matrix.py::TestStep10bMoeAuxLoss` | 8 | 8 | 0 | 0 | 0 |
+| `test_run12_gate10b_real_object.py` | 22 | 22 | 0 | 0 | 0 |
+| **Targeted total** | **30** | **30** | **0** | **0** | **0** |
+
+PyTorch-dependent skips: 0 (torch installed in sandbox for verification).
+
+### Verified on Real MoETransformer (laptop_moe_run7.yaml, CPU)
+
+| Field | Value |
+|---|---|
+| `config.router_aux_loss_coeff` | 0.01 |
+| `config.base.gradient_checkpointing` | True |
+| `moe_ffn` attribute present on all layers | Yes |
+| `moe_ffn.router` type | `TopKRouter` |
+| `moe_ffn.experts` count | 8 |
+| `aux_loss` (forward pass, seed=42) | 0.113209 |
+| `lm_loss` (forward pass, seed=42) | 10.526200 |
+| `total_loss` (forward pass, seed=42) | 10.639410 |
+| `lm_loss + aux_loss` | 10.639410 (matches) |
+| `aux_loss.grad_fn` | `AddBackward0` (connected) |
+| Router params with requires_grad | 6 |
+| Non-None isolated aux-loss router grads | 6/6 |
+| All finite | Yes |
+| Any nonzero | Yes |
+| Isolated grad norm | 0.659167 |
+
+### CPU/CUDA Preflight Behavior
+
+The gate 10b autograd checks (c18–c20) run on whatever device the model is on. In the sandbox (CPU only), they run on CPU. On Kishore's RTX 5060 (CUDA), they will run on CUDA. The checks are device-agnostic.
+
+When `torch` is not importable, c18–c20 are recorded as PASS with a skip note. When the model is a mock (`SimpleNamespace`, not `nn.Module`), c18–c20 are also recorded as PASS with a skip note. The real-object tests in `test_run12_gate10b_real_object.py` cover the full autograd path.

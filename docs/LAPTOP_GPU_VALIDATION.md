@@ -3,10 +3,12 @@
 > **Branch:** `fix/rtx50-blackwell-validation`
 > **Operator:** Kishore
 > **Purpose:** Execute Month 1 GPU gates on a single laptop GPU in Kuwait
-> **Status:** BLACKWELL ENVIRONMENT PASS — TRAINING RUNNER REPAIRED (Run 2)
+> **Status:** BLACKWELL ENVIRONMENT PASS — TRAINING RUNNER REPAIRED (Run 2) — GATE 10B CHECKER REPAIRED (Run 12)
 > **Run 1 result:** Environment unblocked — PyTorch 2.7.1+cu128 installed, CUDA kernel test passes, sm_120 confirmed.
 > **Run 2 result:** Training runner crashes fixed — dict API mismatch, deprecated GradScaler, real-text mode, failure artifacts.
-> **Next gate:** Single-GPU CUDA validation in Kuwait (Kishore executes `run_all_laptop_validation.bat`).
+> **Next gate:** Single-GPU CUDA validation in Kuwait. See `docs/RUN12_OPERATOR_PACKAGE.md` for the authoritative 8-step sequence. Kishore executes:
+> 1. `scripts\windows\run_all_laptop_validation.bat --data-mode real --preflight-only`
+> 2. `scripts\windows\run_all_laptop_validation.bat --data-mode real`
 > **See also:** [docs/BLACKWELL_ENVIRONMENT.md](BLACKWELL_ENVIRONMENT.md)
 
 ---
@@ -350,4 +352,4 @@ Once all stages pass, the team will:
 
 ---
 
-*Last updated: 2026-08-03 (Run 2) | Branch: fix/rtx50-blackwell-validation | Run 1: Blackwell environment unblocked | Run 2: Training runner dict API, GradScaler, real-text mode repaired*
+*Last updated: 2026-08-04 (Run 12) | Branch: fix/rtx50-blackwell-validation | Run 1: Blackwell environment unblocked | Run 2: Training runner dict API, GradScaler, real-text mode repaired | Run 12: Gate 10b checker repaired — operator package corrected*

@@ -932,3 +932,53 @@ PyTorch-dependent skips: 0 (torch installed in sandbox for verification).
 The gate 10b autograd checks (c18–c20) run on whatever device the model is on. In the sandbox (CPU only), they run on CPU. On Kishore's RTX 5060 (CUDA), they will run on CUDA. The checks are device-agnostic.
 
 When `torch` is not importable, c18–c20 are recorded as PASS with a skip note. When the model is a mock (`SimpleNamespace`, not `nn.Module`), c18–c20 are also recorded as PASS with a skip note. The real-object tests in `test_run12_gate10b_real_object.py` cover the full autograd path.
+
+---
+
+## Run 12 Operator Package Correction (2026-08-04)
+
+**Status:** DOCUMENTATION CORRECTION — READY FOR KISHORE RUN 12
+
+### Problems Corrected
+
+| Problem | Old (unsafe) | New (correct) |
+|---|---|---|
+| Python command | `python -m pytest` / `python3` | `.venv\Scripts\python.exe -m pytest` |
+| Pipeline invocation | `python scripts\run_laptop_validation_pipeline.py` | `scripts\windows\run_all_laptop_validation.bat --data-mode real` |
+| git pull | `git pull origin ...` | `git pull --ff-only origin ...` |
+| Commit verification | "or latest follow-up" | Exact commit hash required; STOP if mismatch |
+| CUDA claim | "all tests pass on CUDA" | CUDA proven only when artifact records `device = cuda` |
+| Artifact path | `artifacts\moe_summary.json` (generic, may be stale) | `benchmarks\results\laptop\<run_id>\moe_summary.json` |
+
+### Authoritative Run 12 Sequence
+
+1. STEP 1 — Verify exact commit and clean tree (`git pull --ff-only`, `git rev-parse HEAD`)
+2. STEP 2 — Real-object CPU regression tests (`.venv\Scripts\python.exe -m pytest tests\test_run12_gate10b_real_object.py -v`)
+3. STEP 3 — Mandatory real-data preflight (`scripts\windows\run_all_laptop_validation.bat --data-mode real --preflight-only`)
+4. STEP 4 — Confirm preflight exit code 0 and CPU/CUDA gate 10b results
+5. STEP 5 — Full real-data validation (`scripts\windows\run_all_laptop_validation.bat --data-mode real`)
+6. STEP 6 — Confirm dense, MoE, router and checkpoint results
+7. STEP 7 — Confirm fresh artifacts by `run_id` (not generic path)
+8. STEP 8 — Return complete evidence package
+
+### Operator-Package Contract Regression Tests
+
+15 new tests added in `tests/test_run12_operator_package.py`:
+
+| Test | Contract verified |
+|---|---|
+| `test_venv_python_used` | `.venv\Scripts\python.exe` appears in checklist |
+| `test_system_python_not_used` | `python -m pytest` not used as official command |
+| `test_python3_not_used` | `python3` not used as official command |
+| `test_ff_only_pull` | `--ff-only` present in git pull command |
+| `test_git_status_required` | `git status` present in verification step |
+| `test_exact_commit_required` | No "or latest follow-up" wording |
+| `test_preflight_uses_bat_launcher` | `run_all_laptop_validation.bat` used for preflight |
+| `test_preflight_data_mode_real` | `--data-mode real` present in preflight command |
+| `test_preflight_only_flag` | `--preflight-only` present in preflight command |
+| `test_full_run_uses_bat_launcher` | `run_all_laptop_validation.bat` used for full run |
+| `test_full_run_data_mode_real` | `--data-mode real` present in full run command |
+| `test_direct_python_pipeline_not_official` | Direct pipeline invocation not the official command |
+| `test_synthetic_cannot_authorize` | Synthetic mode not in official sequence |
+| `test_cuda_requires_device_evidence` | CUDA claim requires `device = cuda` in artifact |
+| `test_run_id_artifact_path` | `<run_id>` path used, not generic `artifacts\` path |

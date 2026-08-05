@@ -435,18 +435,35 @@ class TestMoEAuxLossAccumulation(unittest.TestCase):
         moe_path = REPO_ROOT / "training" / "models" / "moe.py"
         source = moe_path.read_text()
 
-        ckpt_call_pos = source.find("x, aux_loss = gradient_checkpoint(")
+        # Run 14 same-pass transport: the GC call now unpacks three values
+        # (out, aux_loss, metric_tensor) instead of two (x, aux_loss).
+        # Accept either the Run 13 two-value form OR the Run 14 three-value form.
+        ckpt_call_pos = source.find("x, aux_loss, metric_tensor = gradient_checkpoint(")
+        if ckpt_call_pos == -1:
+            # Fallback: accept the older two-value form (Run 13 / pre-Run 14)
+            ckpt_call_pos = source.find("x, aux_loss = gradient_checkpoint(")
         self.assertGreater(ckpt_call_pos, 0,
-                           "moe.py must contain gradient_checkpoint call")
+                           "moe.py must contain gradient_checkpoint call "
+                           "(either 'x, aux_loss, metric_tensor = gradient_checkpoint(' "
+                           "for Run 14+ or 'x, aux_loss = gradient_checkpoint(' for Run 13)")
 
-        # Accept either the Run 13 empty-dict form OR the Run 14 probe form.
-        append_empty_pos = source.find("all_router_metrics.append({})", ckpt_call_pos)
-        append_probe_pos = source.find("all_router_metrics.append(_probe_metrics)", ckpt_call_pos)
-        # At least one form must be present
-        append_pos = append_empty_pos if append_empty_pos != -1 else append_probe_pos
+        # Accept any of the three known append forms:
+        #   Run 13a: all_router_metrics.append({})
+        #   Run 13b: all_router_metrics.append(_probe_metrics)
+        #   Run 14:  all_router_metrics.append(_router_metrics)  (same-pass dict)
+        append_pos = -1
+        for pattern in (
+            "all_router_metrics.append({})",
+            "all_router_metrics.append(_probe_metrics)",
+            "all_router_metrics.append(_router_metrics)",
+        ):
+            pos = source.find(pattern, ckpt_call_pos)
+            if pos != -1:
+                append_pos = pos
+                break
         self.assertGreater(append_pos, 0,
                            "moe.py must contain all_router_metrics.append() in the GC branch "
-                           "(either append({}) for Run 13 or append(_probe_metrics) for Run 14)")
+                           "(append({}) / append(_probe_metrics) / append(_router_metrics))")
 
         accumulation_pos = source.find(
             "total_aux_loss = total_aux_loss + aux_loss",

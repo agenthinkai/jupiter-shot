@@ -1,106 +1,71 @@
-# Jupiter Shot — Required Test Node Manifest
-
-This file is the authoritative record of test counts for the targeted validation
-test suite. All operator packages and preflight gates MUST reference this file
-rather than hardcoding totals.
-
-**Authorization uses pytest collected-node counts, not function counts.**
+# Jupiter Shot — Test Manifest
+## Run 15 Corrected Package
+## Branch: `fix/rtx50-blackwell-validation` | Commit: `dc79637`
 
 ---
 
-## Terminology
+## Authoritative Manifest Files
 
-| Term | Definition |
+The authoritative node-ID manifest is machine-generated and machine-verified.
+Do not edit these files manually.
+
+| File | Purpose |
 |---|---|
-| **Test functions** | Python functions named `test_*` (`grep -c "def test_"`) |
-| **Collected nodes** | Actual pytest node IDs (`pytest --collect-only -q`). Parametrized tests expand into multiple nodes. This is the authoritative count. |
+| `tests/run15_authorized_nodes.txt` | Sorted list of 174 authorized node IDs |
+| `tests/run15_authorized_manifest.json` | JSON manifest with SHA-256, counts, branch, commit |
+
+**Authorized SHA-256:** `43142de49d415c5bd8e606aeac51cccec6976eb53c3f2500752b38f0e604c0a7`
+
+To verify: `python3 scripts/verify_test_manifest.py` (exit 0 = exact match)
 
 ---
 
-## Targeted Validation Test Files
+## Per-File Node Breakdown
 
-| File | Test Functions | Collected Nodes | Added in Run |
-|---|---:|---:|---|
-| `tests/test_run12_gate10b_real_object.py` | 26 | 26 | Run 12 |
-| `tests/test_run12_operator_package.py` | 25 | 25 | Run 12 |
-| `tests/test_run13_config_resolver.py` | 24 | 24 | Run 13 |
-| `tests/test_run13_subprocess_smoke.py` | 31 | 31 | Run 13 |
-| `tests/test_run14_integration.py` | 15 | 15 | Run 14 |
-| `tests/test_run14_same_pass_provenance.py` | 2 | 2 | Run 14 |
-| `tests/test_run14_integration_contracts.py` | 12 | 28 | Run 14 |
-| `tests/test_run15_regression.py` | 18 | 18 | Run 15 |
-| **TOTAL (Run 12–15 targeted)** | **153** | **169** | |
-
-> **Note on test_run14_integration_contracts.py:** 12 test functions expand to 28 collected
-> nodes because several tests use `@pytest.mark.parametrize`. The collected count (28) is
-> authoritative.
+| File | Functions | Collected Nodes | Notes |
+|---|---|---|---|
+| `test_run12_gate10b_real_object.py` | 26 | 26 | No parametrized expansion |
+| `test_run12_operator_package.py` | 25 | 25 | No parametrized expansion |
+| `test_run13_config_resolver.py` | 24 | **29** | `test_no_double_yaml_suffix`: 3 variants; `TestAllFourInputForms`: 4 variants → 24−2+7=29 |
+| `test_run13_subprocess_smoke.py` | 31 | 31 | No parametrized expansion |
+| `test_run14_integration.py` | 15 | 15 | No parametrized expansion |
+| `test_run14_same_pass_provenance.py` | 2 | 2 | No parametrized expansion |
+| `test_run14_integration_contracts.py` | 28 | 28 | No parametrized expansion |
+| `test_run15_regression.py` | 18 | 18 | No parametrized expansion |
+| **Targeted total (8 files)** | **169** | **174** | |
 
 ---
 
-## Notes
+## Verifier Tests
 
-- **112→111 discrepancy explained:** The `docs/RUN13_OPERATOR_PACKAGE.md` originally claimed
-  112 tests (60+27+25 — a transcription error). Actual `grep -c "def test_"` counts are
-  31+24+26+25 = **106**. `pytest --collect-only` returns **111** because 5 parametrized
-  variants in `test_run13_subprocess_smoke.py` expand into individual collected items.
+| File | Functions | Collected Nodes | Notes |
+|---|---|---|---|
+| `test_run15_manifest_verifier.py` | 10 | 10 | V01–V10: verifier regression tests |
 
-- **Run 14 adds 45 new test functions:** 15 + 2 + 28 = 45. Collected nodes: 15 + 2 + 28 = 45.
-
-- **Run 15 adds 18 new test functions / 18 collected nodes.**
-
-- **Run 15 targeted total: 169 collected nodes** (verified by `pytest --collect-only`).
-
-- Pre-existing failures (11) are in `test_mesh.py`, `test_models.py`,
-  `test_tokenizer_vocab.py` — unrelated to the targeted suite, present since before Run 12.
+The verifier test file is **not** part of the 174-node authorized suite. It tests the
+verifier itself and is run separately.
 
 ---
 
-## Gate Requirements
+## 112→111→169→174 Count History
 
-Kishore must verify before authorizing a Run 15 PASS:
-
-```bat
-.venv\Scripts\python.exe -m pytest --collect-only -q ^
-  tests\test_run12_gate10b_real_object.py ^
-  tests\test_run12_operator_package.py ^
-  tests\test_run13_config_resolver.py ^
-  tests\test_run13_subprocess_smoke.py ^
-  tests\test_run14_integration.py ^
-  tests\test_run14_same_pass_provenance.py ^
-  tests\test_run14_integration_contracts.py ^
-  tests\test_run15_regression.py
-```
-
-Expected: **169 tests collected**
-
-Then run:
-
-```bat
-.venv\Scripts\python.exe -m pytest ^
-  tests\test_run12_gate10b_real_object.py ^
-  tests\test_run12_operator_package.py ^
-  tests\test_run13_config_resolver.py ^
-  tests\test_run13_subprocess_smoke.py ^
-  tests\test_run14_integration.py ^
-  tests\test_run14_same_pass_provenance.py ^
-  tests\test_run14_integration_contracts.py ^
-  tests\test_run15_regression.py ^
-  -v
-```
-
-Required result:
-- 169 passed
-- 0 failed
-- 0 errors
-- 0 skips
-- Pytest exit code 0
+| Package | Claimed | Actual | Root Cause |
+|---|---|---|---|
+| Run 13 initial | 112 | 111 | Transcription error (60+27+25=112 vs actual 31+24+26+25=106 functions; pytest counts 111 nodes due to 5 parametrized expansions in `test_run13_config_resolver.py`) |
+| Run 14 initial | 106 | 111 | Manifest used `grep -c "def test_"` (function count) instead of `pytest --collect-only` (node count) |
+| Run 15 initial | 169 | 174 | Same error: function count (169) reported instead of collected-node count (174); `test_run13_config_resolver.py` has 24 functions but 29 collected nodes |
+| **Run 15 corrected** | **174** | **174** | Machine-generated manifest; automated verifier eliminates manual counting |
 
 ---
 
-## Full Suite Baseline (Run 15)
+## Full Suite Baseline (pre-existing failures)
 
 | Category | Count |
 |---|---|
-| Passed | 761 |
-| Failed (pre-existing) | 11 |
+| Pre-existing failures | 11 |
+| Pre-existing failures (files) | `test_mesh.py` (6), `test_models.py` (1), `test_tokenizer_vocab.py` (2), other (2) |
+| Passed | 771 |
 | Skipped | 16 |
+| Total collected | 798 |
+
+No new failures were introduced by Run 12, 13, 14, or 15.

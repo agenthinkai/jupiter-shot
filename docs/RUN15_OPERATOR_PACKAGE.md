@@ -1,154 +1,120 @@
-# Jupiter Shot — Run 15 Operator Package
+# Jupiter Shot — Run 15 Corrected Operator Package
 ## Branch: `fix/rtx50-blackwell-validation`
-## Authorized Commit: `(fill in after git log -1 on your machine)`
+## Authorized Commit: `dc79637`
+## Authorized Node Count: **174**
+## Authorized SHA-256: `43142de49d415c5bd8e606aeac51cccec6976eb53c3f2500752b38f0e604c0a7`
 
 ---
 
-## Summary
+## Corrections from Run 15 Initial Package
 
-Run 15 delivers three production-path repairs that blocked the Run 14 PASS:
+The initial Run 15 package stated an authorized total of 169 collected nodes. The actual
+deterministic collection is **174 nodes**. The discrepancy comes entirely from
+`tests/test_run13_config_resolver.py`:
 
-| # | Defect | Root Cause | Fix |
+| File | Functions | Collected Nodes | Explanation |
 |---|---|---|---|
-| 1 | `auxiliary_load_balancing_loss` silently dropped from acceptance evaluation | `run_laptop_moe.py` line 517 used `not k.startswith(("aux", ...))` which matched `auxiliary_load_balancing_loss` as well as the intended `aux_loss` | Replaced with explicit `ROUTER_METRIC_KEYS` allowlist in `training/router_metrics.py`; only exact key `TRAINING_LEVEL_EXCLUDE_KEY = "aux_loss"` is excluded |
-| 2 | MoE artifact missing required schema fields | `moe_summary.json` lacked `schema_version`, `timestamp`, `branch`, `commit`, `device`, `gpu_name` | Added all required fields to initial summary dict; added `validate_moe_artifact_schema()` and `_write_artifact()` helpers; schema validated before every write |
-| 3 | Thermal monitor polled once per training step (step-timed) | `_check_thermal()` called inside the training loop — a 60-second step means 60 seconds of undetected overtemperature | Replaced with `ThermalMonitor` background thread (1 Hz independent sampling, telemetry file, warning/stop events, singleton guard, health summary) |
+| `test_run13_config_resolver.py` | 24 | **29** | Two parametrized tests expand: `test_no_double_yaml_suffix` → 3 variants; `TestAllFourInputForms` → 4 variants. 24 − 2 + 7 = **29** |
+
+All other files have equal function and node counts (no parametrized expansion).
+
+The initial package did not distinguish between function count and collected-node count.
+This package eliminates manual test-count maintenance by providing an automated manifest
+generator and verifier.
 
 ---
 
-## Files Changed
+## Per-File Node Breakdown
 
-| File | Change |
-|---|---|
-| `training/router_metrics.py` | Added `ROUTER_METRIC_KEYS` allowlist and `TRAINING_LEVEL_EXCLUDE_KEY` constant |
-| `training/thermal_monitor.py` | **New module**: `ThermalMonitor` class with background thread, 1 Hz sampling, `thermal_telemetry.jsonl`, warning/stop events, singleton guard |
-| `scripts/run_laptop_moe.py` | Imports `ROUTER_METRIC_KEYS`, `TRAINING_LEVEL_EXCLUDE_KEY`; uses allowlist filter; adds `validate_moe_artifact_schema()`, `_write_artifact()`; integrates `ThermalMonitor`; records `thermal_monitor_healthy`, `thermal_peak_c`, `thermal_warn_samples`, `thermal_stop_triggered`, `thermal_total_samples` in artifact |
-| `tests/test_run15_regression.py` | **New file**: 18 regression tests (T01–T18) |
-| `tests/TEST_MANIFEST.md` | Updated to collected-node counts; Run 15 row added; 169-node total |
-
----
-
-## Repair 1 Detail: Metric Filter Allowlist
-
-**Root cause:** Line 517 of `run_laptop_moe.py` filtered per-step records with:
-```python
-{k: v for k, v in m.items()
- if not k.startswith(("step", "loss", "aux", "lr", ...))}
-```
-The `"aux"` prefix matched both `"aux_loss"` (correct to exclude — training-level scalar) and
-`"auxiliary_load_balancing_loss"` (must survive — required acceptance key). The evaluator
-received records missing this key and returned `NOT_EVALUABLE` instead of `PASS`.
-
-**Fix:** `training/router_metrics.py` now exports:
-```python
-ROUTER_METRIC_KEYS: frozenset[str]   # all keys compute_router_metrics() produces
-TRAINING_LEVEL_EXCLUDE_KEY: str      # = "aux_loss"
-```
-
-The filter in `run_laptop_moe.py` is now:
-```python
-{k: v for k, v in m.items()
- if k in ROUTER_METRIC_KEYS and k != TRAINING_LEVEL_EXCLUDE_KEY}
-```
-
-**Proof (T05):** The test explicitly shows the old prefix filter removes
-`auxiliary_load_balancing_loss` and the new allowlist retains it.
-
----
-
-## Repair 2 Detail: Complete MoE Artifact Schema
-
-**Root cause:** `moe_summary.json` was missing `schema_version`, `timestamp`, `branch`,
-`commit`, `device`, `gpu_name`. The pipeline's `_validate_runner_artifact` requires
-`schema_version` and `timestamp` to be present and well-formed.
-
-**Fix:** The initial `summary` dict in `run_moe_validation()` now includes:
-```python
-"schema_version": "1.0",
-"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-"run_id": _run_id,
-"branch": branch,
-"commit": commit,
-"device": "cuda",
-"gpu_name": torch.cuda.get_device_name(0),
-```
-
-`validate_moe_artifact_schema(artifact)` returns a list of error strings. An empty list means
-the artifact is schema-valid. Called before every `_write_artifact()` invocation.
-
-**Required fields for schema validity:**
-`schema_version`, `timestamp`, `run_id`, `branch`, `commit`, `outcome`, `exit_code`,
-`data_mode`, `device`, `gpu_name`, `aux_loss_semantics`, `router_metrics_available_under_gc`,
-`checkpoint_status`
-
----
-
-## Repair 3 Detail: Independent High-Frequency Thermal Safety Monitor
-
-**Root cause:** `_check_thermal()` was called once per training step. On the RTX 5090 with
-long steps (up to 60 s), a GPU could reach 90°C and sustain it for nearly a minute before
-the next check. The monitor was not independent of training-step timing.
-
-**Fix:** `training/thermal_monitor.py` implements `ThermalMonitor`:
-
-```python
-from training.thermal_monitor import ThermalMonitor
-
-monitor = ThermalMonitor(run_dir=output_dir, run_id=run_id)
-monitor.start()   # background thread starts, 1 Hz sampling
-try:
-    for step in range(1, max_steps + 1):
-        if monitor.stop_requested:     # non-blocking poll
-            # SAFETY_STOP path
-            break
-        if monitor.monitor_failed:
-            # Non-PASS: monitor health required
-            break
-        ... training step ...
-finally:
-    monitor.stop()
-    health = monitor.health_summary()
-    # health["healthy"] == True iff monitor ran without failure
-```
-
-**Key properties:**
-- Samples at 1 Hz regardless of step timing
-- Writes `thermal_telemetry.jsonl` continuously (one JSON record per line)
-- Emits `[THERMAL WARNING]` at >= 80°C
-- Sets `stop_requested` event at >= 90°C
-- Sets `monitor_failed` event if the thread dies unexpectedly
-- Singleton guard: only one active monitor per process
-- `stop()` joins the thread and clears the singleton
-- `health_summary()` returns `healthy`, `peak_temperature_c`, `samples_at_or_above_warn_c`,
-  `safety_stop_triggered`, `total_samples`
-
-**PASS prevention:** If `monitor_failed` is True when `outcome == PASS`, the outcome is
-overridden to `EXECUTION_ERROR`. A healthy monitor is required for PASS.
-
----
-
-## Test Traceability Table
-
-| Test ID | Class | What It Proves |
+| File | Functions | Collected Nodes |
 |---|---|---|
-| T01 | `TestMetricFilterAllowlist` | `auxiliary_load_balancing_loss` survives the allowlist filter |
-| T02 | `TestMetricFilterAllowlist` | Only exact key `aux_loss` is excluded; `auxiliary_load_balancing_loss` is not |
-| T03 | `TestMetricFilterAllowlist` | All 11 required router metrics reach `aggregate_layer_metrics` |
-| T04 | `TestMetricFilterAllowlist` | All 11 required router metrics appear in a fresh MoE artifact; evaluator does not return `NOT_EVALUABLE` |
-| T05 | `TestMetricFilterAllowlist` | **Regression proof**: old prefix filter removed `auxiliary_load_balancing_loss`; new allowlist retains it |
-| T06 | `TestMoEArtifactSchemaValidation` | Complete schema-valid artifact produces zero errors |
-| T07 | `TestMoEArtifactSchemaValidation` | Missing `schema_version` produces validation error |
-| T08 | `TestMoEArtifactSchemaValidation` | Missing `timestamp` produces validation error |
-| T09 | `TestMoEArtifactSchemaValidation` | Naive (timezone-unaware) timestamp produces validation error |
-| T10 | `TestMoEArtifactSchemaValidation` | `schema_version != '1.0'` produces validation error |
-| T11 | `TestThermalMonitor` | 79°C: no warning, no stop |
-| T12 | `TestThermalMonitor` | 80°C: warning triggered, no stop |
-| T13 | `TestThermalMonitor` | 85°C: warning triggered, training may continue |
-| T14 | `TestThermalMonitor` | 89°C: warning triggered, no stop |
-| T15 | `TestThermalMonitor` | 90°C: SAFETY_STOP triggered |
-| T16 | `TestThermalMonitor` | 91°C: SAFETY_STOP triggered |
-| T17 | `TestThermalMonitor` | Monitor thread failure sets `monitor_failed=True`, `healthy=False` |
-| T18 | `TestThermalMonitor` | After `stop()`, thread is dead and singleton is cleared |
+| `test_run12_gate10b_real_object.py` | 26 | 26 |
+| `test_run12_operator_package.py` | 25 | 25 |
+| `test_run13_config_resolver.py` | 24 | **29** |
+| `test_run13_subprocess_smoke.py` | 31 | 31 |
+| `test_run14_integration.py` | 15 | 15 |
+| `test_run14_same_pass_provenance.py` | 2 | 2 |
+| `test_run14_integration_contracts.py` | 28 | 28 |
+| `test_run15_regression.py` | 18 | 18 |
+| **Total** | **169** | **174** |
+
+---
+
+## Automated Manifest Generator and Verifier
+
+Manual test-count maintenance is eliminated. The manifest is generated once (by the
+developer) and verified by Kishore before every run.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `scripts/generate_test_manifest.py` | Generates `run15_authorized_nodes.txt` and `run15_authorized_manifest.json` using the pytest Python API |
+| `scripts/verify_test_manifest.py` | Verifies current collection against the authorized manifest; exits 0 on exact match, 1 on any discrepancy |
+| `tests/run15_authorized_nodes.txt` | Sorted list of 174 authorized node IDs, one per line |
+| `tests/run15_authorized_manifest.json` | Machine-readable manifest with SHA-256, function count, collected count, branch, commit |
+
+### Manifest Contents
+
+```json
+{
+  "schema_version": "1.0",
+  "test_files": ["tests/test_run12_gate10b_real_object.py", "..."],
+  "function_count": 169,
+  "collected_node_count": 174,
+  "node_list_sha256": "43142de49d415c5bd8e606aeac51cccec6976eb53c3f2500752b38f0e604c0a7",
+  "generated_with": "scripts/generate_test_manifest.py",
+  "generated_at": "2026-...",
+  "branch": "fix/rtx50-blackwell-validation",
+  "commit": "dc79637"
+}
+```
+
+### Verifier Behavior
+
+The verifier fails with exit code 1 on any of the following:
+
+- Missing node (test removed or renamed)
+- Unexpected node (test added without re-generating the manifest)
+- Changed parametrized variant name
+- Duplicate node
+- Collection failure (import error, missing file)
+- SHA-256 hash mismatch
+- Count mismatch
+
+The verifier normalizes Windows backslash paths to forward slashes before comparison.
+
+---
+
+## Verifier Regression Tests
+
+`tests/test_run15_manifest_verifier.py` — 10 tests (V01–V10):
+
+| Test | What It Proves |
+|---|---|
+| V01 | Accepts the exact 174-node collection |
+| V02 | Detects a missing node |
+| V03 | Detects an unexpected node |
+| V04 | Detects a changed parametrized variant |
+| V05 | Detects a duplicate node |
+| V06 | Detects collection failure |
+| V07 | Detects hash mismatch |
+| V08 | Produces deterministic output (same SHA-256 on repeated calls) |
+| V09 | Handles Windows paths (backslash normalization) |
+| V10 | Returns nonzero exit code on every mismatch |
+
+---
+
+## Run 15 Repairs (Unchanged from Initial Package)
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | `auxiliary_load_balancing_loss` silently dropped | `ROUTER_METRIC_KEYS` allowlist in `training/router_metrics.py`; explicit filter in `run_laptop_moe.py` |
+| 2 | MoE artifact missing schema fields | `schema_version`, `timestamp`, `branch`, `commit`, `device`, `gpu_name` added; `validate_moe_artifact_schema()` called before every write |
+| 3 | Thermal monitor polled once per training step | `ThermalMonitor` background thread (1 Hz, independent of step timing) in `training/thermal_monitor.py` |
+
+No model code, routing logic, thermal thresholds, acceptance criteria, or training
+configurations were changed. `strategy/jupiter-20t` was not touched.
 
 ---
 
@@ -156,19 +122,36 @@ overridden to `EXECUTION_ERROR`. A healthy monitor is required for PASS.
 
 | Suite | Collected Nodes | Result |
 |---|---|---|
-| Run 12–14 (existing, 7 files) | 151 | 151 passed |
-| **Run 15 regression (new, T01–T18)** | **18** | **18 passed** |
-| **Targeted total (8 files)** | **169** | **169 passed** |
-| Full suite | 788 | 11 failed (pre-existing), 761 passed, 16 skipped |
+| Run 12–14 (7 files) | 151 | 151 passed |
+| Run 15 regression (T01–T18) | 18 | 18 passed |
+| **Run 15 manifest verifier (V01–V10, new)** | **10** | **10 passed** |
+| **Targeted total (9 files)** | **184** | **184 passed** |
+| Full suite | 798 | 11 failed (pre-existing), 771 passed, 16 skipped |
 
-**Zero new failures introduced by Run 15.**
-
-Pre-existing failures (11): `test_mesh.py` (6), `test_models.py` (1),
-`test_tokenizer_vocab.py` (2) — all unrelated to the targeted suite.
+Zero new failures introduced.
 
 ---
 
-## Kishore's Preflight Commands
+## Physical Preparation — Operator Attestation Required
+
+Before starting the GPU workload, Kishore must confirm each of the following manually.
+These items are operator-attested and cannot be software-verified:
+
+```
+[ ] Original power adapter connected (not battery-only)
+[ ] Laptop placed on a hard, flat surface
+[ ] Cooling vents unobstructed on all sides
+[ ] Normal high-performance cooling profile enabled
+[ ] Laptop will remain attended throughout the entire run
+```
+
+Record this attestation in the run summary before proceeding to Step 7.
+
+---
+
+## Kishore's Preflight Sequence
+
+### Step 1 — Verify commit
 
 ```bat
 cd C:\Users\Kishore\jupiter-shot
@@ -176,21 +159,58 @@ git fetch origin
 git checkout fix/rtx50-blackwell-validation
 git pull --ff-only origin fix/rtx50-blackwell-validation
 git log -1
-REM Expected: commit hash ending in f27c173 or later
+```
 
-REM Step 1: Verify collected-node count
-.venv\Scripts\python.exe -m pytest --collect-only -q ^
-  tests\test_run12_gate10b_real_object.py ^
-  tests\test_run12_operator_package.py ^
-  tests\test_run13_config_resolver.py ^
-  tests\test_run13_subprocess_smoke.py ^
-  tests\test_run14_integration.py ^
-  tests\test_run14_same_pass_provenance.py ^
-  tests\test_run14_integration_contracts.py ^
-  tests\test_run15_regression.py
-REM Expected: 169 tests collected
+Expected output: `dc79637 feat(run15): metric allowlist, complete artifact schema, independent thermal monitor`
 
-REM Step 2: Run targeted suite
+**STOP if commit hash does not match `dc79637`.**
+
+---
+
+### Step 2 — Verify clean repository
+
+```bat
+git status
+```
+
+Expected: `nothing to commit, working tree clean`
+
+**STOP if any local modifications are present.**
+
+---
+
+### Step 3 — Run automated manifest verifier
+
+```bat
+.venv\Scripts\python.exe scripts\verify_test_manifest.py
+```
+
+Expected output:
+```
+[VERIFY] Loading authorized manifest...
+[VERIFY] Authorized: 174 nodes, SHA-256: 43142de49d415c5b...
+[VERIFY] Collecting current nodes from 8 files...
+[VERIFY OK] Exact match: 174 nodes, SHA-256: 43142de49d415c5b...
+[VERIFY OK] All checks passed.
+```
+
+Expected exit code: `0`
+
+**STOP if exit code is not 0 or output contains `[VERIFY FAIL]`.**
+
+---
+
+### Step 4 — Require exact 174-node match
+
+The verifier enforces this automatically. No manual counting required.
+
+**STOP if the verifier did not print `Exact match: 174 nodes`.**
+
+---
+
+### Step 5 — Run the 174 authorized tests
+
+```bat
 .venv\Scripts\python.exe -m pytest ^
   tests\test_run12_gate10b_real_object.py ^
   tests\test_run12_operator_package.py ^
@@ -201,34 +221,57 @@ REM Step 2: Run targeted suite
   tests\test_run14_integration_contracts.py ^
   tests\test_run15_regression.py ^
   -v
-REM Expected: 169 passed, 0 failed, exit code 0
 ```
 
 ---
 
-## Stop Conditions
+### Step 6 — Require 174 passed, zero failed/errors/skipped
 
-| Condition | Action |
-|---|---|
-| Fewer than 169 nodes collected | STOP — manifest mismatch, do not proceed |
-| Any targeted test fails | STOP — do not run the validation pipeline |
-| `moe_summary.json` missing `schema_version` or `timestamp` | STOP — schema validation failed |
-| `thermal_monitor_healthy: false` in artifact | STOP — monitor failure, not a valid run |
-| `thermal_stop_triggered: true` in artifact | STOP — GPU overtemperature during run |
-| `outcome != "PASS"` in any runner artifact | STOP — runner did not pass |
-| `exit_code != 0` from pipeline | STOP — pipeline reported failure |
+Expected final line: `174 passed`
+
+**STOP if any test fails, errors, or is skipped.**
 
 ---
 
-## Artifact Verification
+### Step 7 — Physical preparation attestation
 
-After a successful validation run, verify `moe_summary.json`:
+Complete the operator attestation checklist above. Record it in the run summary.
+
+---
+
+### Step 8 — Run real-data preflight
 
 ```bat
-REM Required fields
+.venv\Scripts\python.exe scripts\run_laptop_validation_pipeline.py ^
+  --data-mode real --preflight-only
+```
+
+Expected exit code: `0`
+
+**STOP if exit code is not 0.**
+
+---
+
+### Step 9 — Run full real-data validation
+
+Only proceed if all previous gates passed.
+
+```bat
+.venv\Scripts\python.exe scripts\run_laptop_validation_pipeline.py ^
+  --data-mode real
+```
+
+---
+
+### Step 10 — Verify thermal monitor during the loaded run
+
+During the run, `thermal_telemetry.jsonl` will be written to the output directory.
+After the run, verify the artifact:
+
+```bat
 python -c "
 import json, sys
-a = json.load(open('results/moe_summary.json'))
+a = json.load(open('results\moe_summary.json'))
 required = ['schema_version','timestamp','run_id','branch','commit',
             'outcome','exit_code','data_mode','device','gpu_name',
             'aux_loss_semantics','router_metrics_available_under_gc',
@@ -240,13 +283,42 @@ print('Schema OK')
 print('outcome:', a['outcome'])
 print('thermal_monitor_healthy:', a['thermal_monitor_healthy'])
 print('thermal_peak_c:', a.get('thermal_peak_c'))
+print('thermal_stop_triggered:', a.get('thermal_stop_triggered'))
 "
 ```
 
-Expected output:
+Expected:
 ```
 Schema OK
 outcome: PASS
 thermal_monitor_healthy: True
-thermal_peak_c: <temperature below 90>
+thermal_peak_c: <value below 90>
+thermal_stop_triggered: False
 ```
+
+**STOP if `thermal_monitor_healthy` is False or `thermal_stop_triggered` is True.**
+
+---
+
+### Step 11 — Preserve evidence, make no local repair
+
+If any gate fails, preserve all logs and artifacts exactly as produced.
+Do not attempt local repair. Report the exact failure output.
+
+---
+
+## Stop Conditions Summary
+
+| Condition | Action |
+|---|---|
+| Commit hash ≠ `dc79637` | STOP |
+| Working tree not clean | STOP |
+| Verifier exit code ≠ 0 | STOP |
+| Verifier node count ≠ 174 | STOP |
+| Any targeted test fails/errors/skips | STOP |
+| Physical attestation not completed | STOP |
+| Preflight exit code ≠ 0 | STOP |
+| `outcome != "PASS"` in any runner artifact | STOP |
+| `thermal_monitor_healthy: false` | STOP |
+| `thermal_stop_triggered: true` | STOP |
+| Any missing required artifact field | STOP |

@@ -78,12 +78,15 @@ configurations were changed. `strategy/jupiter-20t` was not touched.
 
 ---
 
-## HUMAN_ATTESTED Block
+## PACKAGE_ATTESTED Block
 
 ```
-HUMAN_ATTESTED
+PACKAGE_ATTESTED
   package:                     RUN15_OPERATOR_PACKAGE_v2
   branch:                      fix/rtx50-blackwell-validation
+  commit:                      679fba0a0bfae5317eddce89a09579e799d6b7c9
+  parent_commit:               0592fbef138dbf4965e92b5f5be9538d637c0975
+  git_tree:                    0366e4c0f352363e39c5726049253b0b04ecd493
   authorized_nodes:            207
   sha256:                      e5cbd90497bcbe536536abeed8c452fd9b26f9af354ae47731bbd287c99596ee
   defects_repaired:            4
@@ -94,7 +97,28 @@ HUMAN_ATTESTED
   strategy_jupiter_20t_touched: NO
   pythonutf8_required:         NO
   pythonioencoding_required:   NO
-END_ATTESTED
+END_PACKAGE_ATTESTED
+```
+
+---
+
+## PHYSICAL_OPERATOR_ATTESTATION
+
+This section must be completed by the person physically beside the laptop immediately before the full GPU run begins. Software, Manus, and execution agents must not complete this section. The full GPU run cannot begin unless every physical answer is YES.
+
+```
+PHYSICAL_OPERATOR_ATTESTATION
+  Operator name:
+  Date and time:
+  Laptop location:
+  Original power adapter connected:                        YES / NO
+  Laptop on a hard stable surface:                         YES / NO
+  Cooling vents unobstructed:                              YES / NO
+  Manufacturer high-performance cooling profile enabled:   YES / NO
+  Laptop will remain attended throughout GPU load:         YES / NO
+  Operator is prepared to stop the run if required:        YES / NO
+  Operator signature or typed confirmation:
+END_PHYSICAL_OPERATOR_ATTESTATION
 ```
 
 ---

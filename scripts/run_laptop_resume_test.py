@@ -3,6 +3,11 @@ Jupiter Shot — Laptop Checkpoint Resume Test
 =============================================
 Verifies checkpoint save, load, and training continuity.
 
+Model API contract:
+  model(input_ids=..., labels=...) → dict with keys:
+    - 'loss':   scalar tensor (cross-entropy loss)
+    - 'logits': (batch, seq_len, vocab_size)
+
 Tests:
   1. Run N steps and save checkpoint
   2. Load checkpoint into fresh model
@@ -31,26 +36,38 @@ sys.path.insert(0, str(REPO_ROOT))
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "laptop"
 CKPT_DIR = REPO_ROOT / "checkpoints" / "laptop"
 
+# ── Semantic artifact contract ────────────────────────────────────────────────
+ARTIFACT_SCHEMA_VERSION  = "1.0"
+EXIT_PASS                = 0
+EXIT_NOT_ACCEPTED        = 1
+EXIT_NOT_EVALUABLE       = 2
+EXIT_EXECUTION_ERROR     = 3
+EXIT_SAFETY_STOP         = 4
+OUTCOME_PASS             = "PASS"
+OUTCOME_NOT_ACCEPTED     = "NOT_ACCEPTED"
+OUTCOME_NOT_EVALUABLE    = "NOT_EVALUABLE"
+OUTCOME_EXECUTION_ERROR  = "EXECUTION_ERROR"
+OUTCOME_SAFETY_STOP      = "SAFETY_STOP"
+
 
 def run_steps(model: Any, optimizer: Any, scheduler: Any, device: Any,
               vocab_size: int, seq_len: int, batch_size: int,
               n_steps: int, torch: Any) -> list[float]:
-    """Run n_steps and return loss values."""
+    """Run n_steps and return loss values.
+
+    Uses the model's dict output API:
+        out = model(input_ids=input_ids, labels=labels)
+        loss = out["loss"]
+    """
     import torch as th
     losses = []
     model.train()
     for _ in range(n_steps):
         input_ids = th.randint(0, vocab_size, (batch_size, seq_len), device=device)
         labels = input_ids.clone()
-        logits = model(input_ids)
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        loss = th.nn.functional.cross_entropy(
-            shift_logits.view(-1, vocab_size),
-            shift_labels.view(-1),
-        )
+        # Model returns dict — unpack loss directly
+        out = model(input_ids=input_ids, labels=labels)
+        loss = out["loss"]
         optimizer.zero_grad()
         loss.backward()
         th.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -73,10 +90,13 @@ def run_resume_test(
     if not torch.cuda.is_available():
         raise RuntimeError("[FAIL] CUDA not available.")
 
-    config_path = REPO_ROOT / "training" / "configs" / f"{config_name}.yaml"
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
-    with open(config_path) as f:
+    # Use shared resolver to support full paths, relative paths, and bare names
+    from training.config_path import resolve_config_path, format_missing_error, safe_checkpoint_name
+    _res = resolve_config_path(config_name, repo_root=REPO_ROOT)
+    config_path = _res.resolved_path
+    if not _res.exists:
+        raise FileNotFoundError(format_missing_error(_res))
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     model_cfg = cfg.get("model", {})
@@ -111,7 +131,8 @@ def run_resume_test(
 
     # ── Phase 2: Save checkpoint ──────────────────────────────────────────────
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / f"resume_test_{config_name}.pt"
+    _ckpt_stem = safe_checkpoint_name(config_name)
+    ckpt_path = ckpt_dir / f"resume_test_{_ckpt_stem}.pt"
     ckpt_start = time.time()
     torch.save({
         "step": initial_steps,
@@ -144,7 +165,8 @@ def run_resume_test(
     opt_b = torch.optim.AdamW(model_b.parameters(), lr=lr)
     sched_b = torch.optim.lr_scheduler.CosineAnnealingLR(opt_b, T_max=initial_steps + resume_steps)
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # weights_only=True avoids the FutureWarning in PyTorch 2.x and is safer
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     model_b.load_state_dict(ckpt["model_state_dict"])
     opt_b.load_state_dict(ckpt["optimizer_state_dict"])
     sched_b.load_state_dict(ckpt["scheduler_state_dict"])
@@ -179,11 +201,11 @@ def run_resume_test(
     print(f"  Resumed loss at step {initial_steps + resume_steps}: {loss_resumed_end:.6f}")
     print(f"  Reference loss at same step: {loss_ref_end:.6f}")
 
-    # Loss continuity: resumed loss should be within 5% of reference
+    # Loss continuity: resumed loss should be within 10% of reference
     # (exact match not expected due to random batch sampling)
     continuity_delta = abs(loss_resumed_end - loss_ref_end)
     continuity_pct = continuity_delta / max(abs(loss_ref_end), 1e-9) * 100
-    continuity_pass = continuity_pct < 10.0  # within 10% is acceptable with random batches
+    continuity_pass = continuity_pct < 10.0
     result["tests"]["loss_continuity"] = {
         "passed": continuity_pass,
         "reference_loss": round(loss_ref_end, 6),
@@ -203,18 +225,60 @@ def run_resume_test(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "resume_test.json"
-    out_path.write_text(json.dumps(result, indent=2))
+    out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"\n[RESUME TEST] {'PASS' if all_passed else 'FAIL'}")
     print(f"[RESUME TEST] Saved: {out_path}")
     return result
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Jupiter Shot Laptop Resume Test")
-    parser.add_argument("--config", default="laptop_dense_small")
-    parser.add_argument("--steps", type=int, default=20, help="Initial steps before checkpoint")
-    parser.add_argument("--output-dir", default="benchmarks/results/laptop")
+    parser = argparse.ArgumentParser(
+        description="Jupiter Shot Laptop Checkpoint Resume Test",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "DATA NOTE: This test uses deterministic synthetic random tensors "
+            "(torch.randint) for all training steps. It does NOT use Wikitext-2 "
+            "or any real text data. The --data-mode flag is accepted for CLI "
+            "contract compatibility with the pipeline but does not change the "
+            "data source. Resume correctness is independent of training-data mode."
+        ),
+    )
+    parser.add_argument("--config", default="laptop_dense_small",
+                        help="Training config name (e.g., laptop_dense_small)")
+    parser.add_argument("--steps", type=int, default=20,
+                        help="Initial steps before checkpoint")
+    parser.add_argument("--output-dir", default="benchmarks/results/laptop",
+                        help="Directory for result artifacts")
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help=(
+            "Unique run identifier (e.g., 20260804_082957_UTC). "
+            "Embedded in resume_test.json for artifact traceability. "
+            "Generated automatically if not provided."
+        ),
+    )
+    parser.add_argument(
+        "--data-mode",
+        choices=["real", "synthetic", "auto"],
+        default="synthetic",
+        help=(
+            "Accepted for CLI contract compatibility with the pipeline. "
+            "This test always uses deterministic synthetic random tensors "
+            "(torch.randint) regardless of this flag."
+        ),
+    )
     args = parser.parse_args()
+
+    import datetime as _dt
+    run_id = args.run_id or _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+    print(f"[RESUME] Run ID: {run_id}", flush=True)
+    print(
+        f"[RESUME] Data mode: {args.data_mode} (accepted; "
+        "test uses deterministic synthetic tensors regardless)",
+        flush=True,
+    )
 
     try:
         result = run_resume_test(
@@ -222,10 +286,49 @@ def main() -> int:
             initial_steps=args.steps,
             output_dir=Path(args.output_dir),
         )
-        return 0 if result["passed"] else 1
+        # Inject semantic artifact contract fields
+        _outcome  = OUTCOME_PASS if result["passed"] else OUTCOME_NOT_ACCEPTED
+        _exit     = EXIT_PASS    if result["passed"] else EXIT_NOT_ACCEPTED
+        result.update({
+            "run_id":         run_id,
+            "outcome":        _outcome,
+            "exit_code":      _exit,
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "timestamp":      _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "data_mode_arg":            args.data_mode,
+            "requested_data_mode":      args.data_mode,
+            "resume_test_data_source":  "deterministic_synthetic_tensors",
+            "resume_uses_wikitext":     False,
+            "data_source":              "deterministic_synthetic_tensors",
+            "data_source_note":         (
+                "The resume runner accepts --data-mode real but uses deterministic "
+                "synthetic tensors internally so that pre-save and post-resume "
+                "behavior can be compared exactly. Real Wikitext-2 is NOT loaded."
+            ),
+        })
+        result_path = Path(args.output_dir) / "resume_result.json"
+        result_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+        return _exit
     except RuntimeError as e:
         print(f"\n[FAIL] {e}")
-        return 1
+        # Write a minimal failure artifact so the pipeline can read it
+        import datetime as _dt2
+        failure_artifact = {
+            "run_id":         run_id,
+            "outcome":        OUTCOME_EXECUTION_ERROR,
+            "exit_code":      EXIT_EXECUTION_ERROR,
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "timestamp":      _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
+            "error":          str(e),
+        }
+        try:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(args.output_dir) / "resume_result.json").write_text(
+                json.dumps(failure_artifact, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+        return EXIT_EXECUTION_ERROR
 
 
 if __name__ == "__main__":

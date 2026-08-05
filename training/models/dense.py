@@ -27,6 +27,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint  # explicit — do not rely on side-effects
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -412,7 +413,7 @@ class DenseTransformer(nn.Module):
 
         for layer in self.layers:
             if self.config.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
+                x = gradient_checkpoint(
                     layer, x, cos, sin, attention_mask, use_reentrant=False
                 )
             else:

@@ -1,0 +1,79 @@
+# ============================================================================
+# Jupiter Shot — Windows Laptop Validation Dependencies
+# requirements-laptop.txt
+#
+# PURPOSE: Minimal dependency set for Windows laptop GPU validation.
+#          Covers: preflight, dense validation, MoE validation,
+#          checkpoint resume, metrics collection, draft-report generation.
+#
+# DO NOT ADD:
+#   - vLLM (Linux-only, requires CUDA build tools)
+#   - DeepSpeed (Linux-only, requires NCCL and C++ build tools)
+#   - AutoGPTQ / AutoAWQ (not needed for validation)
+#   - text-generation-inference (Rust binary, Docker only)
+#   - lm-eval (not needed for validation)
+#
+# PyTorch is installed separately by the setup script to allow
+# architecture-specific wheel selection (cu121 vs cu128 for Blackwell).
+# Do NOT add torch/torchvision/torchaudio here.
+# ============================================================================
+
+# ── Core numerics ─────────────────────────────────────────────────────────────
+numpy==1.26.4
+pandas==2.2.2
+# ── Configuration ─────────────────────────────────────────────────────────────
+pyyaml==6.0.1
+omegaconf==2.3.0
+# ── Progress and display ──────────────────────────────────────────────────────
+tqdm==4.66.4
+rich==13.7.1
+# ── System monitoring ─────────────────────────────────────────────────────────
+psutil==5.9.8
+pynvml==11.5.0
+# ── Utilities ─────────────────────────────────────────────────────────────────
+click==8.1.7
+requests==2.32.2
+filelock==3.14.0
+packaging==24.0
+# Run 8 change: fsspec==2024.5.0 → fsspec[http]==2024.3.1
+#   Root cause: datasets==2.19.1 requires fsspec<=2024.3.1
+#   fsspec==2024.5.0 violated that upper bound, making the set unsatisfiable.
+#   fsspec[http] installs the aiohttp extra required by HuggingFace Hub.
+#   Added: pyarrow-hotfix==0.6 (patches CVE-2023-47248; safe with pyarrow 16.1.0)
+# ── Real-text data (required for --data-mode real) ────────────────────────────
+# Dataset:   wikitext-2-raw-v1 (Merity et al., 2016)
+#   Identifier:    "Salesforce/wikitext", config="wikitext-2-raw-v1", split="train"
+#   License:       Creative Commons Attribution-ShareAlike 4.0 (CC BY-SA 4.0)
+#   Download size: ~4.5 MB compressed (~13 MB uncompressed)
+#   Source:        https://huggingface.co/datasets/Salesforce/wikitext
+# Tokenizer: EleutherAI/gpt-neox-20b
+#   License:       Apache 2.0
+#   Vocabulary:    50,277 tokens (BPE, byte-level)
+#   Source:        https://huggingface.co/EleutherAI/gpt-neox-20b
+#
+# NOTE: If Kishore's .venv already has compatible versions of these packages,
+# pip will skip the download and reuse the existing installation.
+# Do NOT re-install PyTorch — it is already in the .venv.
+#
+# After install, verify no conflicts with:
+#   .venv\Scripts\python.exe -m pip check
+transformers==4.40.2
+datasets==2.19.1
+tokenizers==0.19.1
+huggingface-hub==0.23.2
+sentencepiece==0.2.0
+safetensors==0.4.3
+# FIX (Run 8): was fsspec==2024.5.0 — datasets==2.19.1 requires fsspec<=2024.3.1
+# The [http] extra installs aiohttp for HuggingFace Hub streaming support.
+fsspec[http]==2024.3.1
+aiohttp==3.9.5
+multiprocess==0.70.16
+dill==0.3.8
+pyarrow==16.1.0
+# pyarrow-hotfix: patches CVE-2023-47248 in pyarrow <14.0.1; safe with 16.1.0
+pyarrow-hotfix==0.6
+xxhash==3.4.1
+regex==2024.5.15
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest==8.2.1
+pytest-cov==5.0.0

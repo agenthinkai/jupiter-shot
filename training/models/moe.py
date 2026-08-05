@@ -33,6 +33,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint  # explicit — do not rely on side-effects
 
 from training.models.dense import (
     DenseConfig,
@@ -247,20 +248,36 @@ class TopKRouter(nn.Module):
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
 
     def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        self,
+        x: torch.Tensor,
+        return_metric_tensors: bool = False,
+    ) -> tuple:
         """
         Compute routing decisions.
 
         Args:
             x: Input tensor of shape (batch × seq_len, hidden_size).
+            return_metric_tensors: When True, return raw metric tensors instead
+                of the computed metrics dict.  Used by the gradient-checkpoint
+                branch so that all outputs remain tensors (gradient_checkpoint
+                cannot transport Python dicts across its boundary).
+
+                The returned metric_tensor is a 1-D float32 tensor of length
+                (2 * num_experts + 3) encoding:
+                  [0 : E]       tokens_per_expert  (float, from one_hot sum)
+                  [E : 2E]      mean_prob_per_expert
+                  [2E]          aux_loss_unscaled  (before aux_loss_coeff)
+                  [2E+1]        z_loss_unscaled    (before z_loss_coeff; 0 if disabled)
+                  [2E+2]        num_tokens         (float)
+
+                The caller reconstructs the metrics dict outside the checkpoint
+                boundary by calling router_metrics_from_tensor().
 
         Returns:
-            Tuple of:
-              - router_weights: (tokens, num_experts_per_token) selected weights
-              - expert_indices: (tokens, num_experts_per_token) selected expert IDs
-              - aux_loss: Scalar auxiliary loss (load balancing + z-loss)
-              - metrics: Dict with expert utilization statistics
+            When return_metric_tensors=False (default):
+              (router_weights, expert_indices, aux_loss, metrics_dict)
+            When return_metric_tensors=True:
+              (router_weights, expert_indices, aux_loss, metric_tensor)
         """
         num_tokens = x.shape[0]
 
@@ -299,19 +316,64 @@ class TopKRouter(nn.Module):
             z_loss = torch.mean(torch.log(torch.exp(router_logits).sum(dim=-1)) ** 2)
             aux_loss = aux_loss + self.z_loss_coeff * z_loss
 
-        # ── Metrics ───────────────────────────────────────────────────────────
+        # ── Return raw tensors for gradient-checkpoint transport ───────────────
+        if return_metric_tensors:
+            # Pack all quantities needed by compute_router_metrics into a single
+            # flat float32 tensor.  This tensor crosses the gradient_checkpoint
+            # boundary without a second router call.
+            #
+            # Layout: [tokens_per_expert (E,) | mean_prob_per_expert (E,) |
+            #          aux_loss_unscaled | z_loss_unscaled | num_tokens]
+            if self.z_loss_coeff > 0:
+                _z_raw_t = torch.mean(
+                    torch.log(torch.exp(router_logits).sum(dim=-1)) ** 2
+                ).detach().unsqueeze(0)
+            else:
+                _z_raw_t = torch.zeros(1, device=x.device, dtype=torch.float32)
+            _aux_raw_t = (
+                self.num_experts
+                * (fraction_per_expert * mean_prob_per_expert).sum()
+            ).detach().unsqueeze(0)
+            _num_tokens_t = torch.tensor(
+                [float(num_tokens)], device=x.device, dtype=torch.float32
+            )
+            metric_tensor = torch.cat([
+                tokens_per_expert.detach().float(),   # (E,)
+                mean_prob_per_expert.detach().float(), # (E,)
+                _aux_raw_t,                            # (1,)
+                _z_raw_t,                              # (1,)
+                _num_tokens_t,                         # (1,)
+            ])  # shape: (2E+3,)
+            return top_k_weights, top_k_indices, aux_loss, metric_tensor
+
+        # ── Metrics dict (non-GC path) ─────────────────────────────────────────
         with torch.no_grad():
-            expert_counts = tokens_per_expert.detach().cpu()
-            metrics = {
-                "expert_counts": expert_counts.tolist(),
-                "expert_fraction": fraction_per_expert.detach().cpu().tolist(),
-                "router_entropy": -(router_probs * (router_probs + 1e-9).log()).sum(-1).mean().item(),
-                "max_expert_fraction": fraction_per_expert.max().item(),
-                "min_expert_fraction": fraction_per_expert.min().item(),
-                "load_imbalance_ratio": (
-                    fraction_per_expert.max() / (fraction_per_expert.mean() + 1e-9)
-                ).item(),
-            }
+            from training.router_metrics import compute_router_metrics as _crm
+            _counts = tokens_per_expert.detach().cpu().tolist()
+            _mean_probs = mean_prob_per_expert.detach().cpu().tolist()
+            # Compute raw (unscaled) z-loss value for the metrics record
+            if self.z_loss_coeff > 0:
+                _z_raw = float(torch.mean(
+                    torch.log(torch.exp(router_logits).sum(dim=-1)) ** 2
+                ).item())
+            else:
+                _z_raw = 0.0
+            _aux_raw = float(
+                self.num_experts
+                * (fraction_per_expert * mean_prob_per_expert).sum().item()
+            )
+            metrics = _crm(
+                expert_assignment_counts=_counts,
+                num_tokens=num_tokens,
+                num_experts=self.num_experts,
+                top_k=self.num_experts_per_token,
+                router_probs_mean=_mean_probs,
+                aux_loss_unscaled=_aux_raw,
+                aux_loss_coeff=self.aux_loss_coeff,
+                z_loss_unscaled=_z_raw,
+                z_loss_coeff=self.z_loss_coeff,
+                capacity_factor=self.capacity_factor,
+            )
 
         return top_k_weights, top_k_indices, aux_loss, metrics
 
@@ -373,25 +435,32 @@ class MoEFFNLayer(nn.Module):
         self.num_experts_per_token = config.num_experts_per_token
 
     def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        self,
+        x: torch.Tensor,
+        return_metric_tensors: bool = False,
+    ) -> tuple:
         """
         Forward pass through MoE FFN.
 
         Args:
             x: Input tensor of shape (batch, seq_len, hidden_size).
+            return_metric_tensors: Passed through to TopKRouter.forward.  When
+                True, the third return value is a flat metric_tensor instead of
+                a metrics dict.  See TopKRouter.forward for the tensor layout.
 
         Returns:
             Tuple of:
               - output: (batch, seq_len, hidden_size)
               - aux_loss: Scalar auxiliary loss
-              - router_metrics: Dict with expert utilization statistics
+              - router_metrics_or_tensor: Dict or flat metric_tensor
         """
         B, T, H = x.shape
         x_flat = x.view(B * T, H)
 
         # Get routing decisions
-        router_weights, expert_indices, aux_loss, router_metrics = self.router(x_flat)
+        router_weights, expert_indices, aux_loss, router_metrics_or_tensor = (
+            self.router(x_flat, return_metric_tensors=return_metric_tensors)
+        )
         # router_weights: (B*T, top_k)
         # expert_indices: (B*T, top_k)
 
@@ -418,7 +487,7 @@ class MoEFFNLayer(nn.Module):
             output = output + self.shared_expert(x_flat)
 
         output = output.view(B, T, H)
-        return output, aux_loss, router_metrics
+        return output, aux_loss, router_metrics_or_tensor
 
 
 # ── MoE Transformer Block ─────────────────────────────────────────────────────
@@ -440,15 +509,22 @@ class MoETransformerBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        return_metric_tensors: bool = False,
+    ) -> tuple:
         """
         Returns:
-            Tuple of (output, aux_loss, router_metrics)
+            Tuple of (output, aux_loss, router_metrics_or_tensor)
+
+            When return_metric_tensors=True the third element is a flat
+            metric_tensor (all tensors, safe to pass through gradient_checkpoint).
+            When False (default) it is the metrics dict.
         """
         x = x + self.attn(self.attn_norm(x), cos, sin, attention_mask)
-        ffn_out, aux_loss, metrics = self.moe_ffn(self.ffn_norm(x))
+        ffn_out, aux_loss, metrics_or_tensor = self.moe_ffn(
+            self.ffn_norm(x), return_metric_tensors=return_metric_tensors
+        )
         x = x + ffn_out
-        return x, aux_loss, metrics
+        return x, aux_loss, metrics_or_tensor
 
 
 # ── Main MoE Model ────────────────────────────────────────────────────────────
@@ -542,16 +618,58 @@ class MoETransformer(nn.Module):
 
         for layer in self.layers:
             if self.config.base.gradient_checkpointing and self.training:
+                # ── Same-pass tensor transport across the gradient_checkpoint boundary ──
+                #
+                # gradient_checkpoint() requires all outputs to be tensors; Python
+                # dicts cannot cross the boundary.  The solution is to have the
+                # layer return a flat metric_tensor (all tensors) instead of a dict,
+                # then reconstruct the metrics dict OUTSIDE the boundary from those
+                # exact tensors.  This guarantees that the metrics originate from
+                # the same router call that produced the training loss — no second
+                # router pass, no jitter, no precision difference.
+                #
+                # Tensor layout (see TopKRouter.forward for full spec):
+                #   [0:E]   tokens_per_expert
+                #   [E:2E]  mean_prob_per_expert
+                #   [2E]    aux_loss_unscaled
+                #   [2E+1]  z_loss_unscaled
+                #   [2E+2]  num_tokens
                 def create_custom_forward(layer):
                     def custom_forward(*inputs):
-                        out, aux, metrics = layer(*inputs)
-                        return out, aux
+                        # return_metric_tensors=True: third output is a flat
+                        # tensor, safe to transport through gradient_checkpoint.
+                        out, aux, metric_t = layer(
+                            *inputs, return_metric_tensors=True
+                        )
+                        return out, aux, metric_t
                     return custom_forward
-                x, aux_loss = torch.utils.checkpoint.checkpoint(
+                x, aux_loss, metric_tensor = gradient_checkpoint(
                     create_custom_forward(layer), x, cos, sin, attention_mask,
                     use_reentrant=False
                 )
-                all_router_metrics.append({})
+                total_aux_loss = total_aux_loss + aux_loss
+                # Reconstruct the metrics dict from the same-pass tensors.
+                # No second router call is made here.
+                from training.router_metrics import compute_router_metrics as _crm
+                E = self.config.num_experts
+                _counts = metric_tensor[:E].detach().cpu().tolist()
+                _mean_probs = metric_tensor[E:2*E].detach().cpu().tolist()
+                _aux_raw = float(metric_tensor[2*E].item())
+                _z_raw = float(metric_tensor[2*E+1].item())
+                _num_tokens = int(metric_tensor[2*E+2].item())
+                _router_metrics = _crm(
+                    expert_assignment_counts=_counts,
+                    num_tokens=_num_tokens,
+                    num_experts=E,
+                    top_k=self.config.num_experts_per_token,
+                    router_probs_mean=_mean_probs,
+                    aux_loss_unscaled=_aux_raw,
+                    aux_loss_coeff=self.config.router_aux_loss_coeff,
+                    z_loss_unscaled=_z_raw,
+                    z_loss_coeff=self.config.router_z_loss_coeff,
+                    capacity_factor=self.config.expert_capacity_factor,
+                )
+                all_router_metrics.append(_router_metrics)
             else:
                 x, aux_loss, router_metrics = layer(x, cos, sin, attention_mask)
                 total_aux_loss = total_aux_loss + aux_loss

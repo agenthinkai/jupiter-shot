@@ -1,0 +1,167 @@
+# Jupiter Shot — Laptop MoE 8-Expert 8GB-Safe Config
+# ====================================================
+# Target hardware: RTX 5060 Laptop GPU (8,151 MiB physical VRAM, Blackwell sm_120)
+#
+# Run 3 result: laptop_moe_small (hidden=512, seq=512, batch=2) caused 9.28 GB
+#               peak PyTorch allocation → Windows shared-memory spill → throughput
+#               collapse from ~467 tok/s to ~177 tok/s.
+#
+# This config retains the full 8-expert / top-2 routing requirement and reduces
+# only hidden_size (512→384), seq_length (512→256), and num_hidden_layers (8→6)
+# to bring estimated peak VRAM to ~1.3 GB — well within the 6.5 GB target.
+#
+# Reduction order applied (per spec):
+#   1. Sequence length:        512 → 256
+#   2. Hidden dimension:       512 → 384
+#   3. Expert hidden dim:      1408 → 768  (= 2× hidden_size, standard ratio)
+#   4. Attention heads:        8 → 6       (head_dim = 384/6 = 64, unchanged)
+#   5. Total layers:           8 → 6       (3 MoE + 3 dense)
+#   Micro-batch size:          2 (unchanged — already at minimum)
+#
+# PRESERVED (must not change):
+#   - 8 experts (num_experts = 8)
+#   - Top-2 routing (num_experts_per_token = 2)
+#   - Full router-metrics schema (training/router_metrics.py)
+#   - All acceptance checks (evaluate_acceptance())
+#   - Gradient checkpointing
+#
+# ── Tokenizer contract ───────────────────────────────────────────────────────
+#   tokenizer_id:    EleutherAI/gpt-neox-20b  (Apache 2.0)
+#   vocab_size:      50,277  (was 32,000 — corrected in Run 6)
+#   Runtime guard:   model_config.vocab_size >= len(tokenizer)
+#                    input_ids.max() < model_config.vocab_size
+#   Halt code:       TOKENIZER_VOCABULARY_MISMATCH
+#
+# ── Parameter counts (vocab=50277, hidden=384, layers=6, intermediate=768) ───
+#
+#   Component                   Parameters
+#   ─────────────────────────── ──────────
+#   Token embedding             50277 × 384 = 19.31 M
+#   Positional embedding          256 × 384 =  0.10 M
+#   Attention (6 layers)        6 × 4 × 384² = 3.54 M
+#   Dense FFN (3 layers)        3 × 3 × 384 × 768 = 2.65 M
+#   MoE FFN (3 layers):
+#     8 experts × (3 × 384 × 768) = 7.08 M per layer × 3 = 21.23 M
+#     Router (384 × 8) = 3.1 K per layer × 3 = 9.2 K
+#   LM head (tied to embedding) 0
+#   ─────────────────────────── ──────────
+#   Total parameters:           46,849,920  (~46.85 M)
+#   Active parameters/token:    30,924,672  (~30.92 M)
+#   Parameters per expert:      ~1.77 M     (3 × 384 × 768)
+#   Sparsity:                   ~34%        (1 - active/total)
+#
+# ── VRAM estimate (BF16, vocab=50277, RTX 5060 8 GB, grad-ckpt ON) ───────────
+#
+#   Component                   Estimate    Assumptions
+#   ─────────────────────────── ─────────── ─────────────────────────────────
+#   Weights (BF16)              0.094 GB    46.85M × 2 bytes
+#   Gradients (BF16)            0.094 GB    46.85M × 2 bytes
+#   Optimizer (AdamW, FP32)     0.375 GB    46.85M × 2 states × 4 bytes
+#   Activations (grad-ckpt)     0.007 GB    batch=2, seq=256, hidden=384
+#   ─────────────────────────── ─────────── ─────────────────────────────────
+#   ESTIMATED PEAK              ~0.57 GB    NOT verified on hardware
+#   Target (< 80% of 8,151 MiB) 6.50 GB    Margin: ~5.93 GB
+#
+#   NOTE: This estimate is NOT verified. It will be updated with the measured
+#   peak_vram_allocated_gb from Kishore's RTX 5060 run. Do not label it
+#   "verified" until that measurement is available.
+#
+#   Conservative safety margin: even if the estimate is 4× too low (e.g. due
+#   to attention score buffers, NCCL, or driver overhead not captured above),
+#   the peak would be ~5.2 GB — still within the 6.5 GB target.
+#
+# ── Routing explanation ───────────────────────────────────────────────────────
+#
+#   8 experts, top-2 routing:
+#     Total assignments per batch = num_tokens × top_k
+#                                 = (batch × seq) × top_k
+#                                 = (2 × 256) × 2 = 1024
+#     Balanced assignment fraction per expert = top_k / num_experts = 2/8 = 0.250
+#       → Each expert should receive ~25.0% of all expert assignments
+#     Balanced token routing fraction per expert = 1 / num_experts = 1/8 = 0.125
+#       → Each expert should be visited by ~12.5% of all tokens
+#
+#   These values are derived dynamically from num_experts and top_k in
+#   training/router_metrics.py — they are NOT hardcoded.
+#
+# ── Acceptance thresholds (from training/router_metrics.py) ──────────────────
+#
+#   utilization_cv              < 0.5
+#   router_entropy              > 1.0 nats  (max for 8 experts = ln(8) ≈ 2.08 nats)
+#   number_of_inactive_experts  = 0         (no expert below 1% of assignments)
+#   dropped_token_fraction      < 0.01      (< 1%)
+
+model:
+  base:
+    vocab_size: 50277
+    hidden_size: 384
+    num_hidden_layers: 6
+    num_attention_heads: 6
+    intermediate_size: 768
+    max_position_embeddings: 256
+    rms_norm_eps: 1.0e-5
+    rope_theta: 10000.0
+    tie_word_embeddings: true
+  # MoE parameters — MUST NOT reduce num_experts or num_experts_per_token
+  num_experts: 8
+  num_experts_per_token: 2
+  moe_layer_freq: 2          # Every 2nd layer is MoE (3 MoE layers out of 6)
+  capacity_factor: 1.25
+  aux_loss_coeff: 0.01
+  z_loss_coeff: 0.001
+  router_jitter: 0.01
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  seq_length: 256
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 50
+  precision: bf16          # BF16 preferred on RTX 50-series (Blackwell sm_120)
+  gradient_checkpointing: true
+
+metadata:
+  tier: "8GB-safe"
+  config_name: "laptop_moe_8expert_8gb_safe"
+  num_experts: 8
+  num_experts_per_token: 2
+  # Tokenizer contract
+  tokenizer_id: "EleutherAI/gpt-neox-20b"   # Apache 2.0, vocab=50277
+  tokenizer_vocab_size: 50277
+  # vocab_size MUST be >= tokenizer_vocab_size at runtime (enforced by runner)
+  # Parameter counts (vocab=50277, hidden=384, layers=6, intermediate=768)
+  total_params: 46849920
+  total_params_approx_m: 46.85
+  active_params_per_token: 30924672
+  active_params_approx_m: 30.92
+  params_per_expert_approx_m: 1.77
+  sparsity_pct: 34
+  # VRAM estimates (vocab=50277) — NOT verified on hardware
+  weight_memory_gb: 0.094
+  estimated_peak_vram_gb: 0.57
+  peak_vram_estimate_gb: 0.57
+  vram_target_gb: 6.50
+  vram_estimate_verified: false
+  # Dataset license note
+  dataset_id: "Salesforce/wikitext"
+  dataset_config: "wikitext-2-raw-v1"
+  dataset_split: "train"
+  dataset_license_note: >-
+    Hugging Face metadata lists CC BY-SA 3.0 and GFDL. Dataset card text states
+    CC BY-SA 4.0. Use for technical validation only pending governance review.
+  blackwell_compatible: true
+  min_pytorch_version: "2.7.1+cu128"
+  run3_issue: >
+    laptop_moe_small caused 9.28 GB peak PyTorch allocation on RTX 5060 (7.96 GB
+    physical VRAM), triggering Windows shared-memory spill and throughput collapse
+    from ~467 to ~177 tok/s. This config reduces estimated peak to ~1.30 GB.
+  notes: >
+    8-expert / top-2 MoE validation config for RTX 5060 8 GB (Blackwell sm_120).
+    Retains the full 8-expert architecture required by the validation spec.
+    Reduces hidden_size (512→384), seq_length (512→256), and num_hidden_layers (8→6)
+    to fit within the 6.5 GB VRAM target. Architecture principles (8 experts,
+    top-2 routing, shared router-metrics schema) are identical to the production
+    MoE design. The laptop test validates architecture correctness and routing
+    stability, not maximum parameter count.

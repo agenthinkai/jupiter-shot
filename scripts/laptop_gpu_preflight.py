@@ -4,6 +4,12 @@ Jupiter Shot — Laptop GPU Preflight Check
 Detects hardware, CUDA availability, precision support, and recommends
 the appropriate training configuration for the available VRAM.
 
+IMPORTANT: This preflight executes a real CUDA kernel to verify that the
+installed PyTorch wheel actually supports the GPU architecture. Checking
+torch.cuda.is_available() alone is insufficient — it only confirms driver
+registration, not kernel execution. RTX 50-series (Blackwell, sm_120) GPUs
+require PyTorch 2.7.1+cu128 or newer.
+
 Usage:
     python scripts/laptop_gpu_preflight.py
     python scripts/laptop_gpu_preflight.py --output-dir benchmarks/results/laptop
@@ -13,8 +19,8 @@ Outputs:
     benchmarks/results/laptop/preflight.txt
 
 Exit codes:
-    0 — CUDA available, preflight passed
-    1 — CUDA unavailable (CPU-only environment)
+    0 — CUDA available, real kernel verified, preflight passed
+    1 — CUDA unavailable or kernel launch failed (environment blocked)
     2 — CUDA available but insufficient VRAM for any config
 """
 
@@ -50,6 +56,112 @@ def _safe_import_torch() -> Optional[Any]:
         return None
 
 
+# ── Real CUDA kernel verification ─────────────────────────────────────────────
+
+def run_kernel_test(torch: Any) -> dict:
+    """
+    Execute a real CUDA kernel to verify the PyTorch wheel supports this GPU.
+
+    torch.cuda.is_available() only checks driver registration. On RTX 50-series
+    (Blackwell, sm_120), PyTorch < 2.7.1+cu128 will report CUDA available but
+    fail on the first actual kernel launch.
+
+    Returns a dict with:
+        kernel_pass: bool
+        kernel_error: str or None
+        bf16_pass: bool
+        fp16_pass: bool
+        arch_list: list[str]
+        torch_version: str
+        cuda_version: str
+        gpu_name: str
+        compute_capability: str
+    """
+    result: dict[str, Any] = {
+        "kernel_pass": False,
+        "kernel_error": None,
+        "bf16_pass": False,
+        "fp16_pass": False,
+        "arch_list": [],
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda or "unknown",
+        "gpu_name": "unknown",
+        "compute_capability": "unknown",
+    }
+
+    if not torch.cuda.is_available():
+        result["kernel_error"] = "torch.cuda.is_available() returned False"
+        return result
+
+    try:
+        result["gpu_name"] = torch.cuda.get_device_name(0)
+        cc = torch.cuda.get_device_capability(0)
+        result["compute_capability"] = f"{cc[0]}.{cc[1]}"
+        result["arch_list"] = torch.cuda.get_arch_list()
+    except Exception as e:
+        result["kernel_error"] = f"Failed to query GPU properties: {e}"
+        return result
+
+    # Check if sm_120 (Blackwell) is in arch list when needed
+    cc_major = cc[0]
+    if cc_major >= 12:
+        sm_key = f"sm_{cc_major}{cc[1]}"
+        if sm_key not in result["arch_list"] and f"compute_{cc_major}{cc[1]}" not in result["arch_list"]:
+            result["kernel_error"] = (
+                f"GPU requires {sm_key} but it is not in torch.cuda.get_arch_list(). "
+                f"Install PyTorch 2.7.1+cu128: "
+                f"pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128"
+            )
+            return result
+
+    # Execute a real CUDA kernel: allocate, matmul, synchronize, verify
+    try:
+        a = torch.ones(64, 64, device="cuda", dtype=torch.float32)
+        b = torch.ones(64, 64, device="cuda", dtype=torch.float32)
+        c = torch.matmul(a, b)
+        torch.cuda.synchronize()
+        expected = 64.0
+        actual = c[0, 0].item()
+        if abs(actual - expected) > 1e-3:
+            result["kernel_error"] = (
+                f"Kernel result mismatch: expected {expected}, got {actual}"
+            )
+            return result
+        result["kernel_pass"] = True
+    except Exception as e:
+        result["kernel_error"] = (
+            f"CUDA kernel launch failed: {e}. "
+            f"This usually means the PyTorch wheel does not support this GPU architecture. "
+            f"Compute capability: {result['compute_capability']}. "
+            f"Arch list: {result['arch_list']}."
+        )
+        return result
+
+    # BF16 test
+    try:
+        a_bf16 = torch.ones(32, 32, device="cuda", dtype=torch.bfloat16)
+        b_bf16 = torch.ones(32, 32, device="cuda", dtype=torch.bfloat16)
+        c_bf16 = torch.matmul(a_bf16, b_bf16)
+        torch.cuda.synchronize()
+        result["bf16_pass"] = True
+    except Exception as e:
+        result["bf16_pass"] = False
+        result["bf16_error"] = str(e)
+
+    # FP16 test
+    try:
+        a_fp16 = torch.ones(32, 32, device="cuda", dtype=torch.float16)
+        b_fp16 = torch.ones(32, 32, device="cuda", dtype=torch.float16)
+        c_fp16 = torch.matmul(a_fp16, b_fp16)
+        torch.cuda.synchronize()
+        result["fp16_pass"] = True
+    except Exception as e:
+        result["fp16_pass"] = False
+        result["fp16_error"] = str(e)
+
+    return result
+
+
 # ── System info ───────────────────────────────────────────────────────────────
 
 def collect_system_info() -> dict:
@@ -57,7 +169,8 @@ def collect_system_info() -> dict:
     info["date"] = datetime.datetime.now().isoformat()
     info["os"] = platform.platform()
     info["python_version"] = sys.version
-    info["cpu"] = platform.processor() or _run(["cat", "/proc/cpuinfo"]).split("\n")[4] if os.path.exists("/proc/cpuinfo") else "unknown"
+    info["python_version_tuple"] = list(sys.version_info[:3])
+    info["cpu"] = platform.processor() or "unknown"
     # RAM
     try:
         import psutil
@@ -86,6 +199,7 @@ def collect_gpu_info(torch: Any) -> dict:
     info["gpu_count"] = torch.cuda.device_count()
     info["gpu_model"] = torch.cuda.get_device_name(0)
     info["compute_capability"] = ".".join(str(x) for x in torch.cuda.get_device_capability(0))
+    info["arch_list"] = torch.cuda.get_arch_list()
 
     props = torch.cuda.get_device_properties(0)
     info["vram_total_gb"] = round(props.total_memory / 1024**3, 2)
@@ -94,7 +208,7 @@ def collect_gpu_info(torch: Any) -> dict:
     # Precision support
     cc_major, cc_minor = torch.cuda.get_device_capability(0)
     info["fp16_supported"] = cc_major >= 5
-    info["bf16_supported"] = cc_major >= 8  # Ampere+
+    info["bf16_supported"] = cc_major >= 8  # Ampere+; Blackwell also supports BF16
 
     # Driver version
     driver = _run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
@@ -102,25 +216,24 @@ def collect_gpu_info(torch: Any) -> dict:
 
     # NCCL version
     try:
-        import torch.distributed as dist
         info["nccl_version"] = torch.cuda.nccl.version() if hasattr(torch.cuda, "nccl") else "unknown"
     except Exception:
         info["nccl_version"] = "unknown"
 
-    # DeepSpeed version
+    # DeepSpeed version (optional on laptop)
     try:
         import deepspeed
         info["deepspeed_version"] = deepspeed.__version__
     except ImportError:
-        info["deepspeed_version"] = "not installed"
+        info["deepspeed_version"] = "not installed (not required for laptop validation)"
 
-    # Flash Attention
+    # Flash Attention (optional on laptop)
     try:
         import flash_attn
         info["flash_attention_version"] = flash_attn.__version__
         info["flash_attention_available"] = True
     except ImportError:
-        info["flash_attention_version"] = "not installed"
+        info["flash_attention_version"] = "not installed (not required for laptop validation)"
         info["flash_attention_available"] = False
 
     # Temperature (best-effort)
@@ -162,7 +275,8 @@ VRAM_TIERS = [
         "moe_config": "laptop_moe_small",
         "dense_params_m": "50–150M",
         "moe_total_params_m": "100–300M total",
-        "rationale": "Tight but workable with gradient checkpointing and small batch sizes.",
+        "rationale": "Tight but workable with gradient checkpointing and small batch sizes. "
+                     "SMALL config enforced. 20% VRAM headroom preserved.",
     },
     {
         "min_vram_gb": 3.5,
@@ -180,6 +294,7 @@ def select_config(vram_gb: float) -> dict:
     """Select the appropriate training config tier based on available VRAM."""
     # Apply conservative headroom: reserve 1.5 GB for Windows GPU usage,
     # CUDA buffers, activations, temporary tensors, and framework overhead.
+    # For 8 GB VRAM (RTX 5060), effective VRAM = 6.5 GB → SMALL tier.
     effective_vram = vram_gb - 1.5
     for tier in VRAM_TIERS:
         if effective_vram >= tier["min_vram_gb"]:
@@ -201,9 +316,7 @@ def estimate_memory(params_m: float, precision: str = "fp16") -> dict:
     """
     bytes_per_param = 2 if precision in ("fp16", "bf16") else 4
     weights_gb = params_m * 1e6 * bytes_per_param / 1024**3
-    # AdamW: fp32 master copy + m + v = 3× fp32 = 12 bytes/param
-    optimizer_gb = params_m * 1e6 * 12 / 1024**3
-    # Gradients: same dtype as weights
+    optimizer_gb = params_m * 1e6 * 12 / 1024**3  # AdamW fp32: 12 bytes/param
     grad_gb = weights_gb
     total_training_gb = weights_gb + optimizer_gb + grad_gb
     return {
@@ -231,11 +344,21 @@ def select_precision(gpu_info: dict) -> str:
 
 # ── Report generation ─────────────────────────────────────────────────────────
 
-def build_report(system_info: dict, gpu_info: dict, config_rec: dict, precision: str) -> dict:
+def build_report(
+    system_info: dict,
+    gpu_info: dict,
+    config_rec: dict,
+    precision: str,
+    kernel_test: Optional[dict] = None,
+) -> dict:
+    kernel_pass = kernel_test.get("kernel_pass", False) if kernel_test else None
     report = {
-        "preflight_status": "PASS" if gpu_info.get("cuda_available") else "FAIL",
+        "preflight_status": (
+            "PASS" if (gpu_info.get("cuda_available") and kernel_pass) else "FAIL"
+        ),
         "system": system_info,
         "gpu": gpu_info,
+        "kernel_test": kernel_test or {},
         "recommended_precision": precision,
         "recommended_dense_config": config_rec.get("dense_config"),
         "recommended_moe_config": config_rec.get("moe_config"),
@@ -249,10 +372,13 @@ def build_report(system_info: dict, gpu_info: dict, config_rec: dict, precision:
     }
     if not gpu_info.get("cuda_available"):
         report["failure_reason"] = gpu_info.get("cuda_unavailable_reason", "CUDA not available")
+    elif kernel_test and not kernel_pass:
+        report["failure_reason"] = kernel_test.get("kernel_error", "Kernel test failed")
     return report
 
 
 def format_text_report(report: dict) -> str:
+    kt = report.get("kernel_test", {})
     lines = [
         "=" * 60,
         "  JUPITER SHOT — LAPTOP GPU PREFLIGHT REPORT",
@@ -279,6 +405,7 @@ def format_text_report(report: dict) -> str:
             f"  Driver:             {g.get('driver_version', '?')}",
             f"  CUDA runtime:       {g.get('cuda_version', '?')}",
             f"  PyTorch:            {g.get('pytorch_version', '?')}",
+            f"  Arch list:          {g.get('arch_list', [])}",
             f"  DeepSpeed:          {g.get('deepspeed_version', '?')}",
             f"  Flash Attention:    {g.get('flash_attention_version', '?')}",
             f"  NCCL:               {g.get('nccl_version', '?')}",
@@ -289,6 +416,17 @@ def format_text_report(report: dict) -> str:
         ]
     else:
         lines.append(f"  CUDA UNAVAILABLE: {g.get('cuda_unavailable_reason', 'unknown')}")
+
+    if kt:
+        lines += [
+            "",
+            "KERNEL TEST",
+            f"  Kernel launch:      {'PASS' if kt.get('kernel_pass') else 'FAIL'}",
+            f"  BF16 test:          {'PASS' if kt.get('bf16_pass') else 'FAIL'}",
+            f"  FP16 test:          {'PASS' if kt.get('fp16_pass') else 'FAIL'}",
+        ]
+        if kt.get("kernel_error"):
+            lines.append(f"  Error:              {kt['kernel_error']}")
 
     lines += [
         "",
@@ -304,6 +442,18 @@ def format_text_report(report: dict) -> str:
         "",
         "=" * 60,
     ]
+    if report.get("failure_reason"):
+        lines += [
+            "",
+            "FAILURE REASON",
+            f"  {report['failure_reason']}",
+            "",
+            "REPAIR",
+            "  If this is an RTX 50-series (Blackwell) GPU, install:",
+            "    pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128",
+            "  Then re-run this preflight.",
+            "",
+        ]
     return "\n".join(lines)
 
 
@@ -327,13 +477,20 @@ def main(output_dir: str = "benchmarks/results/laptop") -> int:
         precision = "fp32"
         config_rec = {"tier": "NO_TORCH", "dense_config": None, "moe_config": None,
                       "rationale": "Install PyTorch before running validation."}
+        kernel_test = None
     else:
         gpu_info = collect_gpu_info(torch)
         precision = select_precision(gpu_info)
         vram = gpu_info.get("vram_total_gb", 0) if gpu_info.get("cuda_available") else 0
         config_rec = select_config(float(vram))
+        # Run real kernel test
+        if gpu_info.get("cuda_available"):
+            print("\n[INFO] Running real CUDA kernel test...")
+            kernel_test = run_kernel_test(torch)
+        else:
+            kernel_test = None
 
-    report = build_report(system_info, gpu_info, config_rec, precision)
+    report = build_report(system_info, gpu_info, config_rec, precision, kernel_test)
     text = format_text_report(report)
 
     # Save outputs
@@ -350,11 +507,17 @@ def main(output_dir: str = "benchmarks/results/laptop") -> int:
         print("\n[FAIL] CUDA is not available. Cannot proceed with GPU validation.")
         return 1
 
+    if kernel_test and not kernel_test.get("kernel_pass"):
+        print(f"\n[FAIL] CUDA kernel test failed: {kernel_test.get('kernel_error')}")
+        print("\n       The environment is BLOCKED. Do not proceed with training.")
+        print("       See docs/BLACKWELL_ENVIRONMENT.md for repair instructions.")
+        return 1
+
     if config_rec.get("tier") == "INSUFFICIENT":
         print("\n[FAIL] Insufficient VRAM for any training configuration.")
         return 2
 
-    print("\n[PASS] Preflight complete. Proceed with validation.")
+    print("\n[PASS] Preflight complete. Real CUDA kernel verified. Proceed with validation.")
     return 0
 
 
@@ -363,12 +526,11 @@ def run_preflight(output_dir: "Path | str" = "benchmarks/results/laptop") -> dic
     Programmatic entry point for tests and other scripts.
     Returns the full preflight report dict.
     """
-    import torch as _torch_check
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     system_info = collect_system_info()
     torch = _safe_import_torch()
-    if torch is None or not _torch_check.cuda.is_available():
+    if torch is None or not torch.cuda.is_available():
         gpu_info = {
             "cuda_available": False,
             "cuda_unavailable_reason": "CUDA not available",
@@ -376,13 +538,19 @@ def run_preflight(output_dir: "Path | str" = "benchmarks/results/laptop") -> dic
         precision = "fp32"
         config_rec = {"tier": "NO_TORCH", "dense_config": None, "moe_config": None,
                       "rationale": "CUDA not available."}
+        kernel_test = None
     else:
         gpu_info = collect_gpu_info(torch)
         precision = select_precision(gpu_info)
         vram = gpu_info.get("vram_total_gb", 0) if gpu_info.get("cuda_available") else 0
         config_rec = select_config(float(vram))
-    report = build_report(system_info, gpu_info, config_rec, precision)
-    report["pass"] = bool(gpu_info.get("cuda_available"))
+        kernel_test = run_kernel_test(torch)
+
+    report = build_report(system_info, gpu_info, config_rec, precision, kernel_test)
+    report["pass"] = (
+        bool(gpu_info.get("cuda_available"))
+        and (kernel_test.get("kernel_pass", False) if kernel_test else False)
+    )
     text = format_text_report(report)
     json_path = out / "preflight.json"
     txt_path = out / "preflight.txt"

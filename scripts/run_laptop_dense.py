@@ -4,6 +4,11 @@ Jupiter Shot — Laptop Dense CUDA Validation
 Runs real CUDA forward and backward passes using the repository's actual
 DenseTransformer implementation. Collects all required metrics.
 
+Model API contract:
+  model(input_ids=..., labels=...) → dict with keys:
+    - 'logits': (batch, seq_len, vocab_size)
+    - 'loss': total loss (LM loss) if labels provided, else None
+
 Execution stages:
   1. 10 diagnostic steps (stop on NaN/Inf)
   2. 100 steps if diagnostics pass
@@ -15,6 +20,7 @@ Safety controls:
   - Stop on repeated CUDA OOM
   - Graceful checkpoint on CTRL+C or SIGTERM
   - Frequent metric persistence
+  - Failure artifact saved on exception
 
 Usage:
     python scripts/run_laptop_dense.py --config laptop_dense_small
@@ -31,6 +37,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,6 +54,29 @@ THERMAL_WARN_C = 80
 THERMAL_STOP_C = 90
 MAX_OOM_RETRIES = 3
 METRIC_FLUSH_INTERVAL = 10  # steps
+
+# ── Semantic artifact contract ────────────────────────────────────────────────
+# All runners must write these fields so the pipeline can validate artifacts
+# without relying on raw subprocess exit codes.
+ARTIFACT_SCHEMA_VERSION = "1.0"
+EXIT_PASS             = 0
+EXIT_NOT_ACCEPTED     = 1
+EXIT_NOT_EVALUABLE    = 2
+EXIT_EXECUTION_ERROR  = 3
+EXIT_SAFETY_STOP      = 4
+OUTCOME_PASS             = "PASS"
+OUTCOME_NOT_ACCEPTED     = "NOT_ACCEPTED"
+OUTCOME_NOT_EVALUABLE    = "NOT_EVALUABLE"
+OUTCOME_EXECUTION_ERROR  = "EXECUTION_ERROR"
+OUTCOME_SAFETY_STOP      = "SAFETY_STOP"
+# Mapping from outcome string to exit code (used when writing the artifact)
+_OUTCOME_TO_EXIT = {
+    OUTCOME_PASS:            EXIT_PASS,
+    OUTCOME_NOT_ACCEPTED:    EXIT_NOT_ACCEPTED,
+    OUTCOME_NOT_EVALUABLE:   EXIT_NOT_EVALUABLE,
+    OUTCOME_EXECUTION_ERROR: EXIT_EXECUTION_ERROR,
+    OUTCOME_SAFETY_STOP:     EXIT_SAFETY_STOP,
+}
 
 
 def _gpu_temp() -> Optional[int]:
@@ -149,11 +179,13 @@ def run_dense_validation(
     if not torch.cuda.is_available():
         raise RuntimeError("[FAIL] CUDA is not available. Cannot run GPU validation.")
 
-    # Load config
-    config_path = REPO_ROOT / "training" / "configs" / f"{config_name}.yaml"
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
-    with open(config_path) as f:
+    # Load config — use shared resolver to support full paths, relative paths, and bare names
+    from training.config_path import resolve_config_path, format_missing_error, safe_checkpoint_name
+    _res = resolve_config_path(config_name, repo_root=REPO_ROOT)
+    config_path = _res.resolved_path
+    if not _res.exists:
+        raise FileNotFoundError(format_missing_error(_res))
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     model_cfg = cfg.get("model", {})
@@ -184,7 +216,6 @@ def run_dense_validation(
 
     # Activation checkpointing
     if train_cfg.get("gradient_checkpointing", False):
-        from torch.utils.checkpoint import checkpoint
         print("[DENSE] Gradient checkpointing: enabled")
 
     # Optimizer
@@ -210,6 +241,23 @@ def run_dense_validation(
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
             tokenizer.pad_token = tokenizer.eos_token
+            # ── Vocabulary contract check ─────────────────────────────────
+            # model_config.vocab_size MUST be >= len(tokenizer)
+            # Halt immediately if not — do NOT remap with modulo arithmetic.
+            actual_tokenizer_size = len(tokenizer)
+            if vocab_size < actual_tokenizer_size:
+                raise RuntimeError(
+                    f"TOKENIZER_VOCABULARY_MISMATCH: "
+                    f"model vocab_size={vocab_size} < "
+                    f"tokenizer vocab_size={actual_tokenizer_size} "
+                    f"(EleutherAI/gpt-neox-20b). "
+                    f"Update the config to vocab_size={actual_tokenizer_size} "
+                    f"before running real-text validation."
+                )
+            print(
+                f"[VOCAB] Contract OK: model vocab_size={vocab_size} "
+                f">= tokenizer vocab_size={actual_tokenizer_size}"
+            )
         except Exception:
             print("[DATA] Tokenizer unavailable; falling back to synthetic.")
             texts = []
@@ -222,12 +270,14 @@ def run_dense_validation(
 
     metrics_path = output_dir / "dense_metrics.jsonl"
     errors_path = output_dir / "errors.jsonl"
+    failure_path = output_dir / "dense_failure_artifact.json"
 
     # State
     metrics_log: list[dict] = []
     nan_inf_count = 0
     oom_count = 0
     interrupted = False
+    step = 0
 
     # CTRL+C / SIGTERM handler
     def _graceful_stop(signum, frame):
@@ -238,8 +288,8 @@ def run_dense_validation(
     signal.signal(signal.SIGINT, _graceful_stop)
     signal.signal(signal.SIGTERM, _graceful_stop)
 
-    # AMP scaler
-    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+    # AMP scaler — use torch.amp.GradScaler (torch.cuda.amp.GradScaler is deprecated in PyTorch 2.x)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
     torch.cuda.reset_peak_memory_stats()
     start_wall = time.time()
@@ -278,6 +328,16 @@ def run_dense_validation(
                     import random
                     sample = random.sample(texts, min(batch_size, len(texts)))
                     input_ids = get_real_text_batch(tokenizer, sample, seq_len, device)
+                    # Per-batch token ID range guard
+                    id_min = int(input_ids.min().item())
+                    id_max = int(input_ids.max().item())
+                    if id_min < 0 or id_max >= vocab_size:
+                        raise RuntimeError(
+                            f"TOKENIZER_VOCABULARY_MISMATCH: "
+                            f"batch token IDs [{id_min}, {id_max}] out of range "
+                            f"[0, {vocab_size - 1}] at step {step}. "
+                            f"Model vocab_size={vocab_size} is too small for this tokenizer."
+                        )
                 else:
                     input_ids = get_synthetic_batch(batch_size, seq_len, vocab_size, device)
             except torch.cuda.OutOfMemoryError:
@@ -289,18 +349,14 @@ def run_dense_validation(
                 continue
 
             # Forward + backward
+            # Model API: model(input_ids=..., labels=...) → dict
+            #   out["loss"]   = cross-entropy loss (scalar tensor)
+            #   out["logits"] = (batch, seq_len, vocab_size)
             try:
                 with torch.autocast(device_type="cuda", dtype=dtype):
                     labels = input_ids.clone()
-                    logits = model(input_ids)
-                    # Shift for causal LM loss
-                    shift_logits = logits[:, :-1, :].contiguous()
-                    shift_labels = labels[:, 1:].contiguous()
-                    loss = torch.nn.functional.cross_entropy(
-                        shift_logits.view(-1, vocab_size),
-                        shift_labels.view(-1),
-                    )
-                    loss = loss / grad_accum
+                    out = model(input_ids=input_ids, labels=labels)
+                    loss = out["loss"] / grad_accum
 
                 if use_fp16:
                     scaler.scale(loss).backward()
@@ -356,7 +412,7 @@ def run_dense_validation(
             metrics_log.append(metric)
 
             if step % METRIC_FLUSH_INTERVAL == 0 or step == 1:
-                with open(metrics_path, "a") as f:
+                with open(metrics_path, "a", encoding="utf-8") as f:
                     for m in metrics_log[-METRIC_FLUSH_INTERVAL:]:
                         f.write(json.dumps(m) + "\n")
 
@@ -374,30 +430,44 @@ def run_dense_validation(
                 print("[DIAGNOSTIC] Stable. Continuing.\n")
 
     except (ValueError, RuntimeError) as e:
+        tb = traceback.format_exc()
         print(f"\n[ERROR] {e}")
-        with open(errors_path, "a") as f:
+        # Save failure artifact with full traceback and partial metrics
+        artifact = {
+            "step": step,
+            "error": str(e),
+            "traceback": tb,
+            "time": time.time(),
+            "partial_metrics": metrics_log[-5:] if metrics_log else [],
+        }
+        with open(errors_path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"step": step, "error": str(e), "time": time.time()}) + "\n")
+        failure_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
+        print(f"[FAILURE ARTIFACT] Saved: {failure_path}")
         summary["status"] = "FAILED"
         summary["failure_reason"] = str(e)
+        summary["failure_traceback"] = tb
     else:
         summary["status"] = "INTERRUPTED" if interrupted else "COMPLETED"
 
-    # Save checkpoint
-    ckpt_path = ckpt_dir / f"dense_{config_name}_step{step}.pt"
+    # Save checkpoint — use safe_checkpoint_name to avoid doubled suffixes
+    _ckpt_stem = safe_checkpoint_name(config_name)
+    ckpt_path = ckpt_dir / f"dense_{_ckpt_stem}_step{step}.pt"
     try:
-        import torch
         torch.save({
             "step": step,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "loss": loss_val if "loss_val" in dir() else None,
+            "loss": loss_val if step > 0 else None,
             "config": config_name,
         }, ckpt_path)
         print(f"\n[CHECKPOINT] Saved: {ckpt_path}")
         summary["checkpoint_path"] = str(ckpt_path)
         summary["checkpoint_size_mb"] = round(ckpt_path.stat().st_size / 1024**2, 1)
+        summary["checkpoint_status"] = "saved"
     except Exception as e:
         print(f"[CHECKPOINT] Failed to save: {e}")
+        summary["checkpoint_status"] = f"failed: {e}"
 
     # Final summary
     wall_time = time.time() - start_wall
@@ -421,8 +491,25 @@ def run_dense_validation(
         ),
     })
 
+    # ── Semantic artifact contract fields ──────────────────────────────────────────────
+    # These fields are required by the pipeline's _validate_runner_artifact().
+    # outcome and exit_code are derived from status; run_id and timestamp are
+    # injected by main() after this function returns.
+    if summary["status"] == "COMPLETED":
+        _outcome = OUTCOME_PASS
+    elif summary["status"] == "INTERRUPTED":
+        # Interrupted by SIGTERM/CTRL+C — treated as NOT_EVALUABLE (ran but no
+        # final acceptance verdict); pipeline will read the artifact and classify.
+        _outcome = OUTCOME_NOT_EVALUABLE
+    else:
+        _outcome = OUTCOME_EXECUTION_ERROR
+    summary["outcome"]        = _outcome
+    summary["exit_code"]      = _OUTCOME_TO_EXIT[_outcome]
+    summary["schema_version"] = ARTIFACT_SCHEMA_VERSION
+    # timestamp is written by main() after run_id is known
+
     summary_path = output_dir / "dense_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, default=str))
+    summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     print(f"\n[SUMMARY] Saved: {summary_path}")
     print(f"[SUMMARY] Status: {summary['status']}")
     print(f"[SUMMARY] Steps: {summary['steps_completed']}/{max_steps}")
@@ -442,35 +529,96 @@ def main() -> int:
                         help="Number of training steps (10=diagnostic, 100=standard, 1000=full)")
     parser.add_argument("--confirmed", action="store_true",
                         help="Required to run >100 steps without interactive confirmation")
+    parser.add_argument(
+        "--data-mode",
+        choices=["real", "synthetic", "auto"],
+        default="auto",
+        help=(
+            "real: Wikitext-2 only (halts if unavailable). "
+            "synthetic: random tokens (diagnostic only, cannot produce PASS). "
+            "auto: tries real, falls back to synthetic."
+        ),
+    )
+    # Legacy flag kept for backward compatibility
     parser.add_argument("--synthetic", action="store_true",
-                        help="Use synthetic data only (skip Wikitext-2 download)")
+                        help="Alias for --data-mode synthetic (deprecated)")
     parser.add_argument("--thermal-warn", type=int, default=THERMAL_WARN_C)
     parser.add_argument("--thermal-stop", type=int, default=THERMAL_STOP_C)
-    parser.add_argument("--output-dir", default="benchmarks/results/laptop")
+    parser.add_argument("--output-dir", default="benchmarks/results/laptop",
+                        help="Directory for result artifacts")
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help=(
+            "Unique run identifier (e.g., 20260804_082957_UTC). "
+            "Embedded in dense_summary.json for artifact traceability. "
+            "Generated automatically if not provided."
+        ),
+    )
     args = parser.parse_args()
 
+    # Resolve --synthetic alias
+    if args.synthetic and args.data_mode == "auto":
+        args.data_mode = "synthetic"
+
+    # Resolve --data-mode to synthetic bool for run_dense_validation
+    # real: force real text; halt if unavailable
+    # synthetic: force synthetic
+    # auto: try real, fall back to synthetic (existing behaviour)
+    if args.data_mode == "real":
+        use_synthetic = False
+    elif args.data_mode == "synthetic":
+        use_synthetic = True
+    else:  # auto
+        use_synthetic = False  # load_wikitext_sample handles the fallback
+
     if args.steps > 100 and not args.confirmed:
-        print(f"\n[CONFIRM] You are about to run {args.steps} training steps.")
-        print(f"  Config: {args.config}")
-        print(f"  This may take significant time and GPU resources.")
-        resp = input("  Type 'yes' to confirm: ").strip().lower()
-        if resp != "yes":
-            print("[ABORTED] Run cancelled.")
-            return 1
+        print(f"[CONFIRM] Running {args.steps} steps requires --confirmed flag.")
+        print("  Add --confirmed to proceed with extended run.")
+        return 1
+
+    import datetime as _dt
+    run_id = args.run_id or _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+    print(f"[DENSE] Run ID: {run_id}", flush=True)
 
     try:
         summary = run_dense_validation(
             config_name=args.config,
             max_steps=args.steps,
-            synthetic=args.synthetic,
+            synthetic=use_synthetic,
             thermal_warn=args.thermal_warn,
             thermal_stop=args.thermal_stop,
             output_dir=Path(args.output_dir),
         )
-        return 0 if summary["status"] in ("COMPLETED", "INTERRUPTED") else 1
-    except RuntimeError as e:
+        # Inject run_id and timestamp into the summary artifact so the pipeline
+        # can validate artifact freshness and run_id consistency.
+        summary["run_id"]    = run_id
+        summary["timestamp"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        summary_path = Path(args.output_dir) / "dense_summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+        # Return the semantic exit_code written by run_dense_validation()
+        return int(summary.get("exit_code", EXIT_EXECUTION_ERROR))
+    except (RuntimeError, FileNotFoundError) as e:
         print(f"\n[FAIL] {e}")
-        return 1
+        # Write a minimal failure artifact so the pipeline can read it
+        import datetime as _dt2
+        failure_artifact = {
+            "run_id":         run_id,
+            "outcome":        OUTCOME_EXECUTION_ERROR,
+            "exit_code":      EXIT_EXECUTION_ERROR,
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "timestamp":      _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
+            "error":          str(e),
+        }
+        try:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(args.output_dir) / "dense_summary.json").write_text(
+                json.dumps(failure_artifact, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+        return EXIT_EXECUTION_ERROR
 
 
 if __name__ == "__main__":

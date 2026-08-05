@@ -1,284 +1,152 @@
 @echo off
+:: Jupiter Shot — Laptop Validation Launcher (Run 8)
+:: ====================================================
+::
+:: This file is a MINIMAL LAUNCHER ONLY.
+:: All orchestration logic lives in:
+::   scripts/run_laptop_validation_pipeline.py
+::
+:: Usage:
+::   run_all_laptop_validation.bat [--data-mode real|synthetic|auto] [--preflight-only] [--steps N]
+::
+:: For preflight review only:
+::   run_all_laptop_validation.bat --data-mode real --preflight-only
+::
+:: For full validation:
+::   run_all_laptop_validation.bat --data-mode real
+::
+:: VRAM / Config selection:
+::   For 8 GB VRAM (RTX 5060): uses laptop_moe_8expert_8gb_safe.yaml (small config)
+::   For 16+ GB VRAM:          uses laptop_moe_run7.yaml (full config)
+::   The Python orchestrator selects the config automatically based on available VRAM.
+::
+:: Troubleshooting:
+::   - If pip install hangs or fails, check antivirus software.
+::     Windows Defender and third-party antivirus programs often block or slow
+::     Python package downloads. Temporarily disable real-time protection during
+::     the initial pip install, then re-enable it.
+::   - If torch import fails after install, re-run this script (the venv check
+::     will skip the download and retry the import).
+::
+:: Exit-code contract (Run 8):
+::   0  = PASS (complete success only)
+::   1  = NOT_ACCEPTED
+::   2  = NOT_EVALUABLE
+::   3  = EXECUTION_ERROR or dependency installation failure
+::   4  = SAFETY_STOP (Python pipeline safety stop)
+::
+:: ERRORLEVEL rules applied in this file:
+::   - ERRORLEVEL is captured into !ERR! immediately after every critical command.
+::   - No pause, echo, set, or pipe command appears between a critical command
+::     and the capture of its ERRORLEVEL.
+::   - All error paths use "endlocal & exit /b N" to prevent setlocal from
+::     swallowing the exit code when invoked from a parent batch file.
+::   - pause is NEVER used in error paths (it resets ERRORLEVEL to 0 when
+::     stdin is redirected, breaking CI and parent-batch invocations).
+
 setlocal enabledelayedexpansion
 
-:: ============================================================================
-:: Jupiter Shot — Kuwait Laptop GPU Validation
-:: run_all_laptop_validation.bat
-::
-:: What this script validates:
-::   - CUDA execution on a single NVIDIA GPU
-::   - Dense transformer training (small config)
-::   - Small MoE routing (8-expert prototype)
-::   - Checkpoint save, interrupt, and resume
-::   - Metrics collection and thermal monitoring
-::
-:: What this script does NOT validate:
-::   - 8x A100 distributed training
-::   - DeepSpeed NCCL multi-node communication
-::   - Full 1.3B parameter training run
-::   - 20T scalability
-::
-:: A successful run authorizes the next controlled validation stage.
-:: It does NOT automatically authorize 47B MoE training.
-::
-:: Requirements:
-::   - Windows 10/11 with NVIDIA GPU (CUDA-capable)
-::   - NVIDIA drivers installed (CUDA toolkit NOT required — PyTorch bundles CUDA)
-::   - Python 3.10 or 3.11 installed and on PATH
-::   - Internet access for initial package download (~2 GB)
-::   - 20 GB free disk space
-::
-:: This script creates an ISOLATED virtual environment (.venv) in the project
-:: directory. It does NOT modify the system-wide Python installation or
-:: install/modify the system-wide CUDA toolkit.
-:: ============================================================================
-
-echo.
-echo ============================================================
-echo  Jupiter Shot - Kuwait Laptop GPU Validation
-echo ============================================================
-echo.
-
-:: ----------------------------------------------------------------------------
-:: Step 0: Locate project root
-:: ----------------------------------------------------------------------------
+:: ── Locate repo root (parent of scripts\windows) ──────────────────────────
 set "SCRIPT_DIR=%~dp0"
-pushd "%SCRIPT_DIR%..\.." && cd /d "%CD%"
-set "PROJECT_ROOT=%CD%"
+pushd "%SCRIPT_DIR%..\.."
+set "REPO_ROOT=%CD%"
 popd
 
-echo [INFO] Project root: %PROJECT_ROOT%
+echo.
+echo ============================================================
+echo  Jupiter Shot - Laptop Validation Launcher (Run 8)
+echo ============================================================
+echo  Repo root: %REPO_ROOT%
+echo  Args:      %*
+echo ============================================================
 echo.
 
-:: ----------------------------------------------------------------------------
-:: Step 1: Check Python is available
-:: ----------------------------------------------------------------------------
-echo [STEP 1/7] Checking Python installation...
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] Python not found on PATH.
-    echo         Install Python 3.10 or 3.11 from https://www.python.org/downloads/
-    echo         Ensure "Add Python to PATH" is checked during installation.
-    pause
-    exit /b 1
-)
-for /f "tokens=*" %%v in ('python --version 2^>^&1') do set PYTHON_VERSION=%%v
-echo [OK]   %PYTHON_VERSION%
-echo.
+:: ── Virtual environment ────────────────────────────────────────────────────
+set "VENV_DIR=%REPO_ROOT%\.venv"
+set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 
-:: ----------------------------------------------------------------------------
-:: Step 2: Create isolated virtual environment (does NOT touch system Python)
-:: ----------------------------------------------------------------------------
-set "VENV_DIR=%PROJECT_ROOT%\.venv"
-echo [STEP 2/7] Setting up isolated virtual environment at .venv\...
-
-if exist "%VENV_DIR%\Scripts\activate.bat" (
-    echo [OK]   Virtual environment already exists, reusing it.
-) else (
-    echo [INFO] Creating new virtual environment...
+:: ── Create venv if it does not exist ──────────────────────────────────────
+if not exist "%VENV_PYTHON%" (
+    echo [Launcher] Creating virtual environment at .venv\ ...
     python -m venv "%VENV_DIR%"
-    if errorlevel 1 (
-        echo [ERROR] Failed to create virtual environment.
-        echo         Ensure python -m venv is available (Python 3.10+).
-        pause
-        exit /b 1
+    set "ERR=!ERRORLEVEL!"
+    if !ERR! NEQ 0 (
+        echo [Launcher] ERROR: Failed to create virtual environment.
+        echo [Launcher] Ensure Python 3.10 or 3.11 is on PATH.
+        endlocal & exit /b 3
     )
-    echo [OK]   Virtual environment created.
-)
-
-:: Activate the virtual environment
-call "%VENV_DIR%\Scripts\activate.bat"
-echo [OK]   Virtual environment activated.
-echo.
-
-:: ----------------------------------------------------------------------------
-:: Step 3: Install pinned dependencies (isolated to .venv, NOT system-wide)
-:: ----------------------------------------------------------------------------
-echo [STEP 3/7] Installing pinned dependencies into virtual environment...
-echo [INFO] This downloads ~2 GB on first run. Subsequent runs are fast.
-echo.
-
-python -m pip install --upgrade pip --quiet
-
-:: Install PyTorch with bundled CUDA 12.1 (no system CUDA toolkit needed)
-echo [INFO] Installing PyTorch 2.2.2 with bundled CUDA 12.1...
-pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cu121 --quiet
-if errorlevel 1 (
-    echo [ERROR] Failed to install PyTorch. Check internet connection.
-    pause
-    exit /b 1
-)
-
-echo [INFO] Installing project dependencies from requirements.txt...
-pip install -r "%PROJECT_ROOT%\requirements.txt" --quiet
-if errorlevel 1 (
-    echo [ERROR] Failed to install requirements.txt dependencies.
-    pause
-    exit /b 1
-)
-
-echo [OK]   All dependencies installed.
-echo.
-
-:: ----------------------------------------------------------------------------
-:: Step 4: Verify PyTorch CUDA detection (STOP if CUDA not available)
-:: ----------------------------------------------------------------------------
-echo [STEP 4/7] Verifying PyTorch CUDA detection...
-python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'; print('[OK]   CUDA available: ' + torch.cuda.get_device_name(0))"
-if errorlevel 1 (
-    echo.
-    echo [FAIL] PyTorch cannot detect a CUDA-capable GPU.
-    echo.
-    echo        Possible causes:
-    echo          1. No NVIDIA GPU in this machine
-    echo          2. NVIDIA drivers not installed or outdated
-    echo             Download: https://www.nvidia.com/Download/index.aspx
-    echo          3. GPU does not support CUDA (must be compute capability 3.7+)
-    echo.
-    echo        This validation requires a CUDA-capable NVIDIA GPU on Windows.
-    echo        The script cannot continue without CUDA.
-    echo.
-    pause
-    exit /b 1
-)
-echo.
-
-:: ----------------------------------------------------------------------------
-:: Step 5: Run preflight (STOP if preflight fails)
-:: ----------------------------------------------------------------------------
-echo [STEP 5/7] Running hardware preflight check...
-echo.
-
-mkdir "%PROJECT_ROOT%\benchmarks\results\laptop" 2>nul
-mkdir "%PROJECT_ROOT%\docs\generated" 2>nul
-
-python "%PROJECT_ROOT%\scripts\laptop_gpu_preflight.py" --output-dir "%PROJECT_ROOT%\benchmarks\results\laptop"
-if errorlevel 1 (
-    echo.
-    echo [FAIL] Preflight check failed.
-    echo        Review the output above before proceeding.
-    echo        Do not run validation on a system that fails preflight.
-    echo.
-    pause
-    exit /b 1
-)
-echo.
-echo [OK]   Preflight passed.
-echo.
-
-:: Read recommended configs from preflight output
-for /f "tokens=*" %%i in ('python -c "import json; d=json.load(open('%PROJECT_ROOT:\=/%/benchmarks/results/laptop/preflight.json')); print(d.get('recommended_dense_config','laptop_dense_small'))" 2^>nul') do set DENSE_CONFIG=%%i
-for /f "tokens=*" %%i in ('python -c "import json; d=json.load(open('%PROJECT_ROOT:\=/%/benchmarks/results/laptop/preflight.json')); print(d.get('recommended_moe_config','laptop_moe_small'))" 2^>nul') do set MOE_CONFIG=%%i
-if "!DENSE_CONFIG!"=="" set DENSE_CONFIG=laptop_dense_small
-if "!MOE_CONFIG!"=="" set MOE_CONFIG=laptop_moe_small
-
-echo [INFO] Selected dense config: !DENSE_CONFIG!
-echo [INFO] Selected MoE config:   !MOE_CONFIG!
-echo.
-
-:: ----------------------------------------------------------------------------
-:: Step 6: Confirm before running longer tests
-:: ----------------------------------------------------------------------------
-echo [STEP 6/7] Confirmation required before running GPU training tests.
-echo.
-echo   The following tests will run:
-echo     - Dense transformer training  (estimated: 20-60 minutes)
-echo     - MoE routing validation      (estimated: 20-60 minutes)
-echo     - Checkpoint resume test      (estimated: 5-15 minutes)
-echo.
-echo   Total estimated time: 45 minutes to 2 hours depending on GPU speed.
-echo   GPU will run at high utilization. Ensure adequate cooling.
-echo.
-set /p CONFIRM="   Type YES to continue, or press Enter to cancel: "
-if /i not "!CONFIRM!"=="YES" (
-    echo.
-    echo [INFO] Validation cancelled by user.
-    echo        Run this script again when ready.
-    pause
-    exit /b 0
-)
-echo.
-
-:: ----------------------------------------------------------------------------
-:: Step 7: Run validation tests
-:: ----------------------------------------------------------------------------
-echo [STEP 7/7] Running GPU validation tests...
-echo.
-
-set PASS_COUNT=0
-set FAIL_COUNT=0
-
-:: --- Dense validation ---
-echo [TEST 1/3] Dense transformer training (!DENSE_CONFIG!)...
-python "%PROJECT_ROOT%\scripts\run_laptop_dense.py" --config !DENSE_CONFIG! --steps 100
-if errorlevel 1 (
-    echo [FAIL] Dense training validation failed. Review output above.
-    set /a FAIL_COUNT+=1
+    echo [Launcher] Virtual environment created.
 ) else (
-    echo [OK]   Dense training validation complete.
-    set /a PASS_COUNT+=1
+    echo [Launcher] Virtual environment already exists.
 )
-echo.
 
-:: --- MoE validation ---
-echo [TEST 2/3] MoE routing validation (!MOE_CONFIG!)...
-python "%PROJECT_ROOT%\scripts\run_laptop_moe.py" --config !MOE_CONFIG! --steps 100
-if errorlevel 1 (
-    echo [FAIL] MoE validation failed. Review output above.
-    set /a FAIL_COUNT+=1
+:: ── Install PyTorch if not already present ────────────────────────────────
+"%VENV_PYTHON%" -c "import torch; v=torch.__version__; assert '2.7' in v and 'cu128' in v, f'Wrong torch: {v}'" >nul 2>&1
+set "ERR=!ERRORLEVEL!"
+if !ERR! NEQ 0 (
+    echo [Launcher] Installing PyTorch 2.7.1+cu128 ^(RTX 50-series / Blackwell^) ...
+    echo [Launcher] Download size: ~2.3 GB. This may take 5-30 minutes.
+    "%VENV_PYTHON%" -m pip install --quiet torch==2.7.1+cu128 --index-url https://download.pytorch.org/whl/cu128
+    set "ERR=!ERRORLEVEL!"
+    if !ERR! NEQ 0 (
+        echo [Launcher] ERROR: PyTorch installation failed. Exit code: !ERR!
+        echo [Launcher] Manual fallback:
+        echo [Launcher]   .venv\Scripts\python.exe -m pip install torch==2.7.1+cu128 --index-url https://download.pytorch.org/whl/cu128
+        endlocal & exit /b 3
+    )
+    echo [Launcher] PyTorch 2.7.1+cu128 installed.
 ) else (
-    echo [OK]   MoE validation complete.
-    set /a PASS_COUNT+=1
+    echo [Launcher] PyTorch 2.7.1+cu128 already installed.
 )
-echo.
 
-:: --- Resume test ---
-echo [TEST 3/3] Checkpoint resume test...
-python "%PROJECT_ROOT%\scripts\run_laptop_resume_test.py" --config !DENSE_CONFIG! --steps 20
-if errorlevel 1 (
-    echo [FAIL] Checkpoint resume test failed. Review output above.
-    set /a FAIL_COUNT+=1
+:: ── Install remaining dependencies if any are missing ─────────────────────
+:: Check only the packages that are NOT torch (torch is handled above).
+:: This check avoids re-downloading torch on every run.
+"%VENV_PYTHON%" -c "import transformers, datasets, pandas, pyarrow, yaml, pyarrow_hotfix" >nul 2>&1
+set "ERR=!ERRORLEVEL!"
+if !ERR! NEQ 0 (
+    echo [Launcher] Installing remaining dependencies from requirements-laptop.txt ...
+    "%VENV_PYTHON%" -m pip install --quiet -r "%REPO_ROOT%\requirements-laptop.txt" --extra-index-url https://download.pytorch.org/whl/cu128
+    set "ERR=!ERRORLEVEL!"
+    if !ERR! NEQ 0 (
+        echo [Launcher] ERROR: Dependency installation failed. Exit code: !ERR!
+        echo [Launcher] Run manually to see full error:
+        echo [Launcher]   .venv\Scripts\python.exe -m pip install -r requirements-laptop.txt
+        endlocal & exit /b 3
+    )
+    echo [Launcher] Dependencies installed.
 ) else (
-    echo [OK]   Checkpoint resume test complete.
-    set /a PASS_COUNT+=1
-)
-echo.
-
-:: --- Collect metrics ---
-python "%PROJECT_ROOT%\scripts\collect_laptop_metrics.py" --results-dir "%PROJECT_ROOT%\benchmarks\results\laptop" >nul 2>&1
-
-:: --- Generate report ---
-echo [REPORT] Generating validation report...
-python "%PROJECT_ROOT%\scripts\generate_laptop_validation_draft.py"
-if errorlevel 1 (
-    echo [WARN] Report generation encountered an error.
-    echo        Raw metrics are still in benchmarks\results\laptop\
-) else (
-    echo [OK]   Report generated.
+    echo [Launcher] All dependencies already installed.
 )
 
-:: ----------------------------------------------------------------------------
-:: Done
-:: ----------------------------------------------------------------------------
-echo.
-echo ============================================================
-echo  VALIDATION COMPLETE
-echo  Passed: !PASS_COUNT!   Failed: !FAIL_COUNT!
-echo ============================================================
-echo.
-echo  Generated report (send this to the team):
-echo    %PROJECT_ROOT%\docs\generated\LAPTOP_GPU_VALIDATION_DRAFT.md
-echo.
-echo  Raw metrics:
-echo    %PROJECT_ROOT%\benchmarks\results\laptop\
-echo.
-echo  IMPORTANT:
-echo    A successful result authorizes the next controlled validation stage.
-echo    It does NOT automatically authorize 47B MoE training.
-echo    The team will review the report before deciding next steps.
-echo.
-if !FAIL_COUNT! GTR 0 (
-    echo  [WARN] !FAIL_COUNT! test(s) failed. Review the output above.
+:: ── pip check: verify no broken requirements ──────────────────────────────
+"%VENV_PYTHON%" -m pip check >nul 2>&1
+set "ERR=!ERRORLEVEL!"
+if !ERR! NEQ 0 (
+    echo [Launcher] ERROR: pip check failed - broken requirements detected.
+    echo [Launcher] Run for details: .venv\Scripts\python.exe -m pip check
+    endlocal & exit /b 3
 )
-pause
-exit /b !FAIL_COUNT!
+echo [Launcher] pip check passed.
+
+echo.
+echo [Launcher] Delegating to Python orchestrator ...
+echo.
+
+:: ── Delegate ALL orchestration to the Python pipeline ─────────────────────
+:: All arguments (%*) are forwarded verbatim.
+:: ERRORLEVEL is captured immediately after the Python call with no intervening
+:: commands (no echo, no set, no pipe) to prevent clobbering.
+"%VENV_PYTHON%" "%REPO_ROOT%\scripts\run_laptop_validation_pipeline.py" %*
+set "PIPELINE_EXIT=!ERRORLEVEL!"
+
+echo.
+echo [Launcher] Pipeline exited with code !PIPELINE_EXIT!
+
+if !PIPELINE_EXIT! EQU 0 echo [Launcher] Result: PASS
+if !PIPELINE_EXIT! EQU 1 echo [Launcher] Result: NOT_ACCEPTED
+if !PIPELINE_EXIT! EQU 2 echo [Launcher] Result: NOT_EVALUABLE
+if !PIPELINE_EXIT! EQU 3 echo [Launcher] Result: EXECUTION_ERROR
+if !PIPELINE_EXIT! EQU 4 echo [Launcher] Result: SAFETY_STOP
+
+endlocal & exit /b %PIPELINE_EXIT%

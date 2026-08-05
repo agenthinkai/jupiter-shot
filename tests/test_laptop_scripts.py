@@ -542,8 +542,10 @@ class TestWindowsScripts:
                 full_path = REPO_ROOT / script_path
                 if full_path.exists():
                     content = full_path.read_text()
-                    assert "cd /d" in content or "cd " in content, \
-                        f"{script_path}: should navigate to repo root"
+                    # Accept cd /d, cd , or pushd (all navigate to repo root)
+                    has_nav = "cd /d" in content or "cd " in content or "pushd" in content
+                    assert has_nav, \
+                        f"{script_path}: should navigate to repo root (cd /d, cd, or pushd)"
 
 
 # ─── Documentation Tests ──────────────────────────────────────────────────────

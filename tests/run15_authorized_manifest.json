@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "test_files": [
+    "tests/test_run12_gate10b_real_object.py",
+    "tests/test_run12_operator_package.py",
+    "tests/test_run13_config_resolver.py",
+    "tests/test_run13_subprocess_smoke.py",
+    "tests/test_run14_integration.py",
+    "tests/test_run14_same_pass_provenance.py",
+    "tests/test_run14_integration_contracts.py",
+    "tests/test_run15_regression.py",
+    "tests/test_run15_manifest_verifier.py",
+    "tests/test_run15_utf8_reproducibility.py"
+  ],
+  "function_count": 197,
+  "collected_node_count": 207,
+  "node_list_sha256": "e5cbd90497bcbe536536abeed8c452fd9b26f9af354ae47731bbd287c99596ee",
+  "generated_with": "scripts/generate_test_manifest.py",
+  "generated_at": "2026-08-05T14:50:05.821983+00:00",
+  "branch": "fix/rtx50-blackwell-validation",
+  "commit": "0592fbe"
+}

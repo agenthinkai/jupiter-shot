@@ -4,23 +4,33 @@ Jupiter Shot — Laptop MoE CUDA Validation
 Runs MoE training validation with 8 experts, top-2 routing, and full
 router metric collection.
 
-Metric definitions:
-  - expert_assignment_share[i]: fraction of tokens assigned to expert i
-    (after routing, before capacity overflow). Sum = num_experts_per_token / num_experts.
-  - token_routing_pct[i]: percentage of tokens where expert i is selected.
-  - utilization_cv: coefficient of variation of expert loads = std/mean.
-    CV < 0.2 indicates balanced routing.
-  - max_min_ratio: max_load / min_load. Ratio < 3.0 is acceptable.
-  - dropped_token_pct: percentage of tokens that exceed expert capacity
-    and are dropped (not processed by any expert).
-  - overflow_pct: percentage of tokens that hit the capacity buffer.
-  - router_entropy: Shannon entropy of routing distribution (bits).
-    Max entropy for 8 experts = log2(8) = 3.0 bits.
-    Collapse threshold: < 1.5 bits.
+Model API contract:
+  model(input_ids=..., labels=...) -> dict with keys:
+    - 'logits':         (batch, seq_len, vocab_size)
+    - 'loss':           total loss (LM + aux) if labels provided, else None
+    - 'lm_loss':        language modeling loss only
+    - 'aux_loss':       total auxiliary routing loss (scalar tensor)
+    - 'router_metrics': list of per-layer routing metric dicts
+
+Router metric key names are defined in training/router_metrics.py.
+Do NOT hardcode key names here; import the K_* constants.
+
+Exit codes:
+  0  PASS          — all acceptance criteria met, real-text data used
+  1  NOT_ACCEPTED  — training completed but one or more acceptance criteria failed
+  2  NOT_EVALUABLE — training completed but required metrics were absent
+  3  EXECUTION_ERROR — unrecoverable runtime error (OOM, NaN, CUDA failure)
+  4  SAFETY_STOP   — thermal or other safety threshold triggered
+
+Data modes (--data-mode):
+  real      — Wikitext-2 (MIT license). Halts with exit 3 if unavailable.
+  synthetic — Random token IDs. Diagnostic only; cannot produce a PASS.
+  auto      — (default) Tries real; falls back to synthetic with a warning.
 
 Usage:
-    python scripts/run_laptop_moe.py --config laptop_moe_small
-    python scripts/run_laptop_moe.py --config laptop_moe_small --steps 1000 --confirmed
+    python scripts/run_laptop_moe.py --config laptop_moe_8gb_safe
+    python scripts/run_laptop_moe.py --config laptop_moe_8gb_safe --steps 1000 --confirmed
+    python scripts/run_laptop_moe.py --data-mode synthetic  # diagnostic only
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,14 +58,17 @@ THERMAL_STOP_C = 90
 MAX_OOM_RETRIES = 3
 METRIC_FLUSH_INTERVAL = 10
 
-# MoE acceptance thresholds
-MOE_ACCEPT = {
-    "max_dropped_token_pct": 1.0,    # < 1% dropped tokens required
-    "max_utilization_cv": 0.5,       # CV < 0.5 acceptable
-    "max_max_min_ratio": 10.0,       # max/min utilization ratio
-    "min_router_entropy_bits": 1.5,  # > 1.5 bits to avoid collapse
-    "min_expert_share_pct": 2.0,     # no expert below 2% persistently
-}
+# Exit codes
+EXIT_PASS             = 0
+EXIT_NOT_ACCEPTED     = 1
+EXIT_NOT_EVALUABLE    = 2
+EXIT_EXECUTION_ERROR  = 3
+EXIT_SAFETY_STOP      = 4
+
+# Data mode constants
+DATA_MODE_REAL      = "real"
+DATA_MODE_SYNTHETIC = "synthetic"
+DATA_MODE_AUTO      = "auto"
 
 
 def _gpu_temp() -> Optional[int]:
@@ -84,9 +98,9 @@ def _check_thermal(step: int, warn_c: int, stop_c: int) -> None:
     if temp is None:
         return
     if temp >= stop_c:
-        raise RuntimeError(f"[THERMAL STOP] GPU {temp}°C >= {stop_c}°C at step {step}.")
+        raise SystemExit(EXIT_SAFETY_STOP)  # caught by main() as safety stop
     if temp >= warn_c:
-        print(f"[THERMAL WARNING] GPU {temp}°C >= {warn_c}°C at step {step}.")
+        print(f"[THERMAL WARNING] GPU {temp}C >= {warn_c}C at step {step}.")
 
 
 def _check_nan_inf(loss_val: float, step: int) -> None:
@@ -94,78 +108,155 @@ def _check_nan_inf(loss_val: float, step: int) -> None:
         raise ValueError(f"[NaN/Inf] Loss={loss_val} at step {step}.")
 
 
-def compute_router_metrics(routing_weights: Any, num_experts: int, torch: Any) -> dict:
+def load_wikitext_sample(n_samples: int = 500) -> list[str]:
     """
-    Compute all router utilization metrics from routing weights tensor.
+    Load a sample from Wikitext-2 (MIT license).
 
-    Args:
-        routing_weights: (batch*seq, num_experts) softmax weights
-        num_experts: total number of experts
-
-    Returns dict with all utilization metrics.
+    Returns list of text strings, or [] on failure.
+    Does NOT raise — callers decide whether to abort or fall back.
     """
-    with torch.no_grad():
-        # Expert assignment share: mean probability assigned to each expert
-        mean_weights = routing_weights.mean(dim=0)  # (num_experts,)
-        assignment_share = mean_weights.cpu().tolist()
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train",
+                          trust_remote_code=False)
+        texts = [row["text"] for row in ds if len(row["text"]) > 100][:n_samples]
+        print(f"[DATA] Loaded {len(texts)} samples from Wikitext-2 (MIT license)")
+        return texts
+    except Exception as e:
+        print(f"[DATA] Wikitext-2 unavailable: {e}")
+        return []
 
-        # Token routing percentage: fraction of tokens where each expert is top-k
-        topk_indices = routing_weights.topk(2, dim=-1).indices  # (N, 2)
-        token_counts = torch.zeros(num_experts, device=routing_weights.device)
-        for k in range(2):
-            for e in range(num_experts):
-                token_counts[e] += (topk_indices[:, k] == e).sum()
-        total_tokens = routing_weights.shape[0]
-        token_routing_pct = (token_counts / total_tokens * 100).cpu().tolist()
 
-        # Utilization CV and max/min ratio
-        loads = token_counts.float()
-        mean_load = loads.mean().item()
-        std_load = loads.std().item()
-        cv = std_load / mean_load if mean_load > 0 else float("inf")
-        max_load = loads.max().item()
-        min_load = loads.min().item()
-        max_min_ratio = max_load / min_load if min_load > 0 else float("inf")
+def get_real_text_batch(tokenizer: Any, texts: list[str], seq_len: int, device: Any) -> Any:
+    import torch
+    enc = tokenizer(texts, return_tensors="pt", truncation=True,
+                    max_length=seq_len, padding="max_length")
+    return enc["input_ids"].to(device)
 
-        # Router entropy (Shannon entropy of mean routing distribution)
-        eps = 1e-9
-        probs = mean_weights.clamp(min=eps)
-        probs = probs / probs.sum()
-        entropy_bits = -(probs * torch.log2(probs)).sum().item()
 
-        # Inactive experts (< 2% of tokens)
-        inactive = [i for i, pct in enumerate(token_routing_pct) if pct < 2.0]
+# Run 15: required fields for a schema-valid MoE artifact
+_MOE_SCHEMA_REQUIRED_FIELDS: tuple[str, ...] = (
+    "schema_version",
+    "timestamp",
+    "run_id",
+    "branch",
+    "commit",
+    "outcome",
+    "exit_code",
+    "data_mode",
+    "device",
+    "gpu_name",
+    "aux_loss_semantics",
+    "router_metrics_available_under_gc",
+    "checkpoint_status",
+)
 
-    return {
-        "expert_assignment_share": [round(s, 6) for s in assignment_share],
-        "token_routing_pct": [round(p, 2) for p in token_routing_pct],
-        "utilization_cv": round(cv, 4),
-        "max_min_ratio": round(max_min_ratio, 2),
-        "router_entropy_bits": round(entropy_bits, 4),
-        "inactive_experts": inactive,
-        "num_inactive_experts": len(inactive),
-    }
+
+def validate_moe_artifact_schema(artifact: dict) -> list[str]:
+    """
+    Validate the MoE artifact schema.
+    Returns a list of error strings (empty = valid).
+    PASS requires schema_version == '1.0' and a timezone-aware UTC timestamp.
+    """
+    import datetime as _dt_v
+    errors: list[str] = []
+    # Check required fields are present and non-None
+    for field in _MOE_SCHEMA_REQUIRED_FIELDS:
+        if field not in artifact or artifact[field] is None:
+            errors.append(f"Missing or null required field: '{field}'")
+    # schema_version must be '1.0'
+    sv = artifact.get("schema_version")
+    if sv is not None and sv != "1.0":
+        errors.append(f"schema_version must be '1.0', got {sv!r}")
+    # timestamp must be a timezone-aware UTC ISO-8601 string
+    ts = artifact.get("timestamp")
+    if ts is not None:
+        try:
+            parsed = _dt_v.datetime.fromisoformat(str(ts))
+            if parsed.tzinfo is None:
+                errors.append(
+                    f"timestamp is not timezone-aware: {ts!r}. "
+                    "Must be UTC ISO-8601 with timezone info."
+                )
+        except (ValueError, TypeError):
+            errors.append(f"timestamp is not a valid ISO-8601 string: {ts!r}")
+    return errors
+
+
+def _write_artifact(summary_path: Path, summary: dict, run_id: str) -> None:
+    """
+    Atomically write the MoE summary artifact.
+    Rejects stale artifacts (run_id mismatch) with a warning.
+    """
+    import json as _json
+    if summary_path.exists():
+        try:
+            existing = _json.loads(summary_path.read_text(encoding="utf-8"))
+            existing_run_id = existing.get("run_id")
+            if existing_run_id and existing_run_id != run_id:
+                print(
+                    f"[ARTIFACT WARNING] Stale artifact detected: "
+                    f"existing run_id={existing_run_id!r} != current run_id={run_id!r}. "
+                    f"Overwriting with current run."
+                )
+        except Exception:
+            pass
+    _tmp = summary_path.with_suffix(".tmp")
+    _tmp.write_text(_json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    _tmp.replace(summary_path)
 
 
 def run_moe_validation(
     config_name: str,
     max_steps: int = 100,
-    synthetic: bool = False,
+    data_mode: str = DATA_MODE_AUTO,
     thermal_warn: int = THERMAL_WARN_C,
     thermal_stop: int = THERMAL_STOP_C,
     output_dir: Path = RESULTS_DIR,
     ckpt_dir: Path = CKPT_DIR,
+    run_id: Optional[str] = None,
+    branch: str = "unknown",
+    commit: str = "unknown",
 ) -> dict:
+    """
+    Run MoE laptop validation.
+
+    Returns summary dict with keys:
+      status:        COMPLETED | INTERRUPTED | FAILED
+      outcome:       PASS | NOT_ACCEPTED | NOT_EVALUABLE | EXECUTION_ERROR | SAFETY_STOP
+      exit_code:     int (EXIT_* constant)
+      data_mode:     str describing the data source used
+      moe_accepted:  bool (True only when outcome is PASS)
+      ...
+    """
     import torch
     import yaml
+    from training.router_metrics import (
+        aggregate_layer_metrics,
+        evaluate_acceptance,
+        OUTCOME_PASS,
+        OUTCOME_NOT_ACCEPTED,
+        OUTCOME_NOT_EVALUABLE,
+        OUTCOME_EXECUTION_ERROR,
+        OUTCOME_SAFETY_STOP,
+        K_ROUTER_ENTROPY,
+        K_UTILIZATION_CV,
+        K_NUM_INACTIVE_EXPERTS,
+        K_DROPPED_TOKEN_FRACTION,
+        ROUTER_METRIC_KEYS,
+        TRAINING_LEVEL_EXCLUDE_KEY,
+    )
 
     if not torch.cuda.is_available():
         raise RuntimeError("[FAIL] CUDA is not available.")
 
-    config_path = REPO_ROOT / "training" / "configs" / f"{config_name}.yaml"
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
-    with open(config_path) as f:
+    # Use shared resolver to support full paths, relative paths, and bare names
+    from training.config_path import resolve_config_path, format_missing_error, safe_checkpoint_name
+    _res = resolve_config_path(config_name, repo_root=REPO_ROOT)
+    config_path = _res.resolved_path
+    if not _res.exists:
+        raise FileNotFoundError(format_missing_error(_res))
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     model_cfg = cfg.get("model", {})
@@ -183,7 +274,6 @@ def run_moe_validation(
     model = MoETransformer(moe_config).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    # Active params: non-expert params + (top-k / num_experts) * expert params
     expert_params = sum(p.numel() for n, p in model.named_parameters() if "expert" in n.lower())
     non_expert_params = total_params - expert_params
     active_params = non_expert_params + (moe_config.num_experts_per_token / moe_config.num_experts) * expert_params
@@ -196,27 +286,88 @@ def run_moe_validation(
     precision = train_cfg.get("precision", "fp16")
     use_bf16 = precision == "bf16" and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float16
+    print(f"[MOE] Precision: {'bf16' if use_bf16 else 'fp16'}")
 
     lr = float(train_cfg.get("learning_rate", 3e-4))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=lr * 0.1)
-    scaler = torch.cuda.amp.GradScaler(enabled=not use_bf16)
+
+    # AMP scaler — torch.amp.GradScaler("cuda", ...) replaces deprecated torch.cuda.amp.GradScaler
+    scaler = torch.amp.GradScaler("cuda", enabled=not use_bf16)
 
     vocab_size = base_config.vocab_size
     seq_len = int(train_cfg.get("seq_length", base_config.max_position_embeddings))
     batch_size = int(train_cfg.get("batch_size", 2))
     grad_accum = int(train_cfg.get("gradient_accumulation_steps", 1))
 
+    # ── Data loading ──────────────────────────────────────────────────────────
+    texts: list[str] = []
+    tokenizer = None
+    actual_data_mode: str = data_mode
+
+    if data_mode in (DATA_MODE_REAL, DATA_MODE_AUTO):
+        texts = load_wikitext_sample(500)
+        if texts:
+            try:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+                tokenizer.pad_token = tokenizer.eos_token
+                actual_data_mode = "wikitext-2 (MIT license)"
+                # ── Vocabulary contract check ─────────────────────────────────
+                # model_config.vocab_size MUST be >= len(tokenizer)
+                # Halt immediately if not — do NOT remap with modulo arithmetic.
+                actual_tokenizer_size = len(tokenizer)
+                if vocab_size < actual_tokenizer_size:
+                    raise RuntimeError(
+                        f"TOKENIZER_VOCABULARY_MISMATCH: "
+                        f"model vocab_size={vocab_size} < "
+                        f"tokenizer vocab_size={actual_tokenizer_size} "
+                        f"(EleutherAI/gpt-neox-20b). "
+                        f"Update the config to vocab_size={actual_tokenizer_size} "
+                        f"before running real-text validation."
+                    )
+                print(
+                    f"[VOCAB] Contract OK: model vocab_size={vocab_size} "
+                    f">= tokenizer vocab_size={actual_tokenizer_size}"
+                )
+            except Exception as e:
+                print(f"[DATA] Tokenizer unavailable ({e}).")
+                texts = []
+
+        if not texts:
+            if data_mode == DATA_MODE_REAL:
+                # Hard stop: caller explicitly requested real data
+                raise RuntimeError(
+                    "[FAIL] --data-mode real was requested but Wikitext-2 is unavailable. "
+                    "Install the 'datasets' package and ensure internet access, "
+                    "or use --data-mode auto to fall back to synthetic."
+                )
+            # AUTO mode: fall back to synthetic with a prominent warning
+            print(
+                "\n[DATA WARNING] Real text data unavailable. Falling back to synthetic.\n"
+                "  Synthetic-only results are DIAGNOSTIC ONLY and cannot produce a PASS.\n"
+                "  Install 'datasets' and 'transformers' for a valid run.\n"
+            )
+            actual_data_mode = "synthetic (real text unavailable)"
+    else:
+        actual_data_mode = "synthetic (--data-mode synthetic)"
+
+    print(f"[MOE] Data mode: {actual_data_mode}")
+
+    # ── Output setup ──────────────────────────────────────────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_path = output_dir / "moe_metrics.jsonl"
     errors_path = output_dir / "errors.jsonl"
+    failure_path = output_dir / "moe_failure_artifact.json"
 
     metrics_log: list[dict] = []
     nan_inf_count = 0
     oom_count = 0
     interrupted = False
+    safety_stopped = False
+    step = 0
 
     def _graceful_stop(signum, frame):
         nonlocal interrupted
@@ -229,14 +380,30 @@ def run_moe_validation(
     torch.cuda.reset_peak_memory_stats()
     start_wall = time.time()
     total_tokens = 0
-    step_times = []
-    step = 0
+    step_times: list[float] = []
 
-    # Cumulative router metrics for stability tracking
-    router_history: list[dict] = []
-
-    summary = {
+    import datetime as _dt_inner
+    _run_id = run_id or _dt_inner.datetime.now(_dt_inner.timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+    _timestamp = _dt_inner.datetime.now(_dt_inner.timezone.utc).isoformat()
+    # Detect GPU name for schema
+    _gpu_name: Optional[str] = None
+    try:
+        import torch as _torch_schema
+        if _torch_schema.cuda.is_available():
+            _gpu_name = _torch_schema.cuda.get_device_name(0)
+    except Exception:
+        pass
+    summary: dict[str, Any] = {
+        # Run 15: complete schema-valid artifact fields
+        "schema_version": "1.0",
+        "timestamp": _timestamp,
+        "run_id": _run_id,
+        "branch": branch,
+        "commit": commit,
+        "device": "cuda",
+        "gpu_name": _gpu_name,
         "config": config_name,
+        "data_mode": actual_data_mode,
         "total_params": total_params,
         "active_params_per_token": round(active_params),
         "num_experts": moe_config.num_experts,
@@ -247,7 +414,27 @@ def run_moe_validation(
         "nan_inf_count": 0,
         "oom_count": 0,
         "status": "RUNNING",
+        "outcome": None,
+        "exit_code": None,
+        # Run 14: aux_loss contract and router metrics fields
+        "aux_loss_semantics": "WEIGHTED",
+        "aux_loss_contract": (
+            "aux_loss = aux_loss_coeff * load_balance_loss + z_loss_coeff * z_loss. "
+            "Weighting applied INSIDE TopKRouter.forward(). No second multiplication in MoETransformer."
+        ),
+        "router_metrics_available_under_gc": True,
+        "checkpoint_status": None,
     }
+
+    # Run 15: start independent high-frequency thermal monitor
+    from training.thermal_monitor import ThermalMonitor
+    _thermal_monitor = ThermalMonitor(
+        run_dir=output_dir,
+        run_id=_run_id,
+        warn_c=thermal_warn,
+        stop_c=thermal_stop,
+    )
+    _thermal_monitor.start()
 
     model.train()
     optimizer.zero_grad()
@@ -257,11 +444,45 @@ def run_moe_validation(
             if interrupted:
                 break
 
+            # Poll the independent thermal monitor (non-blocking)
+            if _thermal_monitor.stop_requested:
+                safety_stopped = True
+                print(f"[THERMAL STOP] Independent monitor signalled SAFETY_STOP at step {step}.")
+                break
+            if _thermal_monitor.monitor_failed:
+                # Monitor health is required — treat as execution error
+                summary["status"] = "FAILED"
+                summary["outcome"] = OUTCOME_EXECUTION_ERROR
+                summary["exit_code"] = EXIT_EXECUTION_ERROR
+                summary["failure_reason"] = "Thermal monitor failed unexpectedly during training."
+                break
+
             step_start = time.time()
-            _check_thermal(step, thermal_warn, thermal_stop)
+            # Keep per-step thermal check as a secondary guard
+            try:
+                _check_thermal(step, thermal_warn, thermal_stop)
+            except SystemExit:
+                safety_stopped = True
+                print(f"[THERMAL STOP] GPU temp >= {thermal_stop}C at step {step}. Stopping.")
+                break
 
             try:
-                input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+                if texts and tokenizer:
+                    import random
+                    sample = random.sample(texts, min(batch_size, len(texts)))
+                    input_ids = get_real_text_batch(tokenizer, sample, seq_len, device)
+                    # Per-batch token ID range guard
+                    id_min = int(input_ids.min().item())
+                    id_max = int(input_ids.max().item())
+                    if id_min < 0 or id_max >= vocab_size:
+                        raise RuntimeError(
+                            f"TOKENIZER_VOCABULARY_MISMATCH: "
+                            f"batch token IDs [{id_min}, {id_max}] out of range "
+                            f"[0, {vocab_size - 1}] at step {step}. "
+                            f"Model vocab_size={vocab_size} is too small for this tokenizer."
+                        )
+                else:
+                    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
             except torch.cuda.OutOfMemoryError:
                 oom_count += 1
                 torch.cuda.empty_cache()
@@ -269,31 +490,17 @@ def run_moe_validation(
                     raise RuntimeError(f"[FAIL] {MAX_OOM_RETRIES} OOM errors.")
                 continue
 
+            # Forward + backward
+            # Model API: model(input_ids=..., labels=...) -> dict
+            #   out["loss"]           = total loss (LM + aux)
+            #   out["lm_loss"]        = language modeling loss only
+            #   out["aux_loss"]       = auxiliary routing loss (scalar tensor)
+            #   out["router_metrics"] = list of per-layer routing metric dicts
             try:
                 with torch.autocast(device_type="cuda", dtype=dtype):
                     labels = input_ids.clone()
-                    outputs = model(input_ids)
-
-                    # Handle MoE output (may return tuple with aux losses)
-                    if isinstance(outputs, tuple):
-                        logits, aux_loss, z_loss = outputs[0], outputs[1] if len(outputs) > 1 else None, outputs[2] if len(outputs) > 2 else None
-                    else:
-                        logits, aux_loss, z_loss = outputs, None, None
-
-                    shift_logits = logits[:, :-1, :].contiguous()
-                    shift_labels = labels[:, 1:].contiguous()
-                    ce_loss = torch.nn.functional.cross_entropy(
-                        shift_logits.view(-1, vocab_size),
-                        shift_labels.view(-1),
-                    )
-
-                    total_loss = ce_loss
-                    if aux_loss is not None:
-                        total_loss = total_loss + aux_loss
-                    if z_loss is not None:
-                        total_loss = total_loss + z_loss
-
-                    total_loss = total_loss / grad_accum
+                    out = model(input_ids=input_ids, labels=labels)
+                    total_loss = out["loss"] / grad_accum
 
                 if not use_bf16:
                     scaler.scale(total_loss).backward()
@@ -320,39 +527,31 @@ def run_moe_validation(
                     raise RuntimeError(f"[FAIL] {MAX_OOM_RETRIES} OOM errors.")
                 continue
 
-            loss_val = ce_loss.item()
-            aux_val = aux_loss.item() if aux_loss is not None else None
-            z_val = z_loss.item() if z_loss is not None else None
+            # Unpack losses from dict output
+            lm_loss_tensor = out.get("lm_loss")
+            aux_loss_tensor = out.get("aux_loss")
+            loss_val = (lm_loss_tensor.item() if lm_loss_tensor is not None
+                        else (out["loss"].item() * grad_accum))
+            aux_val = aux_loss_tensor.item() if aux_loss_tensor is not None else None
             _check_nan_inf(loss_val, step)
+
+            # Router metrics — aggregate per-layer dicts using shared schema
+            raw_router_metrics: list[dict] = out.get("router_metrics", [])
+            router_metrics: dict = aggregate_layer_metrics(raw_router_metrics)
 
             step_time = time.time() - step_start
             step_times.append(step_time)
             tokens_this_step = batch_size * seq_len
             total_tokens += tokens_this_step
             tps = tokens_this_step / step_time
-
             vram = _vram_stats(torch)
             temp = _gpu_temp()
             lr_now = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else lr
 
-            # Collect router metrics (best-effort)
-            router_metrics: dict = {}
-            try:
-                # Try to get routing weights from the last MoE layer
-                for module in model.modules():
-                    if hasattr(module, "_last_routing_weights") and module._last_routing_weights is not None:
-                        rw = module._last_routing_weights
-                        if rw.dim() == 2:
-                            router_metrics = compute_router_metrics(rw, moe_config.num_experts, torch)
-                        break
-            except Exception:
-                router_metrics = {"note": "Router weights not accessible via _last_routing_weights"}
-
-            metric = {
+            metric: dict[str, Any] = {
                 "step": step,
                 "loss": round(loss_val, 6),
                 "aux_loss": round(aux_val, 6) if aux_val is not None else None,
-                "z_loss": round(z_val, 6) if z_val is not None else None,
                 "lr": lr_now,
                 "step_time_s": round(step_time, 4),
                 "tokens_per_sec": round(tps, 1),
@@ -364,15 +563,16 @@ def run_moe_validation(
             metrics_log.append(metric)
 
             if step % METRIC_FLUSH_INTERVAL == 0 or step == 1:
-                with open(metrics_path, "a") as f:
+                with open(metrics_path, "a", encoding="utf-8") as f:
                     for m in metrics_log[-METRIC_FLUSH_INTERVAL:]:
                         f.write(json.dumps(m) + "\n")
 
             if step % 10 == 0 or step == 1:
-                inactive_str = f"inactive={router_metrics.get('num_inactive_experts', '?')}" if router_metrics else ""
+                inactive = router_metrics.get(K_NUM_INACTIVE_EXPERTS, "?")
+                aux_str = f"aux={aux_val:.4f}" if aux_val is not None else "aux=?"
+                inactive_str = f"inactive={inactive}" if router_metrics else ""
                 print(f"  Step {step:4d}/{max_steps} | loss={loss_val:.4f} | "
-                      f"aux={aux_val:.4f if aux_val else '?'} | "
-                      f"{tps:.0f} tok/s | {inactive_str}")
+                      f"{aux_str} | {tps:.0f} tok/s | {inactive_str}")
 
             if step == 10:
                 print(f"\n[DIAGNOSTIC] 10 steps complete. Loss={loss_val:.4f}")
@@ -381,114 +581,259 @@ def run_moe_validation(
                 print("[DIAGNOSTIC] Stable. Continuing.\n")
 
     except (ValueError, RuntimeError) as e:
+        tb = traceback.format_exc()
         print(f"\n[ERROR] {e}")
-        with open(errors_path, "a") as f:
+        artifact = {
+            "step": step,
+            "error": str(e),
+            "traceback": tb,
+            "time": time.time(),
+            "partial_metrics": metrics_log[-5:] if metrics_log else [],
+        }
+        with open(errors_path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"step": step, "error": str(e)}) + "\n")
+        failure_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
+        print(f"[FAILURE ARTIFACT] Saved: {failure_path}")
         summary["status"] = "FAILED"
         summary["failure_reason"] = str(e)
+        summary["failure_traceback"] = tb
+        summary["outcome"] = OUTCOME_EXECUTION_ERROR
+        summary["exit_code"] = EXIT_EXECUTION_ERROR
     else:
-        summary["status"] = "INTERRUPTED" if interrupted else "COMPLETED"
+        if safety_stopped:
+            summary["status"] = "SAFETY_STOP"
+            summary["outcome"] = OUTCOME_SAFETY_STOP
+            summary["exit_code"] = EXIT_SAFETY_STOP
+        else:
+            summary["status"] = "INTERRUPTED" if interrupted else "COMPLETED"
 
-    # Checkpoint
-    ckpt_path = ckpt_dir / f"moe_{config_name}_step{step}.pt"
-    ckpt_start = time.time()
-    try:
-        torch.save({
-            "step": step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "loss": loss_val if "loss_val" in dir() else None,
-        }, ckpt_path)
-        ckpt_duration = time.time() - ckpt_start
-        print(f"\n[CHECKPOINT] Saved: {ckpt_path} ({ckpt_duration:.1f}s)")
-        summary["checkpoint_path"] = str(ckpt_path)
-        summary["checkpoint_size_mb"] = round(ckpt_path.stat().st_size / 1024**2, 1)
-        summary["checkpoint_save_duration_s"] = round(ckpt_duration, 2)
-    except Exception as e:
-        print(f"[CHECKPOINT] Failed: {e}")
+    # ── Stop thermal monitor and record health ──────────────────────────────────
+    _thermal_monitor.stop()
+    _thermal_health = _thermal_monitor.health_summary()
+    summary["thermal_monitor_healthy"] = _thermal_health["healthy"]
+    summary["thermal_peak_c"] = _thermal_health["peak_temperature_c"]
+    summary["thermal_warn_samples"] = _thermal_health["samples_at_or_above_warn_c"]
+    summary["thermal_stop_triggered"] = _thermal_health["safety_stop_triggered"]
+    summary["thermal_total_samples"] = _thermal_health["total_samples"]
+    # If monitor failed, override outcome to prevent PASS
+    if _thermal_health["monitor_failed"] and summary.get("outcome") == OUTCOME_PASS:
+        summary["outcome"] = OUTCOME_EXECUTION_ERROR
+        summary["exit_code"] = EXIT_EXECUTION_ERROR
+        summary["failure_reason"] = "Thermal monitor failed during training. PASS requires healthy monitor."
 
-    # MoE acceptance evaluation
-    last_metrics = metrics_log[-10:] if len(metrics_log) >= 10 else metrics_log
-    dropped_pct = 0.0  # Would come from model's capacity overflow counter
-    cv_vals = [m.get("utilization_cv") for m in last_metrics if m.get("utilization_cv") is not None]
-    avg_cv = sum(cv_vals) / len(cv_vals) if cv_vals else None
-    entropy_vals = [m.get("router_entropy_bits") for m in last_metrics if m.get("router_entropy_bits") is not None]
-    avg_entropy = sum(entropy_vals) / len(entropy_vals) if entropy_vals else None
+    # ── Checkpoint ────────────────────────────────────────────────────────────
+    if step > 0:
+        _ckpt_stem = safe_checkpoint_name(config_name)
+        ckpt_path = ckpt_dir / f"moe_{_ckpt_stem}_step{step}.pt"
+        ckpt_start = time.time()
+        try:
+            torch.save({
+                "step": step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": loss_val if step > 0 else None,
+            }, ckpt_path)
+            ckpt_duration = time.time() - ckpt_start
+            print(f"\n[CHECKPOINT] Saved: {ckpt_path} ({ckpt_duration:.1f}s)")
+            summary["checkpoint_path"] = str(ckpt_path)
+            summary["checkpoint_size_mb"] = round(ckpt_path.stat().st_size / 1024**2, 1)
+            summary["checkpoint_save_duration_s"] = round(ckpt_duration, 2)
+            summary["checkpoint_status"] = "saved"
+        except Exception as e:
+            print(f"[CHECKPOINT] Failed: {e}")
+            summary["checkpoint_status"] = f"failed: {e}"
 
-    acceptance = {
-        "no_persistent_inactive_expert": len([m for m in last_metrics if m.get("num_inactive_experts", 0) > 0]) == 0,
-        "dropped_token_pct_below_1": dropped_pct < MOE_ACCEPT["max_dropped_token_pct"],
-        "utilization_cv_acceptable": avg_cv is not None and avg_cv < MOE_ACCEPT["max_utilization_cv"],
-        "router_entropy_above_threshold": avg_entropy is not None and avg_entropy > MOE_ACCEPT["min_router_entropy_bits"],
-        "no_nan_inf": nan_inf_count == 0,
-        "checkpoint_saved": "checkpoint_path" in summary,
-        "loss_trend_downward": (
-            metrics_log[-1]["loss"] < metrics_log[0]["loss"]
-            if len(metrics_log) >= 2 else None
-        ),
-    }
+    # ── Acceptance evaluation ─────────────────────────────────────────────────
+    # Only evaluate if training completed or was interrupted (not FAILED/SAFETY_STOP)
+    if summary["status"] in ("COMPLETED", "INTERRUPTED"):
+        last_metrics_list = metrics_log[-10:] if len(metrics_log) >= 10 else metrics_log
+        # Aggregate the last-10-step router metrics
+        # Run 15: use explicit allowlist from router_metrics.ROUTER_METRIC_KEYS.
+        # The previous broad prefix filter (startswith "aux") silently removed
+        # auxiliary_load_balancing_loss, which is a required acceptance key.
+        # Only exact key TRAINING_LEVEL_EXCLUDE_KEY ("aux_loss") is excluded.
+        last_router_metrics_per_step = [
+            {k: v for k, v in m.items()
+             if k in ROUTER_METRIC_KEYS and k != TRAINING_LEVEL_EXCLUDE_KEY}
+            for m in last_metrics_list
+        ]
+        agg_last10 = aggregate_layer_metrics(last_router_metrics_per_step)
+        acceptance_result = evaluate_acceptance(
+            agg_last10,
+            window_description="last-10-steps",
+        )
 
-    wall_time = time.time() - start_wall
-    vram_final = _vram_stats(torch)
-    summary.update({
-        "steps_completed": step,
-        "nan_inf_count": nan_inf_count,
-        "oom_count": oom_count,
-        "total_tokens": total_tokens,
-        "wall_time_s": round(wall_time, 1),
-        "avg_tokens_per_sec": round(total_tokens / wall_time, 1) if wall_time > 0 else 0,
-        "peak_vram_allocated_gb": vram_final.get("max_allocated_gb"),
-        "first_loss": metrics_log[0]["loss"] if metrics_log else None,
-        "last_loss": metrics_log[-1]["loss"] if metrics_log else None,
-        "avg_aux_loss_last10": round(sum(m["aux_loss"] for m in last_metrics if m.get("aux_loss")) / max(1, len(last_metrics)), 6),
-        "avg_router_entropy_last10": round(avg_entropy, 4) if avg_entropy else None,
-        "avg_utilization_cv_last10": round(avg_cv, 4) if avg_cv else None,
-        "dropped_token_pct": dropped_pct,
-        "moe_acceptance": acceptance,
-        "moe_accepted": all(v for v in acceptance.values() if v is not None),
-    })
+        # Synthetic-only runs cannot PASS regardless of metrics
+        is_synthetic = "synthetic" in actual_data_mode.lower()
+        if is_synthetic and acceptance_result["outcome"] == OUTCOME_PASS:
+            acceptance_result["outcome"] = OUTCOME_NOT_ACCEPTED
+            acceptance_result["errors"].append(
+                "Synthetic data mode: a PASS requires real text data (Wikitext-2). "
+                "Re-run with --data-mode real or --data-mode auto."
+            )
+
+        outcome = acceptance_result["outcome"]
+        exit_code = {
+            OUTCOME_PASS:          EXIT_PASS,
+            OUTCOME_NOT_ACCEPTED:  EXIT_NOT_ACCEPTED,
+            OUTCOME_NOT_EVALUABLE: EXIT_NOT_EVALUABLE,
+        }.get(outcome, EXIT_NOT_EVALUABLE)
+
+        summary["outcome"] = outcome
+        summary["exit_code"] = exit_code
+        summary["moe_accepted"] = (outcome == OUTCOME_PASS)
+        summary["moe_acceptance"] = acceptance_result
+
+        # Aggregate scalar metrics for the summary
+        cv_vals = [m.get(K_UTILIZATION_CV) for m in last_metrics_list
+                   if m.get(K_UTILIZATION_CV) is not None]
+        entropy_vals = [m.get(K_ROUTER_ENTROPY) for m in last_metrics_list
+                        if m.get(K_ROUTER_ENTROPY) is not None]
+        avg_cv = sum(cv_vals) / len(cv_vals) if cv_vals else None
+        avg_entropy = sum(entropy_vals) / len(entropy_vals) if entropy_vals else None
+
+        summary.update({
+            "steps_completed": step,
+            "nan_inf_count": nan_inf_count,
+            "oom_count": oom_count,
+            "total_tokens": total_tokens,
+            "wall_time_s": round(time.time() - start_wall, 1),
+            "avg_tokens_per_sec": round(total_tokens / max(time.time() - start_wall, 1e-9), 1),
+            "peak_vram_allocated_gb": _vram_stats(torch).get("max_allocated_gb"),
+            "first_loss": metrics_log[0]["loss"] if metrics_log else None,
+            "last_loss": metrics_log[-1]["loss"] if metrics_log else None,
+            "avg_aux_loss_last10": round(
+                sum(m["aux_loss"] for m in last_metrics_list if m.get("aux_loss") is not None)
+                / max(1, sum(1 for m in last_metrics_list if m.get("aux_loss") is not None)),
+                6
+            ) if any(m.get("aux_loss") is not None for m in last_metrics_list) else None,
+            "avg_router_entropy_last10": round(avg_entropy, 6) if avg_entropy is not None else None,
+            "avg_utilization_cv_last10": round(avg_cv, 6) if avg_cv is not None else None,
+            "dropped_token_fraction": agg_last10.get(K_DROPPED_TOKEN_FRACTION, 0.0),
+        })
+    else:
+        # FAILED or SAFETY_STOP — fill in what we have
+        summary.update({
+            "steps_completed": step,
+            "nan_inf_count": nan_inf_count,
+            "oom_count": oom_count,
+            "total_tokens": total_tokens,
+            "wall_time_s": round(time.time() - start_wall, 1),
+            "moe_accepted": False,
+        })
 
     summary_path = output_dir / "moe_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, default=str))
-    print(f"\n[SUMMARY] Saved: {summary_path}")
-    print(f"[SUMMARY] MoE Accepted: {summary['moe_accepted']}")
-    for k, v in acceptance.items():
-        status = "✓" if v else ("?" if v is None else "✗")
-        print(f"  {status} {k}: {v}")
+    # Run 14: atomic write — write to .tmp then rename to prevent partial reads
+    _tmp_path = summary_path.with_suffix(".tmp")
+    _tmp_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    _tmp_path.replace(summary_path)
+    print(f"\n[SUMMARY] Saved (atomic): {summary_path}")
+    print(f"[SUMMARY] Outcome: {summary.get('outcome')} (exit {summary.get('exit_code')})")
+    print(f"[SUMMARY] MoE Accepted: {summary.get('moe_accepted', False)}")
+
+    if "moe_acceptance" in summary:
+        acc = summary["moe_acceptance"]
+        for k, v in acc.get("criteria", {}).items():
+            icon = "OK" if v.get("pass") else "FAIL"
+            print(f"  [{icon}] {k}")
+        for err in acc.get("errors", []):
+            print(f"  [!] {err}")
 
     return summary
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Jupiter Shot Laptop MoE CUDA Validation")
-    parser.add_argument("--config", default="laptop_moe_small")
+    parser.add_argument("--config", default="laptop_moe_8gb_safe",
+                        help="Config name under training/configs/ (without .yaml)")
     parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument("--confirmed", action="store_true")
-    parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--confirmed", action="store_true",
+                        help="Required to run >100 steps")
+    parser.add_argument(
+        "--data-mode",
+        choices=[DATA_MODE_REAL, DATA_MODE_SYNTHETIC, DATA_MODE_AUTO],
+        default=DATA_MODE_AUTO,
+        help=(
+            "real: Wikitext-2 only (halts if unavailable). "
+            "synthetic: random tokens (diagnostic only, cannot produce PASS). "
+            "auto: tries real, falls back to synthetic."
+        ),
+    )
+    # Legacy flag kept for backward compatibility with run_all_laptop_validation.bat
+    parser.add_argument("--synthetic", action="store_true",
+                        help="Alias for --data-mode synthetic (deprecated)")
     parser.add_argument("--thermal-warn", type=int, default=THERMAL_WARN_C)
     parser.add_argument("--thermal-stop", type=int, default=THERMAL_STOP_C)
-    parser.add_argument("--output-dir", default="benchmarks/results/laptop")
+    parser.add_argument("--output-dir", default="benchmarks/results/laptop",
+                        help="Directory for result artifacts")
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help=(
+            "Unique run identifier (e.g., 20260804_082957_UTC). "
+            "Embedded in moe_summary.json for artifact traceability. "
+            "Generated automatically if not provided."
+        ),
+    )
     args = parser.parse_args()
 
+    # Resolve --synthetic alias
+    if args.synthetic and args.data_mode == DATA_MODE_AUTO:
+        args.data_mode = DATA_MODE_SYNTHETIC
+
     if args.steps > 100 and not args.confirmed:
-        print(f"\n[CONFIRM] Running {args.steps} MoE steps. Type 'yes' to confirm: ", end="")
-        if input().strip().lower() != "yes":
-            print("[ABORTED]")
-            return 1
+        print(f"[CONFIRM] Running {args.steps} steps requires --confirmed flag.")
+        return EXIT_EXECUTION_ERROR
+
+    import datetime as _dt
+    import subprocess as _sp
+    run_id = args.run_id or _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+    print(f"[MOE] Run ID: {run_id}", flush=True)
+    # Collect git info for schema
+    try:
+        _branch = _sp.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=REPO_ROOT, stderr=_sp.DEVNULL, text=True
+        ).strip()
+        _commit = _sp.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT, stderr=_sp.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        _branch, _commit = "unknown", "unknown"
 
     try:
         summary = run_moe_validation(
             config_name=args.config,
             max_steps=args.steps,
-            synthetic=args.synthetic,
+            data_mode=args.data_mode,
             thermal_warn=args.thermal_warn,
             thermal_stop=args.thermal_stop,
             output_dir=Path(args.output_dir),
+            run_id=run_id,
+            branch=_branch,
+            commit=_commit,
         )
-        return 0 if summary["status"] in ("COMPLETED", "INTERRUPTED") else 1
-    except RuntimeError as e:
+        # Run 15: validate schema before writing final artifact
+        import json as _json
+        _schema_errors = validate_moe_artifact_schema(summary)
+        if _schema_errors:
+            print(f"[SCHEMA ERROR] moe_summary.json schema validation failed:")
+            for _e in _schema_errors:
+                print(f"  - {_e}")
+            # Write the artifact anyway so evidence is preserved, but return EXECUTION_ERROR
+            _write_artifact(Path(args.output_dir) / "moe_summary.json", summary, run_id)
+            return EXIT_EXECUTION_ERROR
+        _write_artifact(Path(args.output_dir) / "moe_summary.json", summary, run_id)
+        return int(summary.get("exit_code", EXIT_EXECUTION_ERROR))
+    except SystemExit as e:
+        # Thermal stop propagated as SystemExit
+        print(f"\n[SAFETY STOP] Exiting with code {EXIT_SAFETY_STOP}.")
+        return EXIT_SAFETY_STOP
+    except (RuntimeError, FileNotFoundError) as e:
         print(f"\n[FAIL] {e}")
-        return 1
+        return EXIT_EXECUTION_ERROR
 
 
 if __name__ == "__main__":

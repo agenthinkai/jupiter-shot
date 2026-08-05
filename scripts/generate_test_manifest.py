@@ -43,6 +43,8 @@ AUTHORIZED_TEST_FILES: list[str] = [
     "tests/test_run14_same_pass_provenance.py",
     "tests/test_run14_integration_contracts.py",
     "tests/test_run15_regression.py",
+    "tests/test_run15_manifest_verifier.py",
+    "tests/test_run15_utf8_reproducibility.py",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

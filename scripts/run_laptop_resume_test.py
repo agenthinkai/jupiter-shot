@@ -96,7 +96,7 @@ def run_resume_test(
     config_path = _res.resolved_path
     if not _res.exists:
         raise FileNotFoundError(format_missing_error(_res))
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     model_cfg = cfg.get("model", {})
@@ -225,7 +225,7 @@ def run_resume_test(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "resume_test.json"
-    out_path.write_text(json.dumps(result, indent=2))
+    out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"\n[RESUME TEST] {'PASS' if all_passed else 'FAIL'}")
     print(f"[RESUME TEST] Saved: {out_path}")
     return result
@@ -307,7 +307,7 @@ def main() -> int:
             ),
         })
         result_path = Path(args.output_dir) / "resume_result.json"
-        result_path.write_text(json.dumps(result, indent=2, default=str))
+        result_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
         return _exit
     except RuntimeError as e:
         print(f"\n[FAIL] {e}")
@@ -324,7 +324,7 @@ def main() -> int:
         try:
             Path(args.output_dir).mkdir(parents=True, exist_ok=True)
             (Path(args.output_dir) / "resume_result.json").write_text(
-                json.dumps(failure_artifact, indent=2)
+                json.dumps(failure_artifact, indent=2), encoding="utf-8"
             )
         except Exception:
             pass

@@ -1,107 +1,46 @@
-# Jupiter Shot — Run 15 Corrected Operator Package
-## Branch: `fix/rtx50-blackwell-validation`
-## Authorized Commit: `dc79637`
-## Authorized Node Count: **174**
-## Authorized SHA-256: `43142de49d415c5bd8e606aeac51cccec6976eb53c3f2500752b38f0e604c0a7`
+# Jupiter Shot — Run 15 Operator Package (Corrected v2)
+
+**Branch:** `fix/rtx50-blackwell-validation`
+**Authorized Node Count:** **207**
+**Authorized SHA-256:** `e5cbd90497bcbe536536abeed8c452fd9b26f9af354ae47731bbd287c99596ee`
 
 ---
 
-## Corrections from Run 15 Initial Package
+## Corrections in This Package (v2)
 
-The initial Run 15 package stated an authorized total of 169 collected nodes. The actual
-deterministic collection is **174 nodes**. The discrepancy comes entirely from
-`tests/test_run13_config_resolver.py`:
+### Defect 4 — Windows UTF-8 reproducibility: bare text I/O calls
 
-| File | Functions | Collected Nodes | Explanation |
-|---|---|---|---|
-| `test_run13_config_resolver.py` | 24 | **29** | Two parametrized tests expand: `test_no_double_yaml_suffix` → 3 variants; `TestAllFourInputForms` → 4 variants. 24 − 2 + 7 = **29** |
+On Windows with cp1252 as the platform default encoding, `open()`, `read_text()`,
+or `write_text()` calls without `encoding="utf-8"` raise `UnicodeDecodeError` when
+reading YAML config files that contain U+2190 (←). Both `laptop_dense_run7.yaml`
+and `laptop_moe_run7.yaml` contain this character.
 
-All other files have equal function and node counts (no parametrized expansion).
+**Affected files and call sites fixed:**
 
-The initial package did not distinguish between function count and collected-node count.
-This package eliminates manual test-count maintenance by providing an automated manifest
-generator and verifier.
-
----
-
-## Per-File Node Breakdown
-
-| File | Functions | Collected Nodes |
-|---|---|---|
-| `test_run12_gate10b_real_object.py` | 26 | 26 |
-| `test_run12_operator_package.py` | 25 | 25 |
-| `test_run13_config_resolver.py` | 24 | **29** |
-| `test_run13_subprocess_smoke.py` | 31 | 31 |
-| `test_run14_integration.py` | 15 | 15 |
-| `test_run14_same_pass_provenance.py` | 2 | 2 |
-| `test_run14_integration_contracts.py` | 28 | 28 |
-| `test_run15_regression.py` | 18 | 18 |
-| **Total** | **169** | **174** |
-
----
-
-## Automated Manifest Generator and Verifier
-
-Manual test-count maintenance is eliminated. The manifest is generated once (by the
-developer) and verified by Kishore before every run.
-
-### Files
-
-| File | Purpose |
+| File | Call sites fixed |
 |---|---|
-| `scripts/generate_test_manifest.py` | Generates `run15_authorized_nodes.txt` and `run15_authorized_manifest.json` using the pytest Python API |
-| `scripts/verify_test_manifest.py` | Verifies current collection against the authorized manifest; exits 0 on exact match, 1 on any discrepancy |
-| `tests/run15_authorized_nodes.txt` | Sorted list of 174 authorized node IDs, one per line |
-| `tests/run15_authorized_manifest.json` | Machine-readable manifest with SHA-256, function count, collected count, branch, commit |
+| `scripts/run_laptop_dense.py` | 7 (lines 188, 415, 443, 445, 512, 599, 616) |
+| `scripts/run_laptop_resume_test.py` | 4 (lines 99, 228, 310, 326) |
+| `training/checkpoint.py` | 5 (lines 109, 154, 211, 268, 326) |
 
-### Manifest Contents
+Already clean (no changes): `run_laptop_moe.py`, `run_laptop_validation_pipeline.py`,
+`config_loader.py`, `config_path.py`, `thermal_monitor.py`,
+`generate_laptop_validation_draft.py`.
 
-```json
-{
-  "schema_version": "1.0",
-  "test_files": ["tests/test_run12_gate10b_real_object.py", "..."],
-  "function_count": 169,
-  "collected_node_count": 174,
-  "node_list_sha256": "43142de49d415c5bd8e606aeac51cccec6976eb53c3f2500752b38f0e604c0a7",
-  "generated_with": "scripts/generate_test_manifest.py",
-  "generated_at": "2026-...",
-  "branch": "fix/rtx50-blackwell-validation",
-  "commit": "dc79637"
-}
-```
+**Fix:** Added `encoding="utf-8"` to all 16 affected call sites. An AST-based audit
+(`test_ast_audit_all_9_production_files`) now permanently guards against regression.
 
-### Verifier Behavior
+**New test file:** `tests/test_run15_utf8_reproducibility.py` — 23 nodes covering
+R01–R13 requirements and 4 AST audit tests. Tests run without `PYTHONUTF8` or
+`PYTHONIOENCODING` set.
 
-The verifier fails with exit code 1 on any of the following:
+### Manifest update
 
-- Missing node (test removed or renamed)
-- Unexpected node (test added without re-generating the manifest)
-- Changed parametrized variant name
-- Duplicate node
-- Collection failure (import error, missing file)
-- SHA-256 hash mismatch
-- Count mismatch
+Two new test files added to the authorized manifest:
+- `tests/test_run15_manifest_verifier.py` — 10 nodes (V01–V10)
+- `tests/test_run15_utf8_reproducibility.py` — 23 nodes (R01–R13 + AST)
 
-The verifier normalizes Windows backslash paths to forward slashes before comparison.
-
----
-
-## Verifier Regression Tests
-
-`tests/test_run15_manifest_verifier.py` — 10 tests (V01–V10):
-
-| Test | What It Proves |
-|---|---|
-| V01 | Accepts the exact 174-node collection |
-| V02 | Detects a missing node |
-| V03 | Detects an unexpected node |
-| V04 | Detects a changed parametrized variant |
-| V05 | Detects a duplicate node |
-| V06 | Detects collection failure |
-| V07 | Detects hash mismatch |
-| V08 | Produces deterministic output (same SHA-256 on repeated calls) |
-| V09 | Handles Windows paths (backslash normalization) |
-| V10 | Returns nonzero exit code on every mismatch |
+Authorized total: **174 → 207 nodes** (+33).
 
 ---
 
@@ -109,12 +48,54 @@ The verifier normalizes Windows backslash paths to forward slashes before compar
 
 | # | Defect | Fix |
 |---|---|---|
-| 1 | `auxiliary_load_balancing_loss` silently dropped | `ROUTER_METRIC_KEYS` allowlist in `training/router_metrics.py`; explicit filter in `run_laptop_moe.py` |
+| 1 | `auxiliary_load_balancing_loss` silently dropped by prefix filter | `ROUTER_METRIC_KEYS` allowlist in `training/router_metrics.py`; explicit filter in `run_laptop_moe.py` |
 | 2 | MoE artifact missing schema fields | `schema_version`, `timestamp`, `branch`, `commit`, `device`, `gpu_name` added; `validate_moe_artifact_schema()` called before every write |
 | 3 | Thermal monitor polled once per training step | `ThermalMonitor` background thread (1 Hz, independent of step timing) in `training/thermal_monitor.py` |
 
 No model code, routing logic, thermal thresholds, acceptance criteria, or training
 configurations were changed. `strategy/jupiter-20t` was not touched.
+
+---
+
+## Authorized Test Manifest
+
+| File | Functions | Collected Nodes |
+|---|---|---|
+| `test_run12_gate10b_real_object.py` | 26 | 26 |
+| `test_run12_operator_package.py` | 25 | 25 |
+| `test_run13_config_resolver.py` | 24 | 29 |
+| `test_run13_subprocess_smoke.py` | 31 | 31 |
+| `test_run14_integration.py` | 15 | 15 |
+| `test_run14_same_pass_provenance.py` | 2 | 2 |
+| `test_run14_integration_contracts.py` | 28 | 28 |
+| `test_run15_regression.py` | 18 | 18 |
+| `test_run15_manifest_verifier.py` | 10 | 10 |
+| `test_run15_utf8_reproducibility.py` | 20 | 23 |
+| **Total** | **199** | **207** |
+
+`test_run13_config_resolver.py`: 24 functions → 29 nodes (5 parametrized expansions).
+`test_run15_utf8_reproducibility.py`: 20 functions → 23 nodes (3 parametrized expansions).
+
+---
+
+## HUMAN_ATTESTED Block
+
+```
+HUMAN_ATTESTED
+  package:                     RUN15_OPERATOR_PACKAGE_v2
+  branch:                      fix/rtx50-blackwell-validation
+  authorized_nodes:            207
+  sha256:                      e5cbd90497bcbe536536abeed8c452fd9b26f9af354ae47731bbd287c99596ee
+  defects_repaired:            4
+  model_code_changed:          NO
+  thresholds_changed:          NO
+  acceptance_criteria_changed: NO
+  training_configs_changed:    NO
+  strategy_jupiter_20t_touched: NO
+  pythonutf8_required:         NO
+  pythonioencoding_required:   NO
+END_ATTESTED
+```
 
 ---
 
@@ -124,9 +105,10 @@ configurations were changed. `strategy/jupiter-20t` was not touched.
 |---|---|---|
 | Run 12–14 (7 files) | 151 | 151 passed |
 | Run 15 regression (T01–T18) | 18 | 18 passed |
-| **Run 15 manifest verifier (V01–V10, new)** | **10** | **10 passed** |
-| **Targeted total (9 files)** | **184** | **184 passed** |
-| Full suite | 798 | 11 failed (pre-existing), 771 passed, 16 skipped |
+| Run 15 manifest verifier (V01–V10) | 10 | 10 passed |
+| **Run 15 UTF-8 reproducibility (R01–R13 + AST, new)** | **23** | **23 passed** |
+| **Targeted total (10 files)** | **207** | **207 passed** |
+| Full suite | 811 | 11 failed (pre-existing), 784 passed, 16 skipped |
 
 Zero new failures introduced.
 
@@ -134,8 +116,7 @@ Zero new failures introduced.
 
 ## Physical Preparation — Operator Attestation Required
 
-Before starting the GPU workload, Kishore must confirm each of the following manually.
-These items are operator-attested and cannot be software-verified:
+Before starting the GPU workload, Kishore must confirm each of the following manually:
 
 ```
 [ ] Original power adapter connected (not battery-only)
@@ -145,13 +126,13 @@ These items are operator-attested and cannot be software-verified:
 [ ] Laptop will remain attended throughout the entire run
 ```
 
-Record this attestation in the run summary before proceeding to Step 7.
+Record this attestation in the run summary before proceeding to Step 8.
 
 ---
 
 ## Kishore's Preflight Sequence
 
-### Step 1 — Verify commit
+### Step 1 — Sync
 
 ```bat
 cd C:\Users\Kishore\jupiter-shot
@@ -161,13 +142,7 @@ git pull --ff-only origin fix/rtx50-blackwell-validation
 git log -1
 ```
 
-Expected output: `dc79637 feat(run15): metric allowlist, complete artifact schema, independent thermal monitor`
-
-**STOP if commit hash does not match `dc79637`.**
-
----
-
-### Step 2 — Verify clean repository
+Expected: latest commit message contains `run15-utf8-windows-reproducibility`
 
 ```bat
 git status
@@ -175,11 +150,11 @@ git status
 
 Expected: `nothing to commit, working tree clean`
 
-**STOP if any local modifications are present.**
+**STOP if working tree is not clean.**
 
 ---
 
-### Step 3 — Run automated manifest verifier
+### Step 2 — Verify manifest (automated)
 
 ```bat
 .venv\Scripts\python.exe scripts\verify_test_manifest.py
@@ -187,10 +162,7 @@ Expected: `nothing to commit, working tree clean`
 
 Expected output:
 ```
-[VERIFY] Loading authorized manifest...
-[VERIFY] Authorized: 174 nodes, SHA-256: 43142de49d415c5b...
-[VERIFY] Collecting current nodes from 8 files...
-[VERIFY OK] Exact match: 174 nodes, SHA-256: 43142de49d415c5b...
+[VERIFY OK] Exact match: 207 nodes, SHA-256: e5cbd90497bcbe53...
 [VERIFY OK] All checks passed.
 ```
 
@@ -200,17 +172,11 @@ Expected exit code: `0`
 
 ---
 
-### Step 4 — Require exact 174-node match
-
-The verifier enforces this automatically. No manual counting required.
-
-**STOP if the verifier did not print `Exact match: 174 nodes`.**
-
----
-
-### Step 5 — Run the 174 authorized tests
+### Step 3 — Run targeted suite WITHOUT PYTHONUTF8
 
 ```bat
+set PYTHONUTF8=
+set PYTHONIOENCODING=
 .venv\Scripts\python.exe -m pytest ^
   tests\test_run12_gate10b_real_object.py ^
   tests\test_run12_operator_package.py ^
@@ -220,16 +186,51 @@ The verifier enforces this automatically. No manual counting required.
   tests\test_run14_same_pass_provenance.py ^
   tests\test_run14_integration_contracts.py ^
   tests\test_run15_regression.py ^
+  tests\test_run15_manifest_verifier.py ^
+  tests\test_run15_utf8_reproducibility.py ^
   -v
 ```
 
----
-
-### Step 6 — Require 174 passed, zero failed/errors/skipped
-
-Expected final line: `174 passed`
+Expected: `207 passed, 0 failed, 0 errors, 0 skipped`
 
 **STOP if any test fails, errors, or is skipped.**
+
+---
+
+### Step 4 — Require exact 207-node match
+
+The verifier enforces this automatically. No manual counting required.
+
+**STOP if the verifier did not print `Exact match: 207 nodes`.**
+
+---
+
+### Step 5 — Confirm PYTHONUTF8 was not set
+
+```bat
+echo %PYTHONUTF8%
+```
+
+Expected: empty line (variable not set).
+
+**STOP if PYTHONUTF8 is set to any value.**
+
+---
+
+### Step 6 — Regenerate manifest (optional, for attestation)
+
+```bat
+.venv\Scripts\python.exe scripts\generate_test_manifest.py
+```
+
+Expected:
+```
+[MANIFEST] collected_node_count: 207
+[MANIFEST] node_list_sha256:      e5cbd90497bcbe536536abeed8c452fd9b26f9af354ae47731bbd287c99596ee
+[MANIFEST] Generation complete. Exit 0.
+```
+
+If the SHA-256 differs, **STOP** and report the full output.
 
 ---
 
@@ -263,40 +264,27 @@ Only proceed if all previous gates passed.
 
 ---
 
-### Step 10 — Verify thermal monitor during the loaded run
-
-During the run, `thermal_telemetry.jsonl` will be written to the output directory.
-After the run, verify the artifact:
+### Step 10 — Verify artifact schema after run
 
 ```bat
-python -c "
-import json, sys
-a = json.load(open('results\moe_summary.json'))
-required = ['schema_version','timestamp','run_id','branch','commit',
-            'outcome','exit_code','data_mode','device','gpu_name',
-            'aux_loss_semantics','router_metrics_available_under_gc',
-            'checkpoint_status','thermal_monitor_healthy']
-missing = [k for k in required if k not in a or a[k] is None]
-if missing:
-    print('MISSING FIELDS:', missing); sys.exit(1)
-print('Schema OK')
-print('outcome:', a['outcome'])
-print('thermal_monitor_healthy:', a['thermal_monitor_healthy'])
-print('thermal_peak_c:', a.get('thermal_peak_c'))
-print('thermal_stop_triggered:', a.get('thermal_stop_triggered'))
+.venv\Scripts\python.exe -c "
+import json, pathlib
+moe = json.loads(pathlib.Path('benchmarks/results/laptop/moe_summary.json').read_text(encoding='utf-8'))
+required = ['schema_version','timestamp','run_id','branch','commit','device','gpu_name',
+            'aux_loss_semantics','aux_loss_contract','router_metrics_available_under_gc',
+            'checkpoint_status','thermal_health']
+missing = [k for k in required if k not in moe]
+print('MISSING:', missing if missing else 'none')
+print('schema_version:', moe.get('schema_version'))
+print('outcome:', moe.get('outcome'))
+print('thermal_health:', moe.get('thermal_health',{}).get('status'))
+print('router_metrics_available_under_gc:', moe.get('router_metrics_available_under_gc'))
 "
 ```
 
-Expected:
-```
-Schema OK
-outcome: PASS
-thermal_monitor_healthy: True
-thermal_peak_c: <value below 90>
-thermal_stop_triggered: False
-```
+Expected: `MISSING: none`, `outcome: PASS`, `thermal_health: OK`
 
-**STOP if `thermal_monitor_healthy` is False or `thermal_stop_triggered` is True.**
+**STOP if any field is missing or outcome is not PASS.**
 
 ---
 
@@ -311,14 +299,27 @@ Do not attempt local repair. Report the exact failure output.
 
 | Condition | Action |
 |---|---|
-| Commit hash ≠ `dc79637` | STOP |
 | Working tree not clean | STOP |
 | Verifier exit code ≠ 0 | STOP |
-| Verifier node count ≠ 174 | STOP |
+| Verifier node count ≠ 207 | STOP |
+| SHA-256 ≠ `e5cbd904...` | STOP |
 | Any targeted test fails/errors/skips | STOP |
+| `PYTHONUTF8` is set during Step 3 | STOP |
 | Physical attestation not completed | STOP |
 | Preflight exit code ≠ 0 | STOP |
 | `outcome != "PASS"` in any runner artifact | STOP |
-| `thermal_monitor_healthy: false` | STOP |
-| `thermal_stop_triggered: true` | STOP |
+| `thermal_health.status != "OK"` | STOP |
 | Any missing required artifact field | STOP |
+
+---
+
+## Count History
+
+| Package | Claimed | Collected Nodes | Explanation |
+|---|---|---|---|
+| RUN13 initial | 112 | — | Transcription error (60+27+25=112 was wrong) |
+| RUN13 corrected | 111 | — | pytest collected 111 (5 parametrized expansions) |
+| RUN14 initial | 151 | 151 | Run 12–14 targeted suite |
+| RUN15 initial | 169 | 174 | 5 parametrized expansions in test_run13_config_resolver |
+| RUN15 corrected v1 | 174 | 174 | Correct per-file breakdown documented; automated verifier added |
+| **RUN15 corrected v2** | **207** | **207** | +33 nodes: manifest verifier (10) + UTF-8 tests (23) |

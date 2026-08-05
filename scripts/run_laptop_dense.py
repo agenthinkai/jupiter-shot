@@ -185,7 +185,7 @@ def run_dense_validation(
     config_path = _res.resolved_path
     if not _res.exists:
         raise FileNotFoundError(format_missing_error(_res))
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     model_cfg = cfg.get("model", {})
@@ -412,7 +412,7 @@ def run_dense_validation(
             metrics_log.append(metric)
 
             if step % METRIC_FLUSH_INTERVAL == 0 or step == 1:
-                with open(metrics_path, "a") as f:
+                with open(metrics_path, "a", encoding="utf-8") as f:
                     for m in metrics_log[-METRIC_FLUSH_INTERVAL:]:
                         f.write(json.dumps(m) + "\n")
 
@@ -440,9 +440,9 @@ def run_dense_validation(
             "time": time.time(),
             "partial_metrics": metrics_log[-5:] if metrics_log else [],
         }
-        with open(errors_path, "a") as f:
+        with open(errors_path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"step": step, "error": str(e), "time": time.time()}) + "\n")
-        failure_path.write_text(json.dumps(artifact, indent=2, default=str))
+        failure_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
         print(f"[FAILURE ARTIFACT] Saved: {failure_path}")
         summary["status"] = "FAILED"
         summary["failure_reason"] = str(e)
@@ -509,7 +509,7 @@ def run_dense_validation(
     # timestamp is written by main() after run_id is known
 
     summary_path = output_dir / "dense_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, default=str))
+    summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     print(f"\n[SUMMARY] Saved: {summary_path}")
     print(f"[SUMMARY] Status: {summary['status']}")
     print(f"[SUMMARY] Steps: {summary['steps_completed']}/{max_steps}")
@@ -596,7 +596,7 @@ def main() -> int:
         summary["run_id"]    = run_id
         summary["timestamp"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
         summary_path = Path(args.output_dir) / "dense_summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2, default=str))
+        summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
         # Return the semantic exit_code written by run_dense_validation()
         return int(summary.get("exit_code", EXIT_EXECUTION_ERROR))
     except (RuntimeError, FileNotFoundError) as e:
@@ -614,7 +614,7 @@ def main() -> int:
         try:
             Path(args.output_dir).mkdir(parents=True, exist_ok=True)
             (Path(args.output_dir) / "dense_summary.json").write_text(
-                json.dumps(failure_artifact, indent=2)
+                json.dumps(failure_artifact, indent=2), encoding="utf-8"
             )
         except Exception:
             pass

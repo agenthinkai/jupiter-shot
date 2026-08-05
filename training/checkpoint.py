@@ -106,7 +106,7 @@ def save_checkpoint(
     if is_main:
         torch.save(state_dict, model_path)
         integrity_hash = _sha256_file(model_path)
-        (checkpoint_dir / "INTEGRITY.sha256").write_text(integrity_hash)
+        (checkpoint_dir / "INTEGRITY.sha256").write_text(integrity_hash, encoding="utf-8")
         logger.info(f"Model saved: {model_path} (SHA-256: {integrity_hash[:16]}...)")
 
     # ── Optimizer state ───────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ def save_checkpoint(
         training_state["extra"] = extra_state
 
     if is_main:
-        with open(checkpoint_dir / "training_state.json", "w") as f:
+        with open(checkpoint_dir / "training_state.json", "w", encoding="utf-8") as f:
             json.dump(training_state, f, indent=2, default=str)
 
     # ── Update 'latest' symlink ───────────────────────────────────────────────
@@ -208,7 +208,7 @@ def load_checkpoint(
     integrity_path = checkpoint_dir / "INTEGRITY.sha256"
 
     if verify_integrity and integrity_path.exists():
-        expected_hash = integrity_path.read_text().strip()
+        expected_hash = integrity_path.read_text(encoding="utf-8").strip()
         actual_hash = _sha256_file(model_path)
         if expected_hash != actual_hash:
             raise RuntimeError(
@@ -265,7 +265,7 @@ def load_checkpoint(
     state_path = checkpoint_dir / "training_state.json"
     training_state = {}
     if state_path.exists():
-        with open(state_path) as f:
+        with open(state_path, encoding="utf-8") as f:
             training_state = json.load(f)
         logger.info(
             f"Resumed from step={training_state.get('global_step', 0)}, "
@@ -323,7 +323,7 @@ def _is_valid_checkpoint(checkpoint_dir: Path) -> bool:
     model_path = checkpoint_dir / "model.pt"
     if integrity_path.exists():
         try:
-            expected = integrity_path.read_text().strip()
+            expected = integrity_path.read_text(encoding="utf-8").strip()
             actual = _sha256_file(model_path)
             return expected == actual
         except Exception:

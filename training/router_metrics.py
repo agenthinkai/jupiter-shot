@@ -179,6 +179,38 @@ REQUIRED_ACCEPTANCE_KEYS: tuple[str, ...] = (
     K_NUM_EXPERTS,
 )
 
+# All router-metric keys produced by compute_router_metrics().
+# Use this allowlist to extract router metrics from per-step records.
+# Never use broad string-prefix filters — they silently remove required keys
+# (e.g. "aux" prefix removes auxiliary_load_balancing_loss).
+ROUTER_METRIC_KEYS: frozenset[str] = frozenset((
+    K_ROUTER_ENTROPY,
+    K_EXPERT_ASSIGNMENT_COUNTS,
+    K_EXPERT_ASSIGNMENT_FRACTIONS,
+    K_TOKEN_ROUTING_FRACTIONS,
+    K_MINIMUM_EXPERT_FRACTION,
+    K_MAXIMUM_EXPERT_FRACTION,
+    K_UTILIZATION_MEAN,
+    K_UTILIZATION_STD,
+    K_UTILIZATION_CV,
+    K_MAX_MIN_RATIO,
+    K_NUM_INACTIVE_EXPERTS,
+    K_INACTIVE_EXPERT_INDICES,
+    K_DROPPED_TOKEN_COUNT,
+    K_DROPPED_TOKEN_FRACTION,
+    K_OVERFLOW_TOKEN_COUNT,
+    K_OVERFLOW_TOKEN_FRACTION,
+    K_AUX_LOAD_BALANCING_LOSS,
+    K_ROUTER_Z_LOSS,
+    K_CAPACITY_FACTOR,
+    K_EXPERTS_PER_TOKEN,
+    K_NUM_EXPERTS,
+))
+
+# The only training-level scalar that must be excluded from router aggregation.
+# Use exact-key exclusion, never a prefix filter.
+TRAINING_LEVEL_EXCLUDE_KEY = "aux_loss"
+
 # ── Acceptance thresholds ─────────────────────────────────────────────────────
 
 ACCEPT_MAX_DROPPED_TOKEN_FRACTION = 0.01   # < 1%

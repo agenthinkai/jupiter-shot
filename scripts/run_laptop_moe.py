@@ -134,6 +134,78 @@ def get_real_text_batch(tokenizer: Any, texts: list[str], seq_len: int, device: 
     return enc["input_ids"].to(device)
 
 
+# Run 15: required fields for a schema-valid MoE artifact
+_MOE_SCHEMA_REQUIRED_FIELDS: tuple[str, ...] = (
+    "schema_version",
+    "timestamp",
+    "run_id",
+    "branch",
+    "commit",
+    "outcome",
+    "exit_code",
+    "data_mode",
+    "device",
+    "gpu_name",
+    "aux_loss_semantics",
+    "router_metrics_available_under_gc",
+    "checkpoint_status",
+)
+
+
+def validate_moe_artifact_schema(artifact: dict) -> list[str]:
+    """
+    Validate the MoE artifact schema.
+    Returns a list of error strings (empty = valid).
+    PASS requires schema_version == '1.0' and a timezone-aware UTC timestamp.
+    """
+    import datetime as _dt_v
+    errors: list[str] = []
+    # Check required fields are present and non-None
+    for field in _MOE_SCHEMA_REQUIRED_FIELDS:
+        if field not in artifact or artifact[field] is None:
+            errors.append(f"Missing or null required field: '{field}'")
+    # schema_version must be '1.0'
+    sv = artifact.get("schema_version")
+    if sv is not None and sv != "1.0":
+        errors.append(f"schema_version must be '1.0', got {sv!r}")
+    # timestamp must be a timezone-aware UTC ISO-8601 string
+    ts = artifact.get("timestamp")
+    if ts is not None:
+        try:
+            parsed = _dt_v.datetime.fromisoformat(str(ts))
+            if parsed.tzinfo is None:
+                errors.append(
+                    f"timestamp is not timezone-aware: {ts!r}. "
+                    "Must be UTC ISO-8601 with timezone info."
+                )
+        except (ValueError, TypeError):
+            errors.append(f"timestamp is not a valid ISO-8601 string: {ts!r}")
+    return errors
+
+
+def _write_artifact(summary_path: Path, summary: dict, run_id: str) -> None:
+    """
+    Atomically write the MoE summary artifact.
+    Rejects stale artifacts (run_id mismatch) with a warning.
+    """
+    import json as _json
+    if summary_path.exists():
+        try:
+            existing = _json.loads(summary_path.read_text(encoding="utf-8"))
+            existing_run_id = existing.get("run_id")
+            if existing_run_id and existing_run_id != run_id:
+                print(
+                    f"[ARTIFACT WARNING] Stale artifact detected: "
+                    f"existing run_id={existing_run_id!r} != current run_id={run_id!r}. "
+                    f"Overwriting with current run."
+                )
+        except Exception:
+            pass
+    _tmp = summary_path.with_suffix(".tmp")
+    _tmp.write_text(_json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    _tmp.replace(summary_path)
+
+
 def run_moe_validation(
     config_name: str,
     max_steps: int = 100,
@@ -142,6 +214,9 @@ def run_moe_validation(
     thermal_stop: int = THERMAL_STOP_C,
     output_dir: Path = RESULTS_DIR,
     ckpt_dir: Path = CKPT_DIR,
+    run_id: Optional[str] = None,
+    branch: str = "unknown",
+    commit: str = "unknown",
 ) -> dict:
     """
     Run MoE laptop validation.
@@ -168,6 +243,8 @@ def run_moe_validation(
         K_UTILIZATION_CV,
         K_NUM_INACTIVE_EXPERTS,
         K_DROPPED_TOKEN_FRACTION,
+        ROUTER_METRIC_KEYS,
+        TRAINING_LEVEL_EXCLUDE_KEY,
     )
 
     if not torch.cuda.is_available():
@@ -305,7 +382,26 @@ def run_moe_validation(
     total_tokens = 0
     step_times: list[float] = []
 
+    import datetime as _dt_inner
+    _run_id = run_id or _dt_inner.datetime.now(_dt_inner.timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+    _timestamp = _dt_inner.datetime.now(_dt_inner.timezone.utc).isoformat()
+    # Detect GPU name for schema
+    _gpu_name: Optional[str] = None
+    try:
+        import torch as _torch_schema
+        if _torch_schema.cuda.is_available():
+            _gpu_name = _torch_schema.cuda.get_device_name(0)
+    except Exception:
+        pass
     summary: dict[str, Any] = {
+        # Run 15: complete schema-valid artifact fields
+        "schema_version": "1.0",
+        "timestamp": _timestamp,
+        "run_id": _run_id,
+        "branch": branch,
+        "commit": commit,
+        "device": "cuda",
+        "gpu_name": _gpu_name,
         "config": config_name,
         "data_mode": actual_data_mode,
         "total_params": total_params,
@@ -327,7 +423,18 @@ def run_moe_validation(
             "Weighting applied INSIDE TopKRouter.forward(). No second multiplication in MoETransformer."
         ),
         "router_metrics_available_under_gc": True,
+        "checkpoint_status": None,
     }
+
+    # Run 15: start independent high-frequency thermal monitor
+    from training.thermal_monitor import ThermalMonitor
+    _thermal_monitor = ThermalMonitor(
+        run_dir=output_dir,
+        run_id=_run_id,
+        warn_c=thermal_warn,
+        stop_c=thermal_stop,
+    )
+    _thermal_monitor.start()
 
     model.train()
     optimizer.zero_grad()
@@ -337,7 +444,21 @@ def run_moe_validation(
             if interrupted:
                 break
 
+            # Poll the independent thermal monitor (non-blocking)
+            if _thermal_monitor.stop_requested:
+                safety_stopped = True
+                print(f"[THERMAL STOP] Independent monitor signalled SAFETY_STOP at step {step}.")
+                break
+            if _thermal_monitor.monitor_failed:
+                # Monitor health is required — treat as execution error
+                summary["status"] = "FAILED"
+                summary["outcome"] = OUTCOME_EXECUTION_ERROR
+                summary["exit_code"] = EXIT_EXECUTION_ERROR
+                summary["failure_reason"] = "Thermal monitor failed unexpectedly during training."
+                break
+
             step_start = time.time()
+            # Keep per-step thermal check as a secondary guard
             try:
                 _check_thermal(step, thermal_warn, thermal_stop)
             except SystemExit:
@@ -486,6 +607,20 @@ def run_moe_validation(
         else:
             summary["status"] = "INTERRUPTED" if interrupted else "COMPLETED"
 
+    # ── Stop thermal monitor and record health ──────────────────────────────────
+    _thermal_monitor.stop()
+    _thermal_health = _thermal_monitor.health_summary()
+    summary["thermal_monitor_healthy"] = _thermal_health["healthy"]
+    summary["thermal_peak_c"] = _thermal_health["peak_temperature_c"]
+    summary["thermal_warn_samples"] = _thermal_health["samples_at_or_above_warn_c"]
+    summary["thermal_stop_triggered"] = _thermal_health["safety_stop_triggered"]
+    summary["thermal_total_samples"] = _thermal_health["total_samples"]
+    # If monitor failed, override outcome to prevent PASS
+    if _thermal_health["monitor_failed"] and summary.get("outcome") == OUTCOME_PASS:
+        summary["outcome"] = OUTCOME_EXECUTION_ERROR
+        summary["exit_code"] = EXIT_EXECUTION_ERROR
+        summary["failure_reason"] = "Thermal monitor failed during training. PASS requires healthy monitor."
+
     # ── Checkpoint ────────────────────────────────────────────────────────────
     if step > 0:
         _ckpt_stem = safe_checkpoint_name(config_name)
@@ -513,11 +648,13 @@ def run_moe_validation(
     if summary["status"] in ("COMPLETED", "INTERRUPTED"):
         last_metrics_list = metrics_log[-10:] if len(metrics_log) >= 10 else metrics_log
         # Aggregate the last-10-step router metrics
+        # Run 15: use explicit allowlist from router_metrics.ROUTER_METRIC_KEYS.
+        # The previous broad prefix filter (startswith "aux") silently removed
+        # auxiliary_load_balancing_loss, which is a required acceptance key.
+        # Only exact key TRAINING_LEVEL_EXCLUDE_KEY ("aux_loss") is excluded.
         last_router_metrics_per_step = [
-            {k: v for k, v in m.items() if not k.startswith(("step", "loss", "aux", "lr",
-                                                               "step_time", "tokens", "total",
-                                                               "allocated", "reserved", "max_",
-                                                               "gpu_temp"))}
+            {k: v for k, v in m.items()
+             if k in ROUTER_METRIC_KEYS and k != TRAINING_LEVEL_EXCLUDE_KEY}
             for m in last_metrics_list
         ]
         agg_last10 = aggregate_layer_metrics(last_router_metrics_per_step)
@@ -650,8 +787,21 @@ def main() -> int:
         return EXIT_EXECUTION_ERROR
 
     import datetime as _dt
+    import subprocess as _sp
     run_id = args.run_id or _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
     print(f"[MOE] Run ID: {run_id}", flush=True)
+    # Collect git info for schema
+    try:
+        _branch = _sp.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=REPO_ROOT, stderr=_sp.DEVNULL, text=True
+        ).strip()
+        _commit = _sp.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT, stderr=_sp.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        _branch, _commit = "unknown", "unknown"
 
     try:
         summary = run_moe_validation(
@@ -661,26 +811,21 @@ def main() -> int:
             thermal_warn=args.thermal_warn,
             thermal_stop=args.thermal_stop,
             output_dir=Path(args.output_dir),
+            run_id=run_id,
+            branch=_branch,
+            commit=_commit,
         )
-        # Embed run_id into the summary artifact for pipeline artifact validation
-        summary["run_id"] = run_id
+        # Run 15: validate schema before writing final artifact
         import json as _json
-        summary_path = Path(args.output_dir) / "moe_summary.json"
-        if summary_path.exists():
-            existing = _json.loads(summary_path.read_text())
-            # Run 14: stale artifact rejection — reject if run_id does not match
-            existing_run_id = existing.get("run_id")
-            if existing_run_id and existing_run_id != run_id:
-                print(
-                    f"[ARTIFACT WARNING] Stale artifact detected: "
-                    f"existing run_id={existing_run_id!r} != current run_id={run_id!r}. "
-                    f"Overwriting with current run."
-                )
-            existing["run_id"] = run_id
-            # Atomic write
-            _tmp = summary_path.with_suffix(".tmp")
-            _tmp.write_text(_json.dumps(existing, indent=2, default=str))
-            _tmp.replace(summary_path)
+        _schema_errors = validate_moe_artifact_schema(summary)
+        if _schema_errors:
+            print(f"[SCHEMA ERROR] moe_summary.json schema validation failed:")
+            for _e in _schema_errors:
+                print(f"  - {_e}")
+            # Write the artifact anyway so evidence is preserved, but return EXECUTION_ERROR
+            _write_artifact(Path(args.output_dir) / "moe_summary.json", summary, run_id)
+            return EXIT_EXECUTION_ERROR
+        _write_artifact(Path(args.output_dir) / "moe_summary.json", summary, run_id)
         return int(summary.get("exit_code", EXIT_EXECUTION_ERROR))
     except SystemExit as e:
         # Thermal stop propagated as SystemExit

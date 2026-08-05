@@ -1,0 +1,73 @@
+# Jupiter Seed 4B — Diagnostic QLoRA Training Configuration
+# Target hardware: RTX 5060 (8-16GB VRAM) or equivalent
+# COMPROMISE: QLoRA (4-bit base) + LoRA adapters to fit limited VRAM.
+# All compromises are flagged in training_runner.py.
+
+run_id: "seed4b-diagnostic-001"
+model_name_or_path: "Qwen/Qwen3-4B"
+# NOTE: Do not silently change this to a smaller model variant.
+
+output_dir: "artifacts/seed4b_diagnostic"
+logging_dir: "artifacts/seed4b_diagnostic/logs"
+
+# --- Data ---
+dataset_path: "data/diagnostic_seed.jsonl"
+max_seq_length: 512
+# COMPROMISE: Reduced from 2048 to 512 for RTX 5060 VRAM budget.
+
+# --- QLoRA ---
+load_in_4bit: true
+bnb_4bit_quant_type: "nf4"
+bnb_4bit_compute_dtype: "bfloat16"
+bnb_4bit_use_double_quant: true
+
+# --- LoRA ---
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+
+# --- Training ---
+num_train_epochs: 3
+per_device_train_batch_size: 1
+# COMPROMISE: Batch size 1 required for RTX 5060 VRAM budget.
+gradient_accumulation_steps: 8
+# Effective batch size = 1 * 8 = 8
+learning_rate: 2.0e-4
+lr_scheduler_type: "cosine"
+warmup_ratio: 0.05
+weight_decay: 0.01
+max_grad_norm: 1.0
+optim: "paged_adamw_8bit"
+# COMPROMISE: paged_adamw_8bit reduces optimizer memory pressure.
+
+# --- Checkpointing ---
+save_strategy: "steps"
+save_steps: 50
+save_total_limit: 3
+resume_from_checkpoint: null
+# Set to checkpoint path to resume.
+
+# --- Logging ---
+logging_steps: 10
+report_to: "none"
+# Do not report to W&B or any external service during diagnostic.
+
+# --- Reproducibility ---
+seed: 42
+data_seed: 42
+
+# --- Budget guard ---
+max_authorized_spend_usd: 500
+# Training runner will abort if estimated cost exceeds this.
+
+# --- Safety ---
+# NaN/Inf detection is enabled in training_runner.py.
+# OOM will trigger graceful checkpoint save before exit.

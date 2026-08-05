@@ -202,7 +202,10 @@ def test_evaluate_returns_mock_on_cpu() -> None:
         }
     ]
     result = evaluate_model("Qwen/Qwen3-4B", mock_examples, device="cpu")
-    assert result["evaluation_mode"] == "CPU_MOCK_DO_NOT_USE_AS_REAL_RESULTS"
+    # evaluation_mode must be MOCK (updated from CPU_MOCK_DO_NOT_USE_AS_REAL_RESULTS)
+    assert result["evaluation_mode"] == "MOCK"
+    assert result["authoritative"] is False
+    assert result["model_loaded"] is False
     assert "domain_scores" in result
 
 

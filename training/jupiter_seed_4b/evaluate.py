@@ -96,18 +96,35 @@ def _mock_evaluation(
     test_examples: List[Dict[str, Any]],
     adapter_path: Optional[Path],
 ) -> Dict[str, Any]:
-    """Return clearly labelled mock metrics for CPU smoke testing."""
+    """Return clearly labelled mock metrics for CPU smoke testing.
+
+    SAFETY CONTRACT:
+    - evaluation_mode must be 'MOCK'
+    - authoritative must be False
+    - model_loaded must be False
+    - publishable must be False
+    - acceptance_eligible must be False
+    - Mock results MUST NOT produce PASS or authorize training, release, or comparison claims.
+    """
     return {
         "model": model_id_or_path,
         "adapter": str(adapter_path) if adapter_path else None,
         "num_examples": len(test_examples),
-        "evaluation_mode": "CPU_MOCK_DO_NOT_USE_AS_REAL_RESULTS",
+        # --- SAFETY FIELDS (must never be changed to True by software) ---
+        "evaluation_mode": "MOCK",
+        "authoritative": False,
+        "model_loaded": False,
+        "publishable": False,
+        "acceptance_eligible": False,
+        # --- Scores are None; must never be used for comparison claims ---
         "domain_scores": {dim: None for dim in EVALUATION_DIMENSIONS},
         "performance_metrics": {m: None for m in PERFORMANCE_METRICS},
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "note": (
-            "These are mock results from a CPU smoke test. "
-            "Real evaluation requires GPU execution."
+            "MOCK RESULTS ONLY. CPU smoke test. No model was loaded. "
+            "These results are not authoritative and must not be used for "
+            "training decisions, release authorization, or comparison claims. "
+            "Real evaluation requires GPU execution with a loaded model."
         ),
     }
 
@@ -180,11 +197,33 @@ def _gpu_evaluation(
     avg_latency = sum(latencies) / max(len(latencies), 1)
     tokens_per_sec = 128 / (avg_latency / 1000) if avg_latency > 0 else 0
 
+    import subprocess
+    def _git_commit() -> str:
+        try:
+            r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+            return r.stdout.strip()
+        except Exception:
+            return "unknown"
+
     return {
         "model": model_id_or_path,
+        "model_revision": "main",
         "adapter": str(adapter_path) if adapter_path else None,
         "num_examples": len(test_examples),
+        # --- SAFETY FIELDS ---
         "evaluation_mode": "GPU",
+        "authoritative": True,
+        "model_loaded": True,
+        "publishable": False,  # Requires human sign-off before publication
+        "acceptance_eligible": True,
+        # --- Provenance ---
+        "device": str(model.device),
+        "precision": "bfloat16",
+        "quantization": "none" if adapter_path is None else "qlora_adapter",
+        "git_commit": _git_commit(),
+        "run_id": f"eval-{int(time.time())}",
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # --- Results ---
         "domain_scores": domain_scores,
         "performance_metrics": {
             "latency_ms": round(avg_latency, 2),
@@ -193,7 +232,6 @@ def _gpu_evaluation(
             "cpu_ram_mb": None,
             "quantized_model_size_mb": None,
         },
-        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
 

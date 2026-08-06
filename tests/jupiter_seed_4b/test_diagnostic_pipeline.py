@@ -105,7 +105,7 @@ def test_provenance_report_generation() -> None:
     try:
         records = load_dataset(tmp_path, strict=True)
         generate_provenance_report(records, report_path)
-        with report_path.open() as fh:
+        with report_path.open(encoding="utf-8") as fh:
             report = json.load(fh)
         assert report["total_records"] == 1
         assert report["provenance_coverage_pct"] == 100.0
@@ -149,7 +149,7 @@ def test_arabic_review_pipeline_writes_output() -> None:
         output_path = Path(tmpdir) / "review_results.jsonl"
         run_review(tmp_path, output_path, top_n_human=1)
         assert output_path.exists()
-        with output_path.open() as fh:
+        with output_path.open(encoding="utf-8") as fh:
             lines = [l for l in fh if l.strip()]
         assert len(lines) == 1
     tmp_path.unlink()
@@ -163,7 +163,7 @@ def test_training_config_loads() -> None:
     import yaml
     config_path = TRAINING_DIR / "configs" / "diagnostic_qlora.yaml"
     assert config_path.exists(), "Training config not found"
-    with config_path.open() as fh:
+    with config_path.open(encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
     assert cfg["model_name_or_path"] == "Qwen/Qwen3-4B", (
         "Base model must be Qwen/Qwen3-4B — do not silently change it"

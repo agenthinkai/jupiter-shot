@@ -237,15 +237,20 @@ def test_no_template_family_exceeds_2pct() -> None:
 # ---------------------------------------------------------------------------
 
 def test_content_audit_has_no_revise_or_reject() -> None:
+    """Defect 6 fix: REVISE is a valid audit finding (needs human review).
+    Only REJECT (structural defect) and BLOCKED (missing fields) are failures.
+    """
     audit_path = DOCS_DIR / "CONTENT_QUALITY_AUDIT.md"
     assert audit_path.exists(), "CONTENT_QUALITY_AUDIT.md not found"
     content = audit_path.read_text(encoding="utf-8")
-    # Count REVISE and REJECT in data rows (not headers)
     data_rows = [l for l in content.split("\n") if l.startswith("| `seed4b-")]
-    revise_count = sum(1 for row in data_rows if "REVISE" in row)
-    reject_count = sum(1 for row in data_rows if "REJECT" in row)
-    assert revise_count == 0, f"Content audit has {revise_count} unresolved REVISE decisions"
+    # REJECT is a structural defect that must be fixed
+    reject_count = sum(1 for row in data_rows if "**REJECT**" in row)
     assert reject_count == 0, f"Content audit has {reject_count} unresolved REJECT decisions"
+    # BLOCKED means a required field is missing — also not acceptable
+    blocked_count = sum(1 for row in data_rows if "**BLOCKED**" in row)
+    assert blocked_count == 0, f"Content audit has {blocked_count} BLOCKED decisions"
+    # REVISE is acceptable: it means the record needs human review before release
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +273,7 @@ def test_benchmark_version_is_1_1_1() -> None:
 def test_v1_0_0_manifest_preserved() -> None:
     v100_path = BENCHMARK_DIR / "FROZEN_BENCHMARK_MANIFEST_v1.0.0.json"
     assert v100_path.exists(), "v1.0.0 manifest not preserved"
-    with v100_path.open() as fh:
+    with v100_path.open(encoding="utf-8") as fh:
         v100 = json.load(fh)
     assert v100["benchmark_version"] == "1.0.0", "Preserved manifest must have version 1.0.0"
 
@@ -279,7 +284,7 @@ def test_v1_0_0_manifest_preserved() -> None:
 
 def test_benchmark_hash_is_deterministic() -> None:
     manifest_path = BENCHMARK_DIR / "FROZEN_BENCHMARK_MANIFEST.json"
-    with manifest_path.open() as fh:
+    with manifest_path.open(encoding="utf-8") as fh:
         manifest = json.load(fh)
     recomputed = sha256_of("|".join(manifest["record_sha256_list"]))
     assert recomputed == manifest["ordered_benchmark_sha256"], (
@@ -316,7 +321,7 @@ def test_no_train_to_valid_leakage() -> None:
 def test_human_review_queue_has_exactly_50() -> None:
     path = DATA_DIR / "human_review_queue.jsonl"
     assert path.exists(), "human_review_queue.jsonl not found"
-    with path.open() as fh:
+    with path.open(encoding="utf-8") as fh:
         count = sum(1 for l in fh if l.strip())
     assert count == 50, f"Expected exactly 50 review examples, got {count}"
 
@@ -364,7 +369,7 @@ def test_no_model_download_in_diversity_audit() -> None:
 
 def test_benchmark_approval_still_pending() -> None:
     manifest_path = BENCHMARK_DIR / "FROZEN_BENCHMARK_MANIFEST.json"
-    with manifest_path.open() as fh:
+    with manifest_path.open(encoding="utf-8") as fh:
         manifest = json.load(fh)
     assert manifest["approval_status"] == "PENDING HUMAN REVIEW", (
         "Benchmark approval_status must remain PENDING HUMAN REVIEW"

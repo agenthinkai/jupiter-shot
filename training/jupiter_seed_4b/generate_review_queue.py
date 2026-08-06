@@ -167,6 +167,14 @@ def generate_csv(records: List[Dict], output_path: Path) -> str:
         "prompt_language", "response_language",
         "task_type", "difficulty", "provenance_type",
         "source_name", "source_url",
+        # Defect 9: scenario_brief fields added
+        "scenario_brief",
+        "scenario_brief_task",
+        "scenario_brief_facts",
+        "scenario_brief_reasoning",
+        "scenario_brief_knowledge",
+        "scenario_brief_risk",
+        # Core content
         "prompt", "response",
         "arabic_character_count_prompt", "arabic_character_count_response",
         "arabic_ratio_prompt", "arabic_ratio_response",
@@ -183,6 +191,20 @@ def generate_csv(records: List[Dict], output_path: Path) -> str:
         if r.get("factuality_review_status") == "human_approved":
             flags.append("ILLEGAL_APPROVAL")
 
+        # Defect 9: extract scenario_brief sub-fields
+        sb = r.get("scenario_brief", "")
+        # scenario_brief may be a plain string or structured dict
+        if isinstance(sb, dict):
+            sb_text = sb.get("brief", str(sb))
+            sb_task = sb.get("task", "")
+            sb_facts = sb.get("facts", "")
+            sb_reasoning = sb.get("reasoning", "")
+            sb_knowledge = sb.get("knowledge", "")
+            sb_risk = sb.get("risk", "")
+        else:
+            sb_text = str(sb)
+            sb_task = sb_facts = sb_reasoning = sb_knowledge = sb_risk = ""
+
         row = {
             "example_id": r["example_id"],
             "split": r["split"],
@@ -195,6 +217,14 @@ def generate_csv(records: List[Dict], output_path: Path) -> str:
             "provenance_type": r.get("provenance_type", ""),
             "source_name": r.get("source_name", ""),
             "source_url": r.get("source_url", ""),
+            # Defect 9: scenario_brief fields
+            "scenario_brief": sb_text,
+            "scenario_brief_task": sb_task,
+            "scenario_brief_facts": sb_facts,
+            "scenario_brief_reasoning": sb_reasoning,
+            "scenario_brief_knowledge": sb_knowledge,
+            "scenario_brief_risk": sb_risk,
+            # Core content
             "prompt": r["prompt"],
             "response": r["response"],
             "arabic_character_count_prompt": r.get("arabic_character_count_prompt", 0),

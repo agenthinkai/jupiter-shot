@@ -105,7 +105,7 @@ def test_eval_has_exactly_150_examples() -> None:
 def test_human_review_queue_has_at_least_50_examples() -> None:
     path = DATA_DIR / "human_review_queue.jsonl"
     assert path.exists(), "human_review_queue.jsonl not found"
-    with path.open() as fh:
+    with path.open(encoding="utf-8") as fh:
         count = sum(1 for l in fh if l.strip())
     assert count >= 50, f"Expected at least 50 review examples, got {count}"
 
@@ -264,7 +264,7 @@ def test_frozen_benchmark_manifest_exists() -> None:
 
 def test_benchmark_manifest_has_correct_counts() -> None:
     manifest_path = BENCHMARK_DIR / "FROZEN_BENCHMARK_MANIFEST.json"
-    with manifest_path.open() as fh:
+    with manifest_path.open(encoding="utf-8") as fh:
         manifest = json.load(fh)
     assert manifest["valid_count"] == 16, f"Expected 16 valid, got {manifest['valid_count']}"
     assert manifest["eval_count"] == 17, f"Expected 17 eval, got {manifest['eval_count']}"
@@ -273,7 +273,7 @@ def test_benchmark_manifest_has_correct_counts() -> None:
 
 def test_benchmark_manifest_contamination_pass() -> None:
     manifest_path = BENCHMARK_DIR / "FROZEN_BENCHMARK_MANIFEST.json"
-    with manifest_path.open() as fh:
+    with manifest_path.open(encoding="utf-8") as fh:
         manifest = json.load(fh)
     assert manifest["contamination_check_result"] == "PASS", (
         f"Contamination check failed: {manifest.get('contamination_errors', [])}"
@@ -282,7 +282,7 @@ def test_benchmark_manifest_contamination_pass() -> None:
 
 def test_benchmark_manifest_approval_pending() -> None:
     manifest_path = BENCHMARK_DIR / "FROZEN_BENCHMARK_MANIFEST.json"
-    with manifest_path.open() as fh:
+    with manifest_path.open(encoding="utf-8") as fh:
         manifest = json.load(fh)
     assert manifest["approval_status"] == "PENDING HUMAN REVIEW", (
         "Manifest approval_status must be PENDING HUMAN REVIEW — software cannot approve"
@@ -292,7 +292,7 @@ def test_benchmark_manifest_approval_pending() -> None:
 def test_benchmark_manifest_hash_is_deterministic() -> None:
     """Re-compute the ordered hash from record_sha256_list and verify it matches."""
     manifest_path = BENCHMARK_DIR / "FROZEN_BENCHMARK_MANIFEST.json"
-    with manifest_path.open() as fh:
+    with manifest_path.open(encoding="utf-8") as fh:
         manifest = json.load(fh)
     record_hashes = manifest["record_sha256_list"]
     recomputed = sha256_of("|".join(record_hashes))

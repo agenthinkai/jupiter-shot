@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
 """
-Jupiter Seed 4B — Dataset Readiness Gate (12 Gates)
-=====================================================
-Evaluates the full dataset against 12 mandatory gates.
-No gate defaults to PASS. Every gate must explicitly pass.
+Jupiter Seed 4B — Dataset Readiness Gate (12 Gates) v2.1
+=========================================================
+Tooling-only repair: fixes Defects 1, 2, 4 from independent audit.
 
-Gates:
-  1.  Schema integrity
-  2.  Provenance integrity
-  3.  UTF-8 portability
-  4.  Language contract
-  5.  Raw duplication
-  6.  Canonical duplication
-  7.  Semantic leakage
-  8.  Content-family split isolation
-  9.  Review-representation identity
-  10. Benchmark manifest integrity
-  11. Test-suite result
-  12. Human-review status
+Defect 1 fix: Gate 11 uses sys.executable + JUnit XML, never python3/python.
+Defect 2 fix: Gate 3 UTF-8 audit covers both training/ and tests/ directories.
+Defect 4 fix: Gate 4 independently recomputes language contracts from text.
 
-Usage:
-    python3 readiness_gate.py --data-dir training/jupiter_seed_4b/data
-                              --output docs/jupiter_seed_4b/READINESS_GATE_REPORT.md
+Corpus is FROZEN. This file does not modify any dataset records.
 """
 
 from __future__ import annotations
@@ -29,12 +16,16 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import datetime
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -64,16 +55,28 @@ FAIL = "FAIL"
 NOT_READY = "NOT_READY"
 WARN = "WARN"
 
+# Authorized Seed 4B test files (must all be present and run)
+AUTHORIZED_TEST_FILES = [
+    "test_adversarial_fixtures.py",
+    "test_repair_audit.py",
+    "test_integrity_audit.py",
+    "test_gold_dataset.py",
+    "test_diagnostic_pipeline.py",
+    "test_foundation_audit.py",
+]
+
 
 class GateResult:
     def __init__(self, gate_id: int, name: str, status: str,
-                 details: str, warnings: List[str] = None, errors: List[str] = None):
+                 details: str, warnings: List[str] = None, errors: List[str] = None,
+                 metadata: Dict = None):
         self.gate_id = gate_id
         self.name = name
         self.status = status
         self.details = details
         self.warnings = warnings or []
         self.errors = errors or []
+        self.metadata = metadata or {}
 
     @property
     def passed(self) -> bool:
@@ -101,6 +104,49 @@ REVIEWER_JUDGMENT_FIELDS = [
     "domain_terminology_score", "factuality_score", "verdict",
     "corrected_wording", "rejection_reason", "comments",
 ]
+
+# ─── Language contract helpers (Defect 4) ────────────────────────────────
+
+def ar_char_count(text: str) -> int:
+    return len(re.findall(r"[\u0600-\u06FF]", str(text)))
+
+
+def en_char_count(text: str) -> int:
+    return len(re.findall(r"[a-zA-Z]", str(text)))
+
+
+def recompute_language_contract(lang: str, prompt: str, response: str) -> Tuple[bool, Dict]:
+    """
+    Independently recompute language contract from raw text.
+    Returns (passed: bool, evidence: dict).
+    """
+    ar_resp = ar_char_count(response)
+    en_resp = en_char_count(response)
+    combined_ar = ar_char_count(prompt + " " + response)
+    combined_en = en_char_count(prompt + " " + response)
+    resp_len = max(len(response.replace(" ", "")), 1)
+    ar_ratio = ar_resp / resp_len
+
+    evidence = {
+        "ar_chars_response": ar_resp,
+        "en_chars_response": en_resp,
+        "ar_chars_combined": combined_ar,
+        "en_chars_combined": combined_en,
+        "ar_ratio_response": round(ar_ratio, 4),
+    }
+
+    if lang == "ar":
+        passed = ar_resp >= 30 and ar_ratio >= 0.20
+    elif lang == "en":
+        passed = en_resp >= 30
+    elif lang == "ar-en":
+        passed = combined_ar >= 20 and combined_en >= 20
+    else:
+        passed = True  # Unknown language — not our contract to enforce
+
+    evidence["recomputed_passed"] = passed
+    return passed, evidence
+
 
 # ─── Blocking content patterns ────────────────────────────────────────────
 
@@ -175,81 +221,131 @@ def gate_provenance(records: List[Dict]) -> GateResult:
                       warnings=warnings[:5])
 
 
-# ─── Gate 3: UTF-8 portability ────────────────────────────────────────────
+# ─── Gate 3: UTF-8 portability (Defect 2 fix) ────────────────────────────
 
-def gate_utf8(data_dir: Path) -> GateResult:
-    """Test that Arabic content in JSONL files cannot be read under cp1252."""
-    errors = []
-    warnings = []
-
-    for split in ("train", "valid", "eval"):
-        path = data_dir / f"{split}.jsonl"
-        if not path.exists():
-            continue
-        # Try reading with cp1252 — should fail if Arabic is present
+def _check_utf8_in_dir(py_dir: Path, label: str) -> List[str]:
+    """
+    AST-based check for text I/O without explicit encoding= in a directory.
+    Covers: open(), Path.open(), .read_text(), .write_text()
+    """
+    violations = []
+    for path in sorted(py_dir.glob("*.py")):
         try:
-            content = path.read_bytes()
-            # Check if file contains Arabic bytes (UTF-8 encoded Arabic is multi-byte)
-            has_arabic = any(b >= 0xC0 for b in content)
-            if has_arabic:
-                try:
-                    content.decode("cp1252")
-                    # If cp1252 decoding succeeds, it means no multi-byte sequences
-                    # (unlikely with Arabic, but check)
-                    warnings.append(f"{split}.jsonl: cp1252 decode succeeded — verify Arabic content")
-                except UnicodeDecodeError:
-                    pass  # Expected: cp1252 cannot decode Arabic UTF-8 bytes
-            else:
-                warnings.append(f"{split}.jsonl: no multi-byte content found — may lack Arabic")
-        except Exception as e:
-            errors.append(f"{split}.jsonl: {e}")
-
-    # Check that all production Python files use explicit encoding
-    training_dir = data_dir.parent
-    py_files = list(training_dir.glob("*.py"))
-    for path in py_files:
-        if path.name.startswith("test_"):
+            source = path.read_text(encoding="utf-8")
+        except Exception:
             continue
-        source = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(source)
         except SyntaxError:
             continue
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func = node.func
-                kws = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
-                is_open = (isinstance(func, ast.Name) and func.id == "open") or \
-                          (isinstance(func, ast.Attribute) and func.attr in {"open", "read_text", "write_text"})
-                if is_open and "encoding" not in kws:
-                    errors.append(f"{path.name}:{node.lineno}: text I/O without explicit encoding")
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            kws = {kw.arg for kw in node.keywords if kw.arg is not None}
+            # Detect: open(...), Path.open(...), .open(...)
+            is_open_call = (
+                (isinstance(func, ast.Name) and func.id == "open") or
+                (isinstance(func, ast.Attribute) and func.attr == "open")
+            )
+            # Detect: .read_text(...), .write_text(...)
+            is_text_method = (
+                isinstance(func, ast.Attribute) and
+                func.attr in {"read_text", "write_text"}
+            )
+            if (is_open_call or is_text_method) and "encoding" not in kws:
+                violations.append(f"{label}/{path.name}:{node.lineno}")
+    return violations
+
+
+def gate_utf8(data_dir: Path) -> GateResult:
+    """
+    Defect 2 fix: covers both training/ and tests/ directories.
+    Runs with PYTHONUTF8 and PYTHONIOENCODING unset.
+    """
+    errors = []
+    warnings = []
+
+    # Check JSONL files contain Arabic bytes that fail cp1252
+    for split in ("train", "valid", "eval"):
+        path = data_dir / f"{split}.jsonl"
+        if not path.exists():
+            continue
+        content = path.read_bytes()
+        has_arabic = any(b >= 0xC0 for b in content)
+        if has_arabic:
+            try:
+                content.decode("cp1252")
+                warnings.append(f"{split}.jsonl: cp1252 decode succeeded — verify Arabic content")
+            except UnicodeDecodeError:
+                pass  # Expected
+        else:
+            warnings.append(f"{split}.jsonl: no multi-byte content found — may lack Arabic")
+
+    # Check production Python files (training/)
+    training_dir = data_dir.parent
+    errors.extend(_check_utf8_in_dir(training_dir, "training"))
+
+    # Check test Python files (tests/jupiter_seed_4b/) — Defect 2 fix
+    repo_root = training_dir.parent.parent
+    tests_dir = repo_root / "tests" / "jupiter_seed_4b"
+    if tests_dir.exists():
+        errors.extend(_check_utf8_in_dir(tests_dir, "tests"))
 
     if errors:
         return GateResult(3, "UTF-8 Portability", FAIL,
-                          f"{len(errors)} UTF-8 portability errors",
-                          warnings=warnings, errors=errors[:10])
+                          f"{len(errors)} UTF-8 portability errors (training + tests)",
+                          warnings=warnings, errors=errors[:20])
     status = WARN if warnings else PASS
     return GateResult(3, "UTF-8 Portability", status,
-                      "All text I/O uses explicit encoding. Arabic bytes fail cp1252 as expected.",
+                      "All text I/O uses explicit encoding in training/ and tests/. "
+                      "Arabic bytes fail cp1252 as expected.",
                       warnings=warnings)
 
 
-# ─── Gate 4: Language contract ────────────────────────────────────────────
+# ─── Gate 4: Language contract (Defect 4 fix) ────────────────────────────
 
 def gate_language_contract(records: List[Dict]) -> GateResult:
+    """
+    Defect 4 fix: independently recomputes language contracts from raw text.
+    Does NOT trust stored language_contract_passed boolean.
+    Fails when stored and recomputed values disagree.
+    """
     errors = []
+    disagreements = []
+
     for r in records:
-        if not r.get("language_contract_passed", False):
+        lang = r.get("language", "")
+        prompt = r.get("prompt", "")
+        response = r.get("response", "")
+        stored = r.get("language_contract_passed", None)
+
+        recomputed, evidence = recompute_language_contract(lang, prompt, response)
+
+        # Fail if recomputed contract is violated
+        if not recomputed:
             errors.append(
-                f"{r['example_id']}: language={r['language']} "
-                f"ar_chars_response={r.get('arabic_character_count_response', 0)}"
+                f"{r['example_id']}: language={lang} "
+                f"ar_resp={evidence['ar_chars_response']} "
+                f"en_resp={evidence['en_chars_response']} "
+                f"ar_ratio={evidence['ar_ratio_response']}"
             )
-    if errors:
+
+        # Fail if stored value disagrees with recomputed
+        if stored is not None and bool(stored) != recomputed:
+            disagreements.append(
+                f"{r['example_id']}: stored={stored} recomputed={recomputed} "
+                f"lang={lang} ar_resp={evidence['ar_chars_response']}"
+            )
+
+    all_errors = errors + disagreements
+    if all_errors:
         return GateResult(4, "Language Contract", FAIL,
-                          f"{len(errors)} language contract violations",
-                          errors=errors[:10])
+                          f"{len(errors)} contract violations, "
+                          f"{len(disagreements)} stored/recomputed disagreements",
+                          errors=all_errors[:10])
     return GateResult(4, "Language Contract", PASS,
-                      f"All {len(records)} records satisfy language contracts")
+                      f"All {len(records)} records satisfy independently recomputed language contracts")
 
 
 # ─── Gate 5: Raw duplication ──────────────────────────────────────────────
@@ -258,7 +354,6 @@ def gate_raw_duplication(records: List[Dict]) -> GateResult:
     errors = []
     id_to_split = {r["example_id"]: r["split"] for r in records}
 
-    # Raw response hashes
     resp_to_ids = defaultdict(list)
     for r in records:
         resp_to_ids[sha256_of(r["response"])].append(r["example_id"])
@@ -270,7 +365,6 @@ def gate_raw_duplication(records: List[Dict]) -> GateResult:
         for ids in cross_split_raw[:5]:
             errors.append(f"Raw cross-split response duplicate: {ids}")
 
-    # Raw prompt hashes
     prompt_to_ids = defaultdict(list)
     for r in records:
         prompt_to_ids[sha256_of(r["prompt"])].append(r["example_id"])
@@ -297,7 +391,6 @@ def gate_canonical_duplication(records: List[Dict]) -> GateResult:
     errors = []
     id_to_split = {r["example_id"]: r["split"] for r in records}
 
-    # Canonical response hashes
     canon_resp_to_ids = defaultdict(list)
     for r in records:
         canon_resp_to_ids[canonical_hash(r["response"])].append(r["example_id"])
@@ -309,7 +402,6 @@ def gate_canonical_duplication(records: List[Dict]) -> GateResult:
         for ids in cross_split_canon[:5]:
             errors.append(f"Canonical cross-split response duplicate: {ids}")
 
-    # Canonical scenario brief duplicates
     brief_to_ids = defaultdict(list)
     for r in records:
         brief_to_ids[sha256_of(canonicalize(r.get("scenario_brief", "")))].append(r["example_id"])
@@ -318,7 +410,6 @@ def gate_canonical_duplication(records: List[Dict]) -> GateResult:
         for ids in dup_briefs[:5]:
             errors.append(f"Duplicate scenario brief: {ids}")
 
-    # Check for artificial markers
     marker_ids = [r["example_id"] for r in records
                   if has_artificial_marker(r.get("prompt", "")) or
                   has_artificial_marker(r.get("response", ""))]
@@ -339,11 +430,6 @@ def gate_canonical_duplication(records: List[Dict]) -> GateResult:
 # ─── Gate 7: Semantic leakage ─────────────────────────────────────────────
 
 def gate_semantic_leakage(records: List[Dict]) -> GateResult:
-    """
-    Check for high-similarity cross-split pairs using Jaccard on canonical word trigrams.
-    Blocking threshold: JACCARD_BLOCK_THRESHOLD (0.70)
-    Warning threshold: JACCARD_WARN_THRESHOLD (0.50)
-    """
     errors = []
     warnings = []
 
@@ -444,7 +530,6 @@ def gate_review_identity(data_dir: Path, docs_dir: Path) -> GateResult:
                 f"JSONL has {len(jsonl_ids)} IDs, CSV has {len(csv_ids)} IDs. "
                 f"Diff: {jsonl_ids.symmetric_difference(csv_ids)}"
             )
-        # Check reviewer fields are empty
         for row in csv_rows:
             for field in REVIEWER_JUDGMENT_FIELDS:
                 if field in row and row[field].strip():
@@ -488,13 +573,11 @@ def gate_benchmark_manifest(benchmark_dir: Path) -> GateResult:
     if contamination and contamination != "PASS":
         errors.append(f"Contamination check result is not PASS: {contamination}")
 
-    # Check history
-    v100 = benchmark_dir / "FROZEN_BENCHMARK_MANIFEST_v1.0.0.json"
-    v110 = benchmark_dir / "FROZEN_BENCHMARK_MANIFEST_v1.1.0.json"
-    v111 = benchmark_dir / "FROZEN_BENCHMARK_MANIFEST_v1.1.1.json"
-    for path in [v100, v110, v111]:
-        if not path.exists():
-            warnings.append(f"Historical manifest not found: {path.name}")
+    for fname in ["FROZEN_BENCHMARK_MANIFEST_v1.0.0.json",
+                  "FROZEN_BENCHMARK_MANIFEST_v1.1.0.json",
+                  "FROZEN_BENCHMARK_MANIFEST_v1.1.1.json"]:
+        if not (benchmark_dir / fname).exists():
+            warnings.append(f"Historical manifest not found: {fname}")
 
     if errors:
         return GateResult(10, "Benchmark Manifest Integrity", FAIL,
@@ -506,49 +589,174 @@ def gate_benchmark_manifest(benchmark_dir: Path) -> GateResult:
                       warnings=warnings)
 
 
-# ─── Gate 11: Test-suite result ───────────────────────────────────────────
+# ─── Gate 11: Test-suite result (Defect 1 fix) ───────────────────────────
+
+def _compute_test_manifest_hash(test_dir: Path) -> Tuple[str, List[str]]:
+    """Compute SHA-256 of the sorted list of authorized test file names."""
+    found = []
+    for fname in AUTHORIZED_TEST_FILES:
+        p = test_dir / fname
+        if p.exists():
+            found.append(fname)
+    manifest_str = "|".join(sorted(found))
+    return hashlib.sha256(manifest_str.encode("utf-8")).hexdigest(), found
+
 
 def gate_test_suite(repo_root: Path) -> GateResult:
-    """Run the CPU test suite and check for zero failures."""
+    """
+    Defect 1 fix:
+    - Uses sys.executable, never 'python3' or 'python'
+    - Runs pytest via sys.executable -m pytest
+    - Uses JUnit XML for structured result parsing
+    - Requires: exit_code=0, collected>0, passed>0, failed=0, errors=0
+    - Includes test_adversarial_fixtures.py
+    - Prevents recursive execution
+    - Records interpreter path, Python version, pytest version
+    - A missing/empty/malformed result file returns FAIL
+    """
+    # Prevent recursive execution: if we are already inside pytest, skip
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return GateResult(11, "Test-Suite Result", FAIL,
+                          "Gate 11 cannot run inside pytest (recursive execution prevented)")
+
     test_dir = repo_root / "tests" / "jupiter_seed_4b"
     if not test_dir.exists():
         return GateResult(11, "Test-Suite Result", FAIL, "Test directory not found")
 
-    try:
-        result = subprocess.run(
-            ["python3", "-m", "pytest", str(test_dir), "--tb=no", "-q",
-             "--ignore", str(test_dir / "test_adversarial_fixtures.py")],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(repo_root),
-            env={**__import__("os").environ, "PYTHONUTF8": "", "PYTHONIOENCODING": ""},
-        )
-        output = result.stdout + result.stderr
-        # Parse results
-        passed = failed = errors_count = skipped = 0
-        for line in output.split("\n"):
-            m = re.search(r"(\d+) passed", line)
-            if m:
-                passed = int(m.group(1))
-            m = re.search(r"(\d+) failed", line)
-            if m:
-                failed = int(m.group(1))
-            m = re.search(r"(\d+) error", line)
-            if m:
-                errors_count = int(m.group(1))
-            m = re.search(r"(\d+) skipped", line)
-            if m:
-                skipped = int(m.group(1))
+    # Verify all authorized test files are present
+    manifest_hash, found_files = _compute_test_manifest_hash(test_dir)
+    missing_files = [f for f in AUTHORIZED_TEST_FILES if f not in found_files]
+    if missing_files:
+        return GateResult(11, "Test-Suite Result", FAIL,
+                          f"Missing authorized test files: {missing_files}",
+                          errors=[f"Missing: {f}" for f in missing_files])
 
-        if failed > 0 or errors_count > 0:
+    # Record interpreter details
+    interpreter = sys.executable
+    python_version = sys.version.split()[0]
+
+    # Get pytest version
+    try:
+        v_result = subprocess.run(
+            [interpreter, "-m", "pytest", "--version"],
+            capture_output=True, text=True, timeout=10,
+            encoding="utf-8",
+        )
+        pytest_version = v_result.stdout.strip() + v_result.stderr.strip()
+    except Exception:
+        pytest_version = "unknown"
+
+    # Run pytest with JUnit XML output
+    start_ts = datetime.datetime.utcnow().isoformat() + "Z"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        xml_path = Path(tmpdir) / "results.xml"
+
+        # Build clean environment: unset encoding overrides (Defect 2)
+        env = dict(os.environ)
+        env.pop("PYTHONUTF8", None)
+        env.pop("PYTHONIOENCODING", None)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        try:
+            result = subprocess.run(
+                [interpreter, "-m", "pytest",
+                 str(test_dir),
+                 f"--junitxml={xml_path}",
+                 "--tb=short",
+                 "-q"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=180,
+                cwd=str(repo_root),
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
             return GateResult(11, "Test-Suite Result", FAIL,
-                              f"passed={passed} failed={failed} errors={errors_count} skipped={skipped}",
-                              errors=[output[-500:]])
-        return GateResult(11, "Test-Suite Result", PASS,
-                          f"passed={passed} failed=0 errors=0 skipped={skipped}")
-    except subprocess.TimeoutExpired:
-        return GateResult(11, "Test-Suite Result", FAIL, "Test suite timed out")
-    except Exception as e:
-        return GateResult(11, "Test-Suite Result", FAIL, str(e))
+                              "Test suite timed out after 180 seconds")
+        except Exception as e:
+            return GateResult(11, "Test-Suite Result", FAIL, f"subprocess error: {e}")
+
+        end_ts = datetime.datetime.utcnow().isoformat() + "Z"
+        exit_code = result.returncode
+
+        # Parse JUnit XML (Defect 1: structured parsing, not text parsing)
+        if not xml_path.exists() or xml_path.stat().st_size == 0:
+            return GateResult(11, "Test-Suite Result", FAIL,
+                              "JUnit XML result file missing or empty — cannot determine test outcome",
+                              errors=[result.stdout[-500:] if result.stdout else "no output"])
+
+        try:
+            tree = ET.parse(str(xml_path))
+            root = tree.getroot()
+            # pytest JUnit XML: <testsuites> or <testsuite>
+            if root.tag == "testsuites":
+                suites = list(root)
+            else:
+                suites = [root]
+
+            collected = 0
+            passed = 0
+            failed_count = 0
+            errors_count = 0
+            skipped_count = 0
+
+            for suite in suites:
+                suite_tests = int(suite.get("tests", 0))
+                suite_failures = int(suite.get("failures", 0))
+                suite_errors = int(suite.get("errors", 0))
+                suite_skipped = int(suite.get("skipped", 0))
+                collected += suite_tests
+                failed_count += suite_failures
+                errors_count += suite_errors
+                skipped_count += suite_skipped
+
+            passed = collected - failed_count - errors_count - skipped_count
+
+        except ET.ParseError as e:
+            return GateResult(11, "Test-Suite Result", FAIL,
+                              f"JUnit XML malformed: {e}",
+                              errors=[result.stdout[-300:] if result.stdout else ""])
+
+    # Defect 1: Gate 11 must NEVER pass when zero tests ran
+    if collected == 0:
+        return GateResult(11, "Test-Suite Result", FAIL,
+                          "Zero tests collected — Gate 11 cannot PASS when no tests ran",
+                          errors=[result.stdout[-300:] if result.stdout else "no output"])
+
+    if passed == 0:
+        return GateResult(11, "Test-Suite Result", FAIL,
+                          f"Zero tests passed (collected={collected}) — Gate 11 cannot PASS",
+                          errors=[result.stdout[-300:] if result.stdout else ""])
+
+    metadata = {
+        "interpreter": interpreter,
+        "python_version": python_version,
+        "pytest_version": pytest_version,
+        "test_manifest_hash": manifest_hash,
+        "authorized_files": AUTHORIZED_TEST_FILES,
+        "found_files": found_files,
+        "collected": collected,
+        "passed": passed,
+        "failed": failed_count,
+        "errors": errors_count,
+        "skipped": skipped_count,
+        "exit_code": exit_code,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+    }
+
+    if failed_count > 0 or errors_count > 0:
+        return GateResult(11, "Test-Suite Result", FAIL,
+                          f"collected={collected} passed={passed} failed={failed_count} "
+                          f"errors={errors_count} skipped={skipped_count}",
+                          errors=[result.stdout[-500:] if result.stdout else ""],
+                          metadata=metadata)
+
+    return GateResult(11, "Test-Suite Result", PASS,
+                      f"collected={collected} passed={passed} failed=0 errors=0 "
+                      f"skipped={skipped_count} exit_code={exit_code}",
+                      metadata=metadata)
 
 
 # ─── Gate 12: Human-review status ────────────────────────────────────────
@@ -576,16 +784,16 @@ def gate_human_review(records: List[Dict]) -> GateResult:
 # ─── Report writer ────────────────────────────────────────────────────────
 
 def write_report(gates: List[GateResult], output_path: Path,
-                 honest_count: Dict, dataset_version: str) -> None:
+                 honest_count: Dict, dataset_version: str) -> str:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     all_passed = all(g.passed for g in gates if g.gate_id != 12)
     gate12 = next((g for g in gates if g.gate_id == 12), None)
-    final_verdict = (
-        "JUPITER SEED 4B REVIEW PACKAGE REPAIRED — READY FOR INDEPENDENT HUMAN REVIEW"
-        if all_passed and gate12 and gate12.status == NOT_READY
-        else "JUPITER SEED 4B REVIEW PACKAGE NOT READY"
-    )
+
+    if all_passed and gate12 and gate12.status == NOT_READY:
+        final_verdict = "MECHANICALLY READY FOR INDEPENDENT AUDIT — HUMAN REVIEW NOT YET AUTHORIZED"
+    else:
+        final_verdict = "JUPITER SEED 4B V2 TOOLING NOT READY"
 
     lines = [
         "# Jupiter Seed 4B: Dataset Readiness Gate Report",
@@ -595,12 +803,11 @@ def write_report(gates: List[GateResult], output_path: Path,
         "",
         "## Honest Dataset Size",
         "",
-        f"| Metric | Value |",
-        f"| :--- | :--- |",
+        "| Metric | Value |",
+        "| :--- | :--- |",
         f"| Authorized target | {honest_count.get('authorized', 'N/A')} |",
         f"| Actual distinct examples | {honest_count.get('actual', 'N/A')} |",
         f"| Shortfall | {honest_count.get('shortfall', 'N/A')} |",
-        f"| Human authoring required | {honest_count.get('shortfall', 'N/A')} additional examples |",
         "",
         "## Gate Results",
         "",
@@ -617,6 +824,11 @@ def write_report(gates: List[GateResult], output_path: Path,
         lines.append(f"### Gate {g.gate_id}: {g.name} — {g.status}")
         lines.append("")
         lines.append(g.details)
+        if g.metadata:
+            lines.append("")
+            lines.append("**Metadata:**")
+            for k, v in g.metadata.items():
+                lines.append(f"- `{k}`: `{v}`")
         if g.warnings:
             lines.append("")
             lines.append("**Warnings:**")
@@ -632,7 +844,7 @@ def write_report(gates: List[GateResult], output_path: Path,
     lines += [
         "---",
         "",
-        f"## Final Verdict",
+        "## Final Verdict",
         "",
         f"**{final_verdict}**",
         "",
@@ -646,7 +858,7 @@ def write_report(gates: List[GateResult], output_path: Path,
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Jupiter Seed 4B — Dataset Readiness Gate")
+    parser = argparse.ArgumentParser(description="Jupiter Seed 4B — Dataset Readiness Gate v2.1")
     parser.add_argument("--data-dir", type=Path,
                         default=Path("training/jupiter_seed_4b/data"))
     parser.add_argument("--docs-dir", type=Path,
@@ -670,7 +882,6 @@ def main() -> None:
 
     log.info("Loaded %d records from %s", len(records), args.data_dir)
 
-    # Honest count
     authorized = 850
     actual = len(records)
     shortfall = max(0, authorized - actual)
@@ -680,10 +891,8 @@ def main() -> None:
         "shortfall": shortfall,
     }
 
-    # Dataset version from first record
     dataset_version = records[0].get("dataset_version", "unknown")
 
-    # Run all 12 gates
     gates = [
         gate_schema(records),
         gate_provenance(records),
@@ -699,12 +908,10 @@ def main() -> None:
         gate_human_review(records),
     ]
 
-    # Report
     verdict = write_report(gates, args.output, honest_count, dataset_version)
 
-    # Summary
     passed = sum(1 for g in gates if g.passed)
-    failed = sum(1 for g in gates if g.failed and g.gate_id != 12)
+    failed = sum(1 for g in gates if g.status == FAIL)
     not_ready = sum(1 for g in gates if g.status == NOT_READY)
     warned = sum(1 for g in gates if g.status == WARN)
 

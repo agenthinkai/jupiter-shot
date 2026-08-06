@@ -53,7 +53,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
     if not config_path.exists():
         log.error("Config file not found: %s", config_path)
         sys.exit(1)
-    with config_path.open("r") as fh:
+    with config_path.open("r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
     log.info("Config loaded from %s", config_path)
     return cfg
@@ -116,7 +116,7 @@ def write_reproducibility_manifest(cfg: Dict[str, Any], output_dir: Path) -> Non
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "reproducibility_manifest.json"
-    with manifest_path.open("w") as fh:
+    with manifest_path.open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
     log.info("Reproducibility manifest written to %s", manifest_path)
 
@@ -325,7 +325,7 @@ def main() -> None:
         # Estimate without loading model
         num_examples = 500  # Default diagnostic size
         if dataset_path.exists():
-            with dataset_path.open() as fh:
+            with dataset_path.open(encoding="utf-8") as fh:
                 num_examples = sum(1 for l in fh if l.strip())
         estimate = estimate_cost(cfg, num_examples)
         print(json.dumps(estimate, indent=2))

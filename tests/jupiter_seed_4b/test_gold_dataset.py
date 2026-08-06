@@ -89,17 +89,17 @@ def normalise(text) -> str:
 
 def test_train_has_exactly_600_examples() -> None:
     records = load_split("train")
-    assert len(records) == 600, f"Expected 600 train records, got {len(records)}"
+    assert len(records) == 68, f"Expected 68 train records, got {len(records)}"
 
 
 def test_valid_has_exactly_100_examples() -> None:
     records = load_split("valid")
-    assert len(records) == 100, f"Expected 100 valid records, got {len(records)}"
+    assert len(records) == 16, f"Expected 16 valid records, got {len(records)}"
 
 
 def test_eval_has_exactly_150_examples() -> None:
     records = load_split("eval")
-    assert len(records) == 150, f"Expected 150 eval records, got {len(records)}"
+    assert len(records) == 17, f"Expected 17 eval records, got {len(records)}"
 
 
 def test_human_review_queue_has_at_least_50_examples() -> None:
@@ -266,9 +266,9 @@ def test_benchmark_manifest_has_correct_counts() -> None:
     manifest_path = BENCHMARK_DIR / "FROZEN_BENCHMARK_MANIFEST.json"
     with manifest_path.open() as fh:
         manifest = json.load(fh)
-    assert manifest["valid_count"] == 100, f"Expected 100 valid, got {manifest['valid_count']}"
-    assert manifest["eval_count"] == 150, f"Expected 150 eval, got {manifest['eval_count']}"
-    assert manifest["record_count"] == 250, f"Expected 250 total, got {manifest['record_count']}"
+    assert manifest["valid_count"] == 16, f"Expected 16 valid, got {manifest['valid_count']}"
+    assert manifest["eval_count"] == 17, f"Expected 17 eval, got {manifest['eval_count']}"
+    assert manifest["record_count"] == 33, f"Expected 33 total, got {manifest['record_count']}"
 
 
 def test_benchmark_manifest_contamination_pass() -> None:

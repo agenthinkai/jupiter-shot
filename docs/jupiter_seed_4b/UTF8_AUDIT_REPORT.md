@@ -1,12 +1,12 @@
-# Jupiter Seed 4B: UTF-8 Encoding Audit Report
+# Jupiter Seed 4B: UTF-8 Encoding Audit Report (v2)
 
-This audit uses AST-based analysis to verify that all production Python files explicitly specify UTF-8 encoding for all text I/O operations.
+AST-based audit covering open(), Path.open(), path.open(), Path.read_text(), and Path.write_text().
 
 ## Summary
 
 | Metric | Value |
 | :--- | :--- |
-| Files audited | 12 |
+| Files audited | 13 |
 | Total errors | 0 |
 | Total warnings | 0 |
 | **Overall result** | **PASS** |

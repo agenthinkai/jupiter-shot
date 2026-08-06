@@ -34,7 +34,7 @@ from typing import Dict, List, Set, Tuple
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-BENCHMARK_VERSION = "1.1.1"
+BENCHMARK_VERSION = "2.0.0"
 NEAR_DUPLICATE_THRESHOLD = 0.80  # Jaccard similarity threshold
 
 
@@ -209,21 +209,18 @@ def build_manifest(
 
     manifest = {
         "benchmark_version": BENCHMARK_VERSION,
-        "previous_version": "1.1.0",
+        "previous_version": "1.1.1",
         "reason_for_change": (
-            "Issue 1: Review document mismatch fixed; single JSONL source established. "
-            "Issue 2: Duplicate responses and cross-split contamination eliminated (all 850 responses unique). "
-            "Issue 3: Language contract violations fixed; Arabic responses enforced. "
-            "Issue 4: Documentation inaccuracies resolved. "
-            "Issue 5: UTF-8 BOM CSV generated for reviewers. "
-            "Issue 6: UTF-8 safety audited across all Python files. "
-            "Issue 7: Benchmark versioned to 1.1.1."
+            "Fundamental rebuild to 2.0.0: removed artificial markers, "
+            "built substantively distinct examples with scenario_brief, "
+            "assigned content families before splitting, "
+            "and applied honest dataset sizing."
         ),
         "distribution_changes": {
-            "v1.1.0_lang": {"ar": 113, "en": 75, "ar-en": 62},
             "v1.1.1_lang": {"ar": 113, "en": 75, "ar-en": 62},
-            "v1.1.0_domain": "authorized targets met",
-            "v1.1.1_domain": "authorized targets maintained",
+            "v2.0.0_lang": {"ar": 12, "en": 13, "ar-en": 8},
+            "v1.1.1_domain": "authorized targets met",
+            "v2.0.0_domain": "honest count sizing applied",
         },
         "git_commit": git_commit,
         "freeze_timestamp": now,

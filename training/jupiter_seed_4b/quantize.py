@@ -169,7 +169,7 @@ def main() -> None:
         sizes["gguf_q4km_mb"] = measure_model_size(gguf_path)
 
     report_path = args.output_dir / "quantization_report.json"
-    with report_path.open("w") as fh:
+    with report_path.open("w", encoding="utf-8") as fh:
         json.dump(sizes, fh, indent=2)
     log.info("Quantization report: %s", json.dumps(sizes))
     log.info("Report written to %s", report_path)

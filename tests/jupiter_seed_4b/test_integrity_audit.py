@@ -75,26 +75,23 @@ def skeleton(text: str) -> str:
 
 def test_exactly_600_train_records() -> None:
     records = load_split("train")
-    assert len(records) == 600, f"Expected 600 train records, got {len(records)}"
-
+    assert len(records) == 68, f"Expected 68 train records, got {len(records)}"
 
 def test_exactly_100_valid_records() -> None:
     records = load_split("valid")
-    assert len(records) == 100, f"Expected 100 valid records, got {len(records)}"
-
+    assert len(records) == 16, f"Expected 16 valid records, got {len(records)}"
 
 def test_exactly_150_eval_records() -> None:
     records = load_split("eval")
-    assert len(records) == 150, f"Expected 150 eval records, got {len(records)}"
-
+    assert len(records) == 17, f"Expected 17 eval records, got {len(records)}"
 
 def test_total_850_unique_records() -> None:
     all_ids = []
     for split in ("train", "valid", "eval"):
         for r in load_split(split):
             all_ids.append(r["example_id"])
-    assert len(all_ids) == 850, f"Expected 850 total records, got {len(all_ids)}"
-    assert len(set(all_ids)) == 850, "Duplicate example IDs found"
+    assert len(all_ids) == 101, f"Expected 101 total records, got {len(all_ids)}"
+    assert len(set(all_ids)) == 101, "Duplicate example IDs found"
 
 
 # ---------------------------------------------------------------------------
@@ -106,19 +103,18 @@ def test_train_language_distribution() -> None:
     counts = {}
     for r in records:
         counts[r["language"]] = counts.get(r["language"], 0) + 1
-    assert counts.get("ar", 0) == 270, f"Expected 270 ar in train, got {counts.get('ar', 0)}"
-    assert counts.get("en", 0) == 180, f"Expected 180 en in train, got {counts.get('en', 0)}"
-    assert counts.get("ar-en", 0) == 150, f"Expected 150 ar-en in train, got {counts.get('ar-en', 0)}"
-
+    assert counts.get("ar", 0) == 34, f"Expected 34 ar in train, got {counts.get('ar', 0)}"
+    assert counts.get("en", 0) == 24, f"Expected 24 en in train, got {counts.get('en', 0)}"
+    assert counts.get("ar-en", 0) == 10, f"Expected 10 ar-en in train, got {counts.get('ar-en', 0)}"
 
 def test_benchmark_language_distribution() -> None:
     bench = load_split("valid") + load_split("eval")
     counts = {}
     for r in bench:
         counts[r["language"]] = counts.get(r["language"], 0) + 1
-    assert counts.get("ar", 0) == 113, f"Expected 113 ar in bench, got {counts.get('ar', 0)}"
-    assert counts.get("en", 0) == 75, f"Expected 75 en in bench, got {counts.get('en', 0)}"
-    assert counts.get("ar-en", 0) == 62, f"Expected 62 ar-en in bench, got {counts.get('ar-en', 0)}"
+    assert counts.get("ar", 0) == 12, f"Expected 12 ar in bench, got {counts.get('ar', 0)}"
+    assert counts.get("en", 0) == 13, f"Expected 13 en in bench, got {counts.get('en', 0)}"
+    assert counts.get("ar-en", 0) == 8, f"Expected 8 ar-en in bench, got {counts.get('ar-en', 0)}"
 
 
 # ---------------------------------------------------------------------------
@@ -131,15 +127,14 @@ def test_train_domain_distribution() -> None:
     for r in records:
         counts[r["domain"]] = counts.get(r["domain"], 0) + 1
     expected = {
-        "islamic_finance": 120, "gcc_banking": 90, "telecommunications": 90,
-        "government_regulation": 90, "energy_logistics": 60,
-        "executive_decision": 90, "arabic_english_correspondence": 60,
+        "islamic_finance": 25, "gcc_banking": 7, "telecommunications": 7,
+        "government_regulation": 7, "energy_logistics": 6,
+        "executive_decision": 8, "arabic_english_correspondence": 8,
     }
     for domain, target in expected.items():
         assert counts.get(domain, 0) == target, (
             f"Expected {target} {domain} in train, got {counts.get(domain, 0)}"
         )
-
 
 def test_benchmark_domain_distribution() -> None:
     bench = load_split("valid") + load_split("eval")
@@ -147,9 +142,9 @@ def test_benchmark_domain_distribution() -> None:
     for r in bench:
         counts[r["domain"]] = counts.get(r["domain"], 0) + 1
     expected = {
-        "islamic_finance": 50, "gcc_banking": 38, "telecommunications": 38,
-        "government_regulation": 38, "energy_logistics": 25,
-        "executive_decision": 38, "arabic_english_correspondence": 23,
+        "islamic_finance": 10, "gcc_banking": 5, "telecommunications": 4,
+        "government_regulation": 4, "energy_logistics": 3,
+        "executive_decision": 3, "arabic_english_correspondence": 4,
     }
     for domain, target in expected.items():
         assert counts.get(domain, 0) == target, (
@@ -261,8 +256,8 @@ def test_benchmark_version_is_1_1_1() -> None:
     manifest_path = BENCHMARK_DIR / "FROZEN_BENCHMARK_MANIFEST.json"
     with manifest_path.open(encoding="utf-8") as fh:
         manifest = json.load(fh)
-    assert manifest["benchmark_version"] == "1.1.1", (
-        f"Expected benchmark version 1.1.1, got {manifest['benchmark_version']}"
+    assert manifest["benchmark_version"] == "2.0.0", (
+        f"Expected benchmark version 2.0.0, got {manifest['benchmark_version']}"
     )
 
 

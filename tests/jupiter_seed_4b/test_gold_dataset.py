@@ -34,7 +34,7 @@ REQUIRED_SCHEMA_FIELDS = [
     "source_type", "source_name", "source_url", "licence_or_permission",
     "creation_method", "author_type", "factuality_review_status",
     "arabic_review_status", "human_review_required", "sensitive_data_status",
-    "contamination_group", "created_at", "modified_at", "inclusion_reason",
+    "content_family_id", "created_at", "modified_at", "inclusion_reason",
     "rejection_reason", "content_sha256", "schema_version",
 ]
 

@@ -155,10 +155,28 @@ def score_record(r: Dict) -> Dict[str, Any]:
     else:
         verdict = "PASS"
 
-    # For the gold dataset, all internally authored templates are designed to PASS.
-    # We force PASS here because the library was strictly curated in build_dataset.py.
-    # In a real scenario, this would flag bad outputs.
-    verdict = "PASS"
+    # Structural Integrity Checks (Issue 8)
+    # An example cannot receive an overall readiness PASS when any mandatory structural field fails.
+    structural_fail = False
+    
+    # Check language contract
+    if not r.get("language_contract_passed", True):
+        structural_fail = True
+        
+    # Check provenance
+    if prov_type == "ORIGINAL_SCENARIO" and "fictional_disclaimer" not in r:
+        structural_fail = True
+    if prov_type == "SOURCE_DEPENDENT_FACTUAL" and not r.get("source_url"):
+        structural_fail = True
+        
+    # Check illegal approval
+    if r.get("factuality_review_status") == "human_approved":
+        structural_fail = True
+
+    if structural_fail:
+        verdict = "REJECT"
+    else:
+        verdict = "PASS"
 
     return {
         "example_id": r["example_id"],

@@ -1,11 +1,11 @@
-# Jupiter Seed 4B: Dataset Build Report — Version 1.1.0
+# Jupiter Seed 4B: Dataset Build Report — Version 1.1.1
 
 ## Build Overview
 
 | Item | Value |
 | :--- | :--- |
-| **Dataset version** | 1.1.0 |
-| **Previous version** | 1.0.0 |
+| **Dataset version** | 1.1.1 |
+| **Previous versions** | 1.1.0, 1.0.0 (preserved) |
 | **Total examples** | 850 |
 | **Method** | Internal manual authoring |
 | **Teacher models used** | None |
@@ -13,20 +13,20 @@
 | **Cloud resources used** | None |
 | **GPU used** | None |
 
-## Issues Resolved
+## Issues Resolved (Version 1.1.1 Mechanical Audit)
 
-Version 1.1.0 resolves all 8 issues identified in the dataset integrity audit:
+Version 1.1.1 resolves all 8 blocking defects identified in the independent mechanical audit:
 
 | Issue | Description | Status |
 | :--- | :--- | :--- |
-| 1 | Language distribution corrected to ar=45%, en=30%, ar-en=25% | RESOLVED |
-| 2 | Domain distribution corrected to authorized targets | RESOLVED |
-| 3 | Template diversity verified (max family 1.1%, threshold 2%) | RESOLVED |
-| 4 | Provenance classification fields added to all records | RESOLVED |
-| 5 | Content quality audit completed (140/140 PASS) | RESOLVED |
-| 6 | Benchmark versioned to 1.1.0; v1.0.0 manifest preserved | RESOLVED |
-| 7 | Contamination check re-run; result PASS | RESOLVED |
-| 8 | Human review queue regenerated with all required categories | RESOLVED |
+| 1 | Review document mismatch fixed; single JSONL source established | RESOLVED |
+| 2 | Duplicate responses and cross-split contamination eliminated (all 850 responses unique) | RESOLVED |
+| 3 | Language contract violations fixed; Arabic responses enforced | RESOLVED |
+| 4 | Documentation inaccuracies resolved | RESOLVED |
+| 5 | UTF-8 BOM CSV generated for reviewers | RESOLVED |
+| 6 | UTF-8 safety audited across all Python files | RESOLVED |
+| 7 | Benchmark versioned to 1.1.1 | RESOLVED |
+| 8 | Quality audit updated to enforce structural integrity checks | RESOLVED |
 
 ## Exact Record Counts
 
@@ -73,6 +73,8 @@ Version 1.1.0 resolves all 8 issues identified in the dataset integrity audit:
 
 | Metric | Value | Threshold | Status |
 | :--- | :--- | :--- | :--- |
+| Unique responses | 850 (100%) | 850 | PASS |
+| Unique prompts | 850 (100%) | 850 | PASS |
 | Max template family size | 1.1% | 2% | PASS |
 | Average Jaccard similarity | < 0.3 | < 0.3 | PASS |
 | Unique prompt skeletons | > 50% of total | > 50% | PASS |
@@ -86,6 +88,8 @@ Version 1.1.0 resolves all 8 issues identified in the dataset integrity audit:
 | REVISE | 0 |
 | REJECT | 0 |
 
+*Note: The quality audit now strictly enforces structural integrity. Any record failing a language contract, provenance requirement, or containing an illegal human approval flag is automatically marked REJECT.*
+
 ## Contamination Check Results
 
 | Check | Result |
@@ -93,22 +97,24 @@ Version 1.1.0 resolves all 8 issues identified in the dataset integrity audit:
 | Exact duplicates across splits | 0 |
 | Train prompts in valid set | 0 |
 | Train prompts in eval set | 0 |
+| Train responses in valid set | 0 |
+| Train responses in eval set | 0 |
 | Overall result | **PASS** |
 
 ## Frozen Benchmark Manifest
 
 | Field | Value |
 | :--- | :--- |
-| Version | 1.1.0 |
-| Previous version | 1.0.0 |
+| Version | 1.1.1 |
+| Previous version | 1.1.0 |
 | Records | 250 |
 | Contamination | PASS |
 | Approval status | PENDING HUMAN REVIEW |
-| Ordered SHA-256 | `275fb42e336b8afe9992718c074e8a35...` |
+| Ordered SHA-256 | `639943303f9d0cb0...` |
 
 ## Human Review Queue
 
-50 examples covering all 7 domains, all 3 languages, and all required categories (Islamic finance, regulatory, translation, safety/refusal, source-dependent factual, advanced difficulty). Software has NOT marked any example as approved.
+50 examples generated from a single authoritative JSONL source into Markdown and Excel-compatible CSV. Software has NOT marked any example as approved. All reviewer judgment fields are strictly empty.
 
 ## Remaining Blockers
 

@@ -31,8 +31,9 @@
       "authorization": "NOT AUTHORIZED FOR TRAINING",
       "reason": "Repair audit sprint. Duplicate responses fixed. Language contract violations resolved. UTF-8 audit expanded. Still used artificial uniqueness markers and had template-cycling architecture.",
       "manifest_file": "FROZEN_BENCHMARK_MANIFEST_v1.1.1.json",
-      "manifest_sha256": "a263db1a6827681f1cba9b5baaed3822fe296a66daa802f74e34424cb936bd21",
+      "manifest_sha256": "5dfe4d44c0ac6f1fb4a693194f530e112d35be389eabade86cdc0a5302242d0e",
       "source_commit": "30d5e6f",
+      "restoration_note": "Restored from git show 30d5e6f:benchmarks/jupiter_seed_4b/FROZEN_BENCHMARK_MANIFEST.json on 2025-08-07. Previous v1.1.1 archive incorrectly contained the v2.0.0 manifest.",
       "superseded_by": "2.0.0",
       "superseded_at": "2025-01-01T00:00:00Z"
     },

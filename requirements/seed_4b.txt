@@ -4,8 +4,8 @@
 # those are only needed for GPU training (see requirements/seed_4b_gpu.txt).
 
 # Test framework
+# pytest already provides --junitxml natively; no plugin needed
 pytest==8.3.5
-pytest-xml==0.1.1
 
 # Inference server (inference_server.py)
 fastapi==0.115.12

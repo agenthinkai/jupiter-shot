@@ -56,14 +56,24 @@ NOT_READY = "NOT_READY"
 WARN = "WARN"
 
 # Authorized Seed 4B test files (must all be present and run)
+# V2.2 Task 3: 8 files (test_gate_adversarial.py and test_v22_regression.py added)
 AUTHORIZED_TEST_FILES = [
     "test_adversarial_fixtures.py",
+    "test_gate_adversarial.py",
     "test_repair_audit.py",
     "test_integrity_audit.py",
     "test_gold_dataset.py",
     "test_diagnostic_pipeline.py",
     "test_foundation_audit.py",
+    "test_v22_regression.py",
 ]
+
+# Canonical authorized manifest hash (SHA-256 of sorted filenames joined by '|')
+# Recompute with: sha256("|".join(sorted(AUTHORIZED_TEST_FILES)).encode()).hexdigest()
+import hashlib as _hashlib
+AUTHORIZED_MANIFEST_HASH = _hashlib.sha256(
+    "|".join(sorted(AUTHORIZED_TEST_FILES)).encode("utf-8")
+).hexdigest()
 
 
 class GateResult:
@@ -602,6 +612,51 @@ def _compute_test_manifest_hash(test_dir: Path) -> Tuple[str, List[str]]:
     return hashlib.sha256(manifest_str.encode("utf-8")).hexdigest(), found
 
 
+def _check_test_manifest(test_dir: Path) -> List[str]:
+    """
+    V2.2 Task 3: Full authorized-test-manifest enforcement.
+    Returns a list of error strings. Empty list means all checks passed.
+    Fails on:
+      - missing authorized files
+      - unexpected test files in the directory
+      - duplicate entries in AUTHORIZED_TEST_FILES
+      - manifest hash mismatch
+    """
+    errors = []
+
+    # Check for duplicate entries in AUTHORIZED_TEST_FILES
+    if len(AUTHORIZED_TEST_FILES) != len(set(AUTHORIZED_TEST_FILES)):
+        from collections import Counter
+        dupes = [f for f, c in Counter(AUTHORIZED_TEST_FILES).items() if c > 1]
+        errors.append(f"Duplicate entries in AUTHORIZED_TEST_FILES: {dupes}")
+
+    # Check all authorized files are present
+    authorized_set = set(AUTHORIZED_TEST_FILES)
+    missing = [f for f in AUTHORIZED_TEST_FILES if not (test_dir / f).exists()]
+    if missing:
+        errors.append(f"Missing authorized test files: {missing}")
+
+    # Check for unexpected test files in the directory
+    actual_files = {p.name for p in test_dir.glob("test_*.py")}
+    unexpected = sorted(actual_files - authorized_set)
+    if unexpected:
+        errors.append(
+            f"Unexpected test files not in authorized manifest: {unexpected}. "
+            f"Add them to AUTHORIZED_TEST_FILES or remove them."
+        )
+
+    # Verify manifest hash matches AUTHORIZED_MANIFEST_HASH
+    found = sorted([f for f in AUTHORIZED_TEST_FILES if (test_dir / f).exists()])
+    computed_hash = hashlib.sha256("|".join(sorted(found)).encode("utf-8")).hexdigest()
+    if computed_hash != AUTHORIZED_MANIFEST_HASH:
+        errors.append(
+            f"Manifest hash mismatch: computed={computed_hash} "
+            f"expected={AUTHORIZED_MANIFEST_HASH}"
+        )
+
+    return errors
+
+
 def gate_test_suite(repo_root: Path) -> GateResult:
     """
     Defect 1 fix:
@@ -623,13 +678,13 @@ def gate_test_suite(repo_root: Path) -> GateResult:
     if not test_dir.exists():
         return GateResult(11, "Test-Suite Result", FAIL, "Test directory not found")
 
-    # Verify all authorized test files are present
-    manifest_hash, found_files = _compute_test_manifest_hash(test_dir)
-    missing_files = [f for f in AUTHORIZED_TEST_FILES if f not in found_files]
-    if missing_files:
+    # V2.2 Task 3: Full authorized-test-manifest enforcement
+    manifest_errors = _check_test_manifest(test_dir)
+    if manifest_errors:
         return GateResult(11, "Test-Suite Result", FAIL,
-                          f"Missing authorized test files: {missing_files}",
-                          errors=[f"Missing: {f}" for f in missing_files])
+                          f"Authorized test manifest failed: {len(manifest_errors)} error(s)",
+                          errors=manifest_errors)
+    manifest_hash, found_files = _compute_test_manifest_hash(test_dir)
 
     # Record interpreter details
     interpreter = sys.executable
@@ -753,9 +808,16 @@ def gate_test_suite(repo_root: Path) -> GateResult:
                           errors=[result.stdout[-500:] if result.stdout else ""],
                           metadata=metadata)
 
+    # V2.2 Task 2: enforce exit code — nonzero exit must FAIL even if XML parsed OK
+    if exit_code != 0:
+        return GateResult(11, "Test-Suite Result", FAIL,
+                          f"pytest exit_code={exit_code} (nonzero) — Gate 11 cannot PASS",
+                          errors=[result.stdout[-500:] if result.stdout else ""],
+                          metadata=metadata)
+
     return GateResult(11, "Test-Suite Result", PASS,
                       f"collected={collected} passed={passed} failed=0 errors=0 "
-                      f"skipped={skipped_count} exit_code={exit_code}",
+                      f"skipped={skipped_count} exit_code=0",
                       metadata=metadata)
 
 
@@ -781,13 +843,159 @@ def gate_human_review(records: List[Dict]) -> GateResult:
                       "Status: PENDING INDEPENDENT AUDIT AND HUMAN REVIEW")
 
 
+# ─── Gate 13: Corpus Integrity (V2.2 Task 5) ────────────────────────────
+
+def gate_corpus_integrity(records: List[Dict], benchmark_dir: Path) -> GateResult:
+    """
+    V2.2 Task 5: Enforced corpus-integrity gate.
+    Recomputes and verifies:
+      - ordered corpus SHA-256
+      - dataset content commit (from manifest)
+      - record count
+      - split counts
+      - content-family assignment hash
+      - split-assignment hash
+      - per-record stored hashes against recomputed values
+    Any stored-versus-recomputed disagreement fails readiness.
+    Does NOT trust stored booleans or stored hashes without recomputation.
+    """
+    EXPECTED_CORPUS_HASH = "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0"
+    EXPECTED_CONTENT_COMMIT = "2e36f6b977a8af052fced5a532c1168dc1988b6f"
+    EXPECTED_RECORD_COUNT = 101
+    EXPECTED_SPLITS = {"train": 68, "valid": 16, "eval": 17}
+
+    errors = []
+    warnings = []
+
+    # 1. Record count
+    if len(records) != EXPECTED_RECORD_COUNT:
+        errors.append(
+            f"Record count mismatch: expected={EXPECTED_RECORD_COUNT} actual={len(records)}"
+        )
+
+    # 2. Split counts
+    actual_splits: Dict[str, int] = {}
+    for r in records:
+        s = r.get("split", "unknown")
+        actual_splits[s] = actual_splits.get(s, 0) + 1
+    for split_name, expected_count in EXPECTED_SPLITS.items():
+        actual_count = actual_splits.get(split_name, 0)
+        if actual_count != expected_count:
+            errors.append(
+                f"Split '{split_name}' count mismatch: expected={expected_count} actual={actual_count}"
+            )
+
+    # 3. Per-record stored hash vs recomputed
+    hash_errors = []
+    for r in records:
+        eid = r.get("example_id", "?")
+        stored_hash = r.get("content_sha256", "")
+        # content_sha256 is sha256(prompt + "\n" + response) per build_dataset.py
+        recomputed_hash = sha256_of(r.get("prompt", "") + "\n" + r.get("response", ""))
+        if stored_hash and stored_hash != recomputed_hash:
+            hash_errors.append(
+                f"{eid}: stored={stored_hash[:16]}... recomputed={recomputed_hash[:16]}..."
+            )
+    if hash_errors:
+        errors.append(f"{len(hash_errors)} per-record content hash mismatches")
+        errors.extend(hash_errors[:5])
+
+    # 4. Ordered corpus SHA-256
+    records_sorted = sorted(records, key=lambda r: r.get("example_id", ""))
+    prompt_hashes = [sha256_of(r.get("prompt", "")) for r in records_sorted]
+    response_hashes = [sha256_of(r.get("response", "")) for r in records_sorted]
+    brief_hashes = [sha256_of(r.get("scenario_brief", "") if isinstance(r.get("scenario_brief"), str) else str(r.get("scenario_brief", ""))) for r in records_sorted]
+    ordered_str = "|".join(
+        f"{p}:{r}:{b}"
+        for p, r, b in zip(prompt_hashes, response_hashes, brief_hashes)
+    )
+    computed_corpus_hash = sha256_of(ordered_str)
+    if computed_corpus_hash != EXPECTED_CORPUS_HASH:
+        errors.append(
+            f"Ordered corpus SHA-256 mismatch: "
+            f"expected={EXPECTED_CORPUS_HASH} "
+            f"computed={computed_corpus_hash}"
+        )
+    else:
+        pass  # PASS
+
+    # 5. Split-assignment hash
+    split_str = "|".join(f"{r['example_id']}:{r['split']}" for r in records_sorted)
+    computed_split_hash = sha256_of(split_str)
+
+    # 6. Content-family assignment hash
+    family_str = "|".join(
+        f"{r['example_id']}:{r.get('content_family_id', '')}" for r in records_sorted
+    )
+    computed_family_hash = sha256_of(family_str)
+
+    # 7. Verify against FROZEN_CORPUS_MANIFEST.json if it exists
+    manifest_path = benchmark_dir / "FROZEN_CORPUS_MANIFEST.json"
+    if manifest_path.exists():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            manifest_corpus_hash = manifest.get("ordered_corpus_sha256", "")
+            if manifest_corpus_hash and manifest_corpus_hash != computed_corpus_hash:
+                errors.append(
+                    f"Corpus hash disagrees with FROZEN_CORPUS_MANIFEST.json: "
+                    f"manifest={manifest_corpus_hash[:16]}... "
+                    f"computed={computed_corpus_hash[:16]}..."
+                )
+            manifest_split_hash = manifest.get("split_assignment_sha256", "")
+            if manifest_split_hash and manifest_split_hash != computed_split_hash:
+                errors.append(
+                    f"Split-assignment hash disagrees with manifest: "
+                    f"manifest={manifest_split_hash[:16]}... "
+                    f"computed={computed_split_hash[:16]}..."
+                )
+            manifest_family_hash = manifest.get("family_assignment_sha256", "")
+            if manifest_family_hash and manifest_family_hash != computed_family_hash:
+                errors.append(
+                    f"Family-assignment hash disagrees with manifest: "
+                    f"manifest={manifest_family_hash[:16]}... "
+                    f"computed={computed_family_hash[:16]}..."
+                )
+            manifest_content_commit = manifest.get("dataset_content_commit", "")
+            if manifest_content_commit and manifest_content_commit != EXPECTED_CONTENT_COMMIT:
+                errors.append(
+                    f"dataset_content_commit in manifest does not match expected: "
+                    f"manifest={manifest_content_commit} "
+                    f"expected={EXPECTED_CONTENT_COMMIT}"
+                )
+        except Exception as e:
+            errors.append(f"Failed to read FROZEN_CORPUS_MANIFEST.json: {e}")
+    else:
+        warnings.append("FROZEN_CORPUS_MANIFEST.json not found — skipping manifest cross-check")
+
+    if errors:
+        return GateResult(13, "Corpus Integrity", FAIL,
+                          f"{len(errors)} corpus integrity errors",
+                          warnings=warnings, errors=errors[:15])
+
+    return GateResult(13, "Corpus Integrity", PASS,
+                      f"Corpus intact: {EXPECTED_RECORD_COUNT} records, "
+                      f"ordered_sha256={computed_corpus_hash[:16]}..., "
+                      f"content_commit={EXPECTED_CONTENT_COMMIT[:12]}...",
+                      warnings=warnings,
+                      metadata={
+                          "ordered_corpus_sha256": computed_corpus_hash,
+                          "split_assignment_sha256": computed_split_hash,
+                          "family_assignment_sha256": computed_family_hash,
+                          "dataset_content_commit": EXPECTED_CONTENT_COMMIT,
+                          "record_count": len(records),
+                          "split_counts": actual_splits,
+                      })
+
+
 # ─── Report writer ────────────────────────────────────────────────────────
 
 def write_report(gates: List[GateResult], output_path: Path,
                  honest_count: Dict, dataset_version: str) -> str:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    all_passed = all(g.passed for g in gates if g.gate_id != 12)
+    # Gate 12 (human review) is expected NOT_READY; Gate 13 (corpus) must PASS
+    all_passed = all(g.passed for g in gates if g.gate_id not in (12,))
     gate12 = next((g for g in gates if g.gate_id == 12), None)
 
     if all_passed and gate12 and gate12.status == NOT_READY:
@@ -906,6 +1114,7 @@ def main() -> None:
         gate_benchmark_manifest(args.benchmark_dir),
         gate_test_suite(args.repo_root),
         gate_human_review(records),
+        gate_corpus_integrity(records, args.benchmark_dir),  # V2.2 Task 5
     ]
 
     verdict = write_report(gates, args.output, honest_count, dataset_version)
@@ -916,7 +1125,7 @@ def main() -> None:
     warned = sum(1 for g in gates if g.status == WARN)
 
     log.info("=== READINESS GATE SUMMARY ===")
-    log.info("Gates passed: %d / 12", passed)
+    log.info("Gates passed: %d / 13", passed)
     log.info("Gates failed: %d", failed)
     log.info("Gates not_ready: %d", not_ready)
     log.info("Gates warned: %d", warned)

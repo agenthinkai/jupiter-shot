@@ -217,10 +217,10 @@ class TestGate11ExitCodeEnforcement:
 class TestAuthorizedTestManifest:
     """Tests for the authorized-test-manifest enforcement in Gate 11."""
 
-    def test_authorized_test_files_has_8_entries(self) -> None:
-        """AUTHORIZED_TEST_FILES must contain exactly 8 entries (V2.2 adds test_gate_adversarial.py and test_v22_regression.py)."""
-        assert len(AUTHORIZED_TEST_FILES) == 8, (
-            f"Expected 8 authorized test files, got {len(AUTHORIZED_TEST_FILES)}: "
+    def test_authorized_test_files_has_10_entries(self) -> None:
+        """AUTHORIZED_TEST_FILES must contain exactly 10 entries (V2.3 adds test_v23_regex.py and test_v23_regression.py)."""
+        assert len(AUTHORIZED_TEST_FILES) == 10, (
+            f"Expected 10 authorized test files, got {len(AUTHORIZED_TEST_FILES)}: "
             f"{AUTHORIZED_TEST_FILES}"
         )
 

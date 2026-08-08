@@ -54,6 +54,14 @@ PASS = "PASS"
 FAIL = "FAIL"
 NOT_READY = "NOT_READY"
 WARN = "WARN"
+BLOCKED = "BLOCKED"           # V2.3: objectively prohibited content
+REVIEW_REQUIRED = "REVIEW_REQUIRED"  # V2.3: culturally sensitive, needs human review
+
+# V2.3 Exit-code contract
+EXIT_MECHANICALLY_READY = 0    # all mechanical gates pass; Gate 12 pending human judgment
+EXIT_MECHANICAL_FAILURE = 1    # failed integrity test, gate, contamination, schema, test, corpus
+EXIT_MECHANICALLY_BLOCKED = 2  # unresolved blocking content or required-review record not in queue
+EXIT_EXECUTION_ERROR = 3       # dependency, subprocess, missing file, malformed artifact
 
 # Authorized Seed 4B test files (must all be present and run)
 # V2.2 Task 3: 8 files (test_gate_adversarial.py and test_v22_regression.py added)
@@ -66,6 +74,8 @@ AUTHORIZED_TEST_FILES = [
     "test_diagnostic_pipeline.py",
     "test_foundation_audit.py",
     "test_v22_regression.py",
+    "test_v23_regex.py",      # V2.3: regex regression tests
+    "test_v23_regression.py", # V2.3: content-risk and exit-code regression tests
 ]
 
 # Canonical authorized manifest hash (SHA-256 of sorted filenames joined by '|')
@@ -95,6 +105,14 @@ class GateResult:
     @property
     def failed(self) -> bool:
         return self.status in (FAIL, NOT_READY)
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.status == BLOCKED
+
+    @property
+    def is_review_required(self) -> bool:
+        return self.status == REVIEW_REQUIRED
 
 
 # ─── Required schema fields ───────────────────────────────────────────────
@@ -167,9 +185,14 @@ BLOCKING_CONTENT_PATTERNS = [
     (re.compile(r"^\s*\[.*\]\s*$"), "response is only a placeholder bracket"),
 ]
 
+# V2.3: Corrected GCC_TRIP_PHRASES — removed erroneous $ end-anchor.
+# Previous patterns used \.$  which is \. (literal period) + $ (end-of-string anchor).
+# This meant phrases were only detected when they appeared at the very end of the string.
+# Corrected: \. matches a sentence-ending period anywhere in the text.
+# Regression tests in test_v23_regex.py verify anchor behaviour and punctuation boundaries.
 GCC_TRIP_PHRASES = [
-    re.compile(r"يُنصح بمراجعة[^\.]{0,50}\.$"),
-    re.compile(r"specific current requirements should be verified[^\.]{0,60}\.$", re.IGNORECASE),
+    re.compile(r"يُنصح بمراجعة[^\.]{0,50}\.", re.UNICODE),
+    re.compile(r"specific current requirements should be verified[^\.]{0,60}\.", re.IGNORECASE),
 ]
 
 
@@ -886,16 +909,27 @@ def gate_corpus_integrity(records: List[Dict], benchmark_dir: Path) -> GateResul
             )
 
     # 3. Per-record stored hash vs recomputed
+    # V2.3 Task 5A: blank or missing stored hash must be rejected (not silently skipped)
     hash_errors = []
+    blank_hash_errors = []
     for r in records:
         eid = r.get("example_id", "?")
         stored_hash = r.get("content_sha256", "")
         # content_sha256 is sha256(prompt + "\n" + response) per build_dataset.py
         recomputed_hash = sha256_of(r.get("prompt", "") + "\n" + r.get("response", ""))
-        if stored_hash and stored_hash != recomputed_hash:
+
+        # V2.3: Reject blank or missing stored hash
+        if not stored_hash or not stored_hash.strip():
+            blank_hash_errors.append(
+                f"{eid}: content_sha256 is blank or missing — cannot verify integrity"
+            )
+        elif stored_hash != recomputed_hash:
             hash_errors.append(
                 f"{eid}: stored={stored_hash[:16]}... recomputed={recomputed_hash[:16]}..."
             )
+    if blank_hash_errors:
+        errors.append(f"{len(blank_hash_errors)} record(s) have blank/missing content_sha256")
+        errors.extend(blank_hash_errors[:5])
     if hash_errors:
         errors.append(f"{len(hash_errors)} per-record content hash mismatches")
         errors.extend(hash_errors[:5])
@@ -988,20 +1022,243 @@ def gate_corpus_integrity(records: List[Dict], benchmark_dir: Path) -> GateResul
                       })
 
 
+# ─── Gate 14: Content-Risk Gate (V2.3) ──────────────────────────────────────
+
+def gate_content_risk(records: List[Dict]) -> GateResult:
+    """
+    V2.3 Task 1: Production content-risk gate.
+    Scans the actual corpus using BLOCKING_CONTENT_PATTERNS and GCC_TRIP_PHRASES.
+
+    Severity A — BLOCKED:
+      Any match on BLOCKING_CONTENT_PATTERNS (e.g. '100% guaranteed').
+      Makes the final mechanical verdict NOT_READY.
+      Prevents training authorization.
+
+    Severity B — REVIEW_REQUIRED:
+      Any match on GCC_TRIP_PHRASES (culturally sensitive phrases).
+      Adds record to human-review attention list.
+      Prevents training/release authorization.
+      Does not silently disappear behind an overall PASS.
+
+    Each finding records: example_id, field, rule, safe excerpt.
+    """
+    blocked_findings = []
+    review_required_findings = []
+
+    for r in records:
+        eid = r.get("example_id", "?")
+        for field in ("prompt", "response"):
+            text = r.get(field, "")
+
+            # Severity A: BLOCKED
+            for pat, rule_name in BLOCKING_CONTENT_PATTERNS:
+                m = pat.search(text)
+                if m:
+                    start = max(0, m.start() - 30)
+                    end = min(len(text), m.end() + 30)
+                    excerpt = text[start:end].replace("\n", " ")
+                    blocked_findings.append({
+                        "example_id": eid,
+                        "field": field,
+                        "rule": rule_name,
+                        "excerpt": excerpt[:120],
+                        "severity": "BLOCKED",
+                    })
+
+            # Severity B: REVIEW_REQUIRED
+            for pat in GCC_TRIP_PHRASES:
+                m = pat.search(text)
+                if m:
+                    start = max(0, m.start() - 30)
+                    end = min(len(text), m.end() + 30)
+                    excerpt = text[start:end].replace("\n", " ")
+                    review_required_findings.append({
+                        "example_id": eid,
+                        "field": field,
+                        "rule": repr(pat.pattern),
+                        "excerpt": excerpt[:120],
+                        "severity": "REVIEW_REQUIRED",
+                    })
+
+    all_findings = blocked_findings + review_required_findings
+
+    if blocked_findings:
+        return GateResult(
+            14, "Content-Risk", BLOCKED,
+            f"{len(blocked_findings)} BLOCKED finding(s) and "
+            f"{len(review_required_findings)} REVIEW_REQUIRED finding(s). "
+            f"Blocked records must not be used for training.",
+            errors=[
+                f"BLOCKED | {f['example_id']} [{f['field']}] | {f['rule']} | {repr(f['excerpt'])}"
+                for f in blocked_findings
+            ],
+            warnings=[
+                f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule'][:40]} | {repr(f['excerpt'])}"
+                for f in review_required_findings
+            ],
+            metadata={
+                "blocked_count": len(blocked_findings),
+                "review_required_count": len(review_required_findings),
+                "blocked_records": [f["example_id"] for f in blocked_findings],
+                "review_required_records": list({f["example_id"] for f in review_required_findings}),
+            },
+        )
+
+    if review_required_findings:
+        return GateResult(
+            14, "Content-Risk", REVIEW_REQUIRED,
+            f"0 BLOCKED, {len(review_required_findings)} REVIEW_REQUIRED finding(s). "
+            f"Records must appear in human-review queue before training/release authorization.",
+            warnings=[
+                f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule'][:40]} | {repr(f['excerpt'])}"
+                for f in review_required_findings
+            ],
+            metadata={
+                "blocked_count": 0,
+                "review_required_count": len(review_required_findings),
+                "review_required_records": list({f["example_id"] for f in review_required_findings}),
+                "findings": review_required_findings,
+            },
+        )
+
+    return GateResult(
+        14, "Content-Risk", PASS,
+        "No BLOCKED or REVIEW_REQUIRED content found in corpus.",
+        metadata={"blocked_count": 0, "review_required_count": 0},
+    )
+
+
+# ─── Gate 15: Review-queue coverage (V2.3 Task 4) ─────────────────────────────
+
+def gate_review_queue_coverage(
+    records: List[Dict],
+    data_dir: Path,
+    content_risk_gate: GateResult,
+) -> GateResult:
+    """
+    V2.3 Task 4: For every REVIEW_REQUIRED corpus record, verify it appears
+    in the authoritative human-review queue JSONL.
+    Returns exit-code 2 (MECHANICALLY_BLOCKED) if any required-review record
+    is absent from the queue.
+    Human judgment fields must remain empty.
+    """
+    # Identify REVIEW_REQUIRED records from Gate 14
+    review_required_ids: set = set()
+    if content_risk_gate.metadata:
+        review_required_ids = set(
+            content_risk_gate.metadata.get("review_required_records", [])
+        )
+
+    if not review_required_ids:
+        return GateResult(
+            15, "Review-Queue Coverage", PASS,
+            "No REVIEW_REQUIRED records to verify.",
+        )
+
+    # Load the authoritative queue JSONL from the data directory
+    queue_path = data_dir / "human_review_queue.jsonl"
+    if not queue_path.exists():
+        return GateResult(
+            15, "Review-Queue Coverage", BLOCKED,
+            "human_review_queue.jsonl not found — cannot verify coverage.",
+            errors=[f"Queue file not found: {queue_path}"],
+        )
+
+    queue_ids: set = set()
+    illegal_approvals = []
+    with queue_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                qr = json.loads(line)
+                queue_ids.add(qr.get("example_id", ""))
+                # Check no human judgment fields are populated
+                for jf in REVIEWER_JUDGMENT_FIELDS:
+                    val = qr.get(jf, "")
+                    if val and str(val).strip():
+                        illegal_approvals.append(
+                            f"{qr.get('example_id', '?')}: reviewer field '{jf}' is populated"
+                        )
+            except json.JSONDecodeError:
+                pass
+
+    missing = sorted(review_required_ids - queue_ids)
+    errors = []
+    warnings = []
+
+    if missing:
+        errors.append(
+            f"{len(missing)} REVIEW_REQUIRED record(s) absent from human-review queue: {missing}"
+        )
+
+    if illegal_approvals:
+        errors.append(
+            f"{len(illegal_approvals)} reviewer judgment field(s) illegally populated by software"
+        )
+        errors.extend(illegal_approvals[:5])
+
+    if errors:
+        return GateResult(
+            15, "Review-Queue Coverage", BLOCKED,
+            f"Review-queue coverage failed: {len(errors)} error(s). Exit code 2 required.",
+            errors=errors,
+            warnings=warnings,
+            metadata={
+                "review_required_ids": sorted(review_required_ids),
+                "queue_ids_found": sorted(queue_ids & review_required_ids),
+                "missing_from_queue": missing,
+            },
+        )
+
+    return GateResult(
+        15, "Review-Queue Coverage", PASS,
+        f"All {len(review_required_ids)} REVIEW_REQUIRED record(s) present in queue. "
+        f"No reviewer judgment fields populated.",
+        warnings=warnings,
+        metadata={
+            "review_required_ids": sorted(review_required_ids),
+            "queue_coverage": "COMPLETE",
+        },
+    )
+
+
 # ─── Report writer ────────────────────────────────────────────────────────
 
 def write_report(gates: List[GateResult], output_path: Path,
                  honest_count: Dict, dataset_version: str) -> str:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Gate 12 (human review) is expected NOT_READY; Gate 13 (corpus) must PASS
-    all_passed = all(g.passed for g in gates if g.gate_id not in (12,))
+    # Gate 12 (human review) is expected NOT_READY.
+    # Gates 14/15 may be BLOCKED or REVIEW_REQUIRED (not a FAIL, but blocks authorization).
+    # All other gates must PASS for mechanical readiness.
     gate12 = next((g for g in gates if g.gate_id == 12), None)
+    gate14 = next((g for g in gates if g.gate_id == 14), None)
+    gate15 = next((g for g in gates if g.gate_id == 15), None)
 
-    if all_passed and gate12 and gate12.status == NOT_READY:
-        final_verdict = "MECHANICALLY READY FOR INDEPENDENT AUDIT — HUMAN REVIEW NOT YET AUTHORIZED"
+    has_fail = any(g.status == FAIL for g in gates)
+    has_blocked = any(g.status == BLOCKED for g in gates)
+    has_review_req = any(g.status == REVIEW_REQUIRED for g in gates)
+    all_mechanical_pass = all(
+        g.passed for g in gates
+        if g.gate_id not in (12, 14, 15)  # 12=human-review, 14/15=content-risk
+    )
+
+    if has_fail:
+        final_verdict = "MECHANICAL_FAILURE — HUMAN REVIEW MUST NOT BEGIN"
+    elif has_blocked:
+        final_verdict = "MECHANICALLY_BLOCKED — BLOCKED CONTENT MUST BE RESOLVED BEFORE HUMAN REVIEW"
+    elif has_review_req and all_mechanical_pass:
+        rr_ids = gate14.metadata.get('review_required_records', []) if gate14 else []
+        final_verdict = (
+            f"MECHANICALLY_BLOCKED — {len(rr_ids)} REVIEW_REQUIRED RECORD(S) PENDING HUMAN JUDGMENT: "
+            f"{sorted(rr_ids)}"
+        )
+    elif all_mechanical_pass and gate12 and gate12.status == NOT_READY:
+        final_verdict = "MECHANICALLY_READY_FOR_HUMAN_REVIEW — GATE 12 PENDING HUMAN JUDGMENT"
     else:
-        final_verdict = "JUPITER SEED 4B V2 TOOLING NOT READY"
+        final_verdict = "JUPITER SEED 4B NOT READY"
 
     lines = [
         "# Jupiter Seed 4B: Dataset Readiness Gate Report",
@@ -1101,6 +1358,12 @@ def main() -> None:
 
     dataset_version = records[0].get("dataset_version", "unknown")
 
+    # Run all gates
+    g_content_risk = gate_content_risk(records)  # V2.3 Gate 14
+    g_review_coverage = gate_review_queue_coverage(  # V2.3 Gate 15
+        records, args.data_dir, g_content_risk
+    )
+
     gates = [
         gate_schema(records),
         gate_provenance(records),
@@ -1114,7 +1377,9 @@ def main() -> None:
         gate_benchmark_manifest(args.benchmark_dir),
         gate_test_suite(args.repo_root),
         gate_human_review(records),
-        gate_corpus_integrity(records, args.benchmark_dir),  # V2.2 Task 5
+        gate_corpus_integrity(records, args.benchmark_dir),  # V2.2 Gate 13
+        g_content_risk,                                      # V2.3 Gate 14
+        g_review_coverage,                                   # V2.3 Gate 15
     ]
 
     verdict = write_report(gates, args.output, honest_count, dataset_version)
@@ -1123,17 +1388,33 @@ def main() -> None:
     failed = sum(1 for g in gates if g.status == FAIL)
     not_ready = sum(1 for g in gates if g.status == NOT_READY)
     warned = sum(1 for g in gates if g.status == WARN)
+    blocked = sum(1 for g in gates if g.status == BLOCKED)
+    review_req = sum(1 for g in gates if g.status == REVIEW_REQUIRED)
 
     log.info("=== READINESS GATE SUMMARY ===")
-    log.info("Gates passed: %d / 13", passed)
+    log.info("Gates passed: %d / 15", passed)
     log.info("Gates failed: %d", failed)
+    log.info("Gates blocked: %d", blocked)
+    log.info("Gates review_required: %d", review_req)
     log.info("Gates not_ready: %d", not_ready)
     log.info("Gates warned: %d", warned)
     log.info("Honest dataset size: %d / %d (shortfall: %d)", actual, authorized, shortfall)
     log.info("Final verdict: %s", verdict)
 
+    # V2.3 Task 3: Unambiguous 4-code exit contract
+    # Exit 1: any mechanical gate FAIL
     if failed > 0:
-        sys.exit(1)
+        log.info("Exit code: %d (MECHANICAL_FAILURE)", EXIT_MECHANICAL_FAILURE)
+        sys.exit(EXIT_MECHANICAL_FAILURE)
+
+    # Exit 2: any BLOCKED or REVIEW_REQUIRED gate (content risk or queue coverage)
+    if blocked > 0 or review_req > 0:
+        log.info("Exit code: %d (MECHANICALLY_BLOCKED)", EXIT_MECHANICALLY_BLOCKED)
+        sys.exit(EXIT_MECHANICALLY_BLOCKED)
+
+    # Exit 0: all mechanical gates pass; Gate 12 pending human judgment (expected NOT_READY)
+    log.info("Exit code: %d (MECHANICALLY_READY_FOR_HUMAN_REVIEW)", EXIT_MECHANICALLY_READY)
+    sys.exit(EXIT_MECHANICALLY_READY)
 
 
 if __name__ == "__main__":

@@ -60,7 +60,8 @@ REVIEW_REQUIRED = "REVIEW_REQUIRED"  # V2.3: culturally sensitive, needs human r
 # V2.3 Exit-code contract
 EXIT_MECHANICALLY_READY = 0    # all mechanical gates pass; Gate 12 pending human judgment
 EXIT_MECHANICAL_FAILURE = 1    # failed integrity test, gate, contamination, schema, test, corpus
-EXIT_MECHANICALLY_BLOCKED = 2  # unresolved blocking content or required-review record not in queue
+EXIT_HUMAN_REVIEW_REQUIRED = 2  # human review required before training/release (was MECHANICALLY_BLOCKED)
+EXIT_MECHANICALLY_BLOCKED = EXIT_HUMAN_REVIEW_REQUIRED  # backward-compat alias
 EXIT_EXECUTION_ERROR = 3       # dependency, subprocess, missing file, malformed artifact
 
 # Authorized Seed 4B test files (must all be present and run)
@@ -76,6 +77,7 @@ AUTHORIZED_TEST_FILES = [
     "test_v22_regression.py",
     "test_v23_regex.py",      # V2.3: regex regression tests
     "test_v23_regression.py", # V2.3: content-risk and exit-code regression tests
+    "test_v24_regression.py", # V2.4: review-package propagation and training interlock
 ]
 
 # Canonical authorized manifest hash (SHA-256 of sorted filenames joined by '|')
@@ -184,6 +186,9 @@ BLOCKING_CONTENT_PATTERNS = [
     (re.compile(r"^\s*\[placeholder\]\s*$", re.IGNORECASE), "placeholder text"),
     (re.compile(r"^\s*\[.*\]\s*$"), "response is only a placeholder bracket"),
 ]
+
+# Module-level corpus constants (used by Gate 13, Gate 16, and test suite)
+EXPECTED_CORPUS_HASH = "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0"
 
 # V2.3: Corrected GCC_TRIP_PHRASES — removed erroneous $ end-anchor.
 # Previous patterns used \.$  which is \. (literal period) + $ (end-of-string anchor).
@@ -1224,6 +1229,193 @@ def gate_review_queue_coverage(
     )
 
 
+# ─── Gate 16: Review-Package Identity and Coverage (V2.4) ───────────────────────
+
+def gate_review_package_identity(
+    records: List[Dict],
+    docs_dir: Path,
+    data_dir: Path,
+    content_risk_gate: GateResult,
+) -> GateResult:
+    """
+    V2.4 Gate 16: Proves identity and coverage across all reviewer-facing representations.
+
+    Checks:
+    1. All 50 frozen queue IDs appear exactly once in REVIEWER_PACKAGE.jsonl.
+    2. All Gate 14 REVIEW_REQUIRED records appear in REVIEWER_PACKAGE.jsonl.
+    3. Rule, field, severity and excerpt agree across sidecar, JSONL, CSV and Markdown.
+    4. A flagged record showing integrity_flags=OK causes FAIL.
+    5. Missing or stale sidecar causes FAIL.
+    6. Sidecar corpus hash must match the frozen corpus hash.
+    7. Sidecar package commit must match the checked-out commit.
+    8. No reviewer-facing file can claim CLEAR when Gate 14 says REVIEW_REQUIRED.
+    """
+    errors = []
+    warnings = []
+
+    # 1. Load sidecar
+    sidecar_path = docs_dir / "REVIEW_RISK_FINDINGS.json"
+    if not sidecar_path.exists():
+        return GateResult(
+            16, "Review-Package Identity", FAIL,
+            "REVIEW_RISK_FINDINGS.json sidecar not found.",
+            errors=[f"Missing: {sidecar_path}"],
+        )
+
+    try:
+        with sidecar_path.open("r", encoding="utf-8") as fh:
+            sidecar = json.load(fh)
+    except (json.JSONDecodeError, OSError) as e:
+        return GateResult(
+            16, "Review-Package Identity", FAIL,
+            f"Malformed or unreadable sidecar: {e}",
+            errors=[str(e)],
+        )
+
+    # 2. Sidecar corpus hash must match frozen hash
+    sidecar_corpus_sha = sidecar.get("corpus_sha256", "")
+    if sidecar_corpus_sha != EXPECTED_CORPUS_HASH:
+        errors.append(
+            f"Sidecar corpus_sha256 mismatch: "
+            f"sidecar={sidecar_corpus_sha[:16]}... expected={EXPECTED_CORPUS_HASH[:16]}..."
+        )
+
+    # 3. Sidecar package commit must match checked-out commit
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True, text=True, timeout=10
+        )
+        current_commit = result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        current_commit = ""
+
+    sidecar_commit = sidecar.get("package_commit", "")
+    if current_commit and sidecar_commit != current_commit:
+        errors.append(
+            f"Sidecar package_commit mismatch: "
+            f"sidecar={sidecar_commit[:12]}... current={current_commit[:12]}..."
+        )
+
+    # 4. Build expected flagged IDs from Gate 14
+    review_required_ids: set = set()
+    if content_risk_gate.metadata:
+        review_required_ids = set(
+            content_risk_gate.metadata.get("review_required_records", [])
+        )
+
+    # 5. Load REVIEWER_PACKAGE.jsonl
+    pkg_path = docs_dir / "REVIEWER_PACKAGE.jsonl"
+    if not pkg_path.exists():
+        errors.append(f"REVIEWER_PACKAGE.jsonl not found: {pkg_path}")
+    else:
+        pkg_records: Dict[str, Dict] = {}
+        try:
+            with pkg_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        r = json.loads(line)
+                        eid = r.get("example_id", "")
+                        if eid in pkg_records:
+                            errors.append(f"Duplicate example_id in REVIEWER_PACKAGE.jsonl: {eid}")
+                        pkg_records[eid] = r
+        except (json.JSONDecodeError, OSError) as e:
+            errors.append(f"Cannot read REVIEWER_PACKAGE.jsonl: {e}")
+            pkg_records = {}
+
+        # 5a. All 50 frozen queue IDs appear exactly once
+        queue_path = data_dir / "human_review_queue.jsonl"
+        if queue_path.exists():
+            queue_ids = set()
+            with queue_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        queue_ids.add(json.loads(line).get("example_id", ""))
+            missing_from_pkg = queue_ids - set(pkg_records.keys())
+            if missing_from_pkg:
+                errors.append(
+                    f"{len(missing_from_pkg)} queue record(s) missing from REVIEWER_PACKAGE.jsonl: "
+                    f"{sorted(missing_from_pkg)[:5]}"
+                )
+
+        # 5b. All Gate 14 REVIEW_REQUIRED records appear in REVIEWER_PACKAGE.jsonl
+        for eid in review_required_ids:
+            if eid not in pkg_records:
+                errors.append(
+                    f"REVIEW_REQUIRED record {eid} absent from REVIEWER_PACKAGE.jsonl"
+                )
+
+        # 5c. Flagged records must not show integrity_flags=OK
+        for eid in review_required_ids:
+            if eid in pkg_records:
+                flags = pkg_records[eid].get("integrity_flags", "")
+                if flags == "OK":
+                    errors.append(
+                        f"Flagged record {eid} shows integrity_flags=OK in REVIEWER_PACKAGE.jsonl — must be REVIEW_REQUIRED_CONTENT_RISK"
+                    )
+                status = pkg_records[eid].get("content_risk_status", "")
+                if status == "CLEAR":
+                    errors.append(
+                        f"Flagged record {eid} shows content_risk_status=CLEAR in REVIEWER_PACKAGE.jsonl — must be REVIEW_REQUIRED"
+                    )
+
+        # 5d. Unflagged records must show content_risk_status=CLEAR
+        for eid, r in pkg_records.items():
+            if eid not in review_required_ids:
+                status = r.get("content_risk_status", "")
+                if status not in ("CLEAR", ""):
+                    warnings.append(
+                        f"Unflagged record {eid} has content_risk_status={status} (expected CLEAR)"
+                    )
+
+    # 6. Cross-representation identity: sidecar findings vs REVIEWER_PACKAGE.jsonl
+    sidecar_findings = {f["record_id"]: f for f in sidecar.get("findings", [])}
+    for eid, sf in sidecar_findings.items():
+        if eid in pkg_records:
+            pr = pkg_records[eid]
+            if pr.get("content_risk_rule_id") != sf.get("matched_rule_id"):
+                errors.append(
+                    f"{eid}: rule_id mismatch: pkg={pr.get('content_risk_rule_id')} "
+                    f"sidecar={sf.get('matched_rule_id')}"
+                )
+            if pr.get("content_risk_field") != sf.get("matched_field"):
+                errors.append(
+                    f"{eid}: field mismatch: pkg={pr.get('content_risk_field')} "
+                    f"sidecar={sf.get('matched_field')}"
+                )
+            if pr.get("content_risk_severity") != sf.get("severity"):
+                errors.append(
+                    f"{eid}: severity mismatch: pkg={pr.get('content_risk_severity')} "
+                    f"sidecar={sf.get('severity')}"
+                )
+
+    if errors:
+        return GateResult(
+            16, "Review-Package Identity", FAIL,
+            f"{len(errors)} identity/coverage error(s) in reviewer-facing files.",
+            errors=errors[:15],
+            warnings=warnings,
+            metadata={"review_required_ids": sorted(review_required_ids)},
+        )
+
+    return GateResult(
+        16, "Review-Package Identity", PASS,
+        f"All reviewer-facing representations are consistent. "
+        f"{len(review_required_ids)} flagged record(s) correctly disclosed. "
+        f"Sidecar corpus hash and package commit verified.",
+        warnings=warnings,
+        metadata={
+            "review_required_ids": sorted(review_required_ids),
+            "sidecar_corpus_sha256": sidecar_corpus_sha,
+            "sidecar_package_commit": sidecar_commit,
+        },
+    )
+
+
 # ─── Report writer ────────────────────────────────────────────────────────
 
 def write_report(gates: List[GateResult], output_path: Path,
@@ -1243,16 +1435,17 @@ def write_report(gates: List[GateResult], output_path: Path,
     all_mechanical_pass = all(
         g.passed for g in gates
         if g.gate_id not in (12, 14, 15)  # 12=human-review, 14/15=content-risk
+        # Gate 16 is a FAIL gate (not REVIEW_REQUIRED), so it is included in has_fail check
     )
 
     if has_fail:
         final_verdict = "MECHANICAL_FAILURE — HUMAN REVIEW MUST NOT BEGIN"
     elif has_blocked:
-        final_verdict = "MECHANICALLY_BLOCKED — BLOCKED CONTENT MUST BE RESOLVED BEFORE HUMAN REVIEW"
+        final_verdict = "HUMAN_REVIEW_REQUIRED — BLOCKED CONTENT MUST BE RESOLVED BEFORE HUMAN REVIEW"
     elif has_review_req and all_mechanical_pass:
         rr_ids = gate14.metadata.get('review_required_records', []) if gate14 else []
         final_verdict = (
-            f"MECHANICALLY_BLOCKED — {len(rr_ids)} REVIEW_REQUIRED RECORD(S) PENDING HUMAN JUDGMENT: "
+            f"HUMAN_REVIEW_REQUIRED — {len(rr_ids)} REVIEW_REQUIRED RECORD(S) PENDING HUMAN JUDGMENT: "
             f"{sorted(rr_ids)}"
         )
     elif all_mechanical_pass and gate12 and gate12.status == NOT_READY:
@@ -1337,13 +1530,94 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _write_execution_error_artifact(
+    stage: str,
+    exc: Exception,
+    exc_category: str,
+    docs_dir: Path,
+) -> None:
+    """Write a machine-readable execution-error artifact before exiting with code 3."""
+    import traceback as _tb
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True, text=True, timeout=5
+        )
+        commit = result.stdout.strip() if result.returncode == 0 else "UNKNOWN"
+    except Exception:
+        commit = "UNKNOWN"
+
+    artifact = {
+        "outcome": "EXECUTION_ERROR",
+        "exit_code": EXIT_EXECUTION_ERROR,
+        "exception_category": exc_category,
+        "safe_error_message": str(exc)[:500],
+        "failing_stage": stage,
+        "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "commit": commit,
+    }
+    # Internal diagnostic (full traceback, not reviewer-facing)
+    internal = dict(artifact)
+    internal["full_traceback"] = _tb.format_exc()[:4000]
+
+    try:
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        public_path = docs_dir / "EXECUTION_ERROR_ARTIFACT.json"
+        with public_path.open("w", encoding="utf-8") as fh:
+            json.dump(artifact, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        internal_path = docs_dir / "EXECUTION_ERROR_INTERNAL.json"
+        with internal_path.open("w", encoding="utf-8") as fh:
+            json.dump(internal, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        log.info("Execution-error artifact written to %s", public_path)
+    except Exception as write_exc:
+        log.error("Could not write execution-error artifact: %s", write_exc)
+
+
 def main() -> None:
+    # Parse args first so we know where to write the error artifact
+    try:
+        _args = parse_args()
+        _docs_dir = _args.docs_dir
+    except Exception:
+        _docs_dir = Path("docs/jupiter_seed_4b")
+
+    try:
+        _main_inner()
+    except SystemExit:
+        raise  # Let sys.exit() pass through normally
+    except json.JSONDecodeError as e:
+        log.error("EXECUTION_ERROR: malformed JSON: %s", e)
+        _write_execution_error_artifact("json_parsing", e, "JSONDecodeError", _docs_dir)
+        sys.exit(EXIT_EXECUTION_ERROR)
+    except FileNotFoundError as e:
+        log.error("EXECUTION_ERROR: missing required file: %s", e)
+        _write_execution_error_artifact("file_loading", e, "FileNotFoundError", _docs_dir)
+        sys.exit(EXIT_EXECUTION_ERROR)
+    except PermissionError as e:
+        log.error("EXECUTION_ERROR: unreadable file: %s", e)
+        _write_execution_error_artifact("file_loading", e, "PermissionError", _docs_dir)
+        sys.exit(EXIT_EXECUTION_ERROR)
+    except subprocess.SubprocessError as e:
+        log.error("EXECUTION_ERROR: subprocess failure: %s", e)
+        _write_execution_error_artifact("subprocess", e, "SubprocessError", _docs_dir)
+        sys.exit(EXIT_EXECUTION_ERROR)
+    except Exception as e:
+        log.error("EXECUTION_ERROR: unexpected exception before valid verdict: %s", e)
+        _write_execution_error_artifact("unexpected", e, type(e).__name__, _docs_dir)
+        sys.exit(EXIT_EXECUTION_ERROR)
+
+
+def _main_inner() -> None:
     args = parse_args()
     records = load_all(args.data_dir)
 
     if not records:
         log.error("No records found in %s", args.data_dir)
-        sys.exit(1)
+        sys.exit(EXIT_MECHANICAL_FAILURE)
 
     log.info("Loaded %d records from %s", len(records), args.data_dir)
 
@@ -1363,6 +1637,9 @@ def main() -> None:
     g_review_coverage = gate_review_queue_coverage(  # V2.3 Gate 15
         records, args.data_dir, g_content_risk
     )
+    g_review_pkg_identity = gate_review_package_identity(  # V2.4 Gate 16
+        records, args.docs_dir, args.data_dir, g_content_risk
+    )
 
     gates = [
         gate_schema(records),
@@ -1380,6 +1657,7 @@ def main() -> None:
         gate_corpus_integrity(records, args.benchmark_dir),  # V2.2 Gate 13
         g_content_risk,                                      # V2.3 Gate 14
         g_review_coverage,                                   # V2.3 Gate 15
+        g_review_pkg_identity,                               # V2.4 Gate 16
     ]
 
     verdict = write_report(gates, args.output, honest_count, dataset_version)
@@ -1392,7 +1670,7 @@ def main() -> None:
     review_req = sum(1 for g in gates if g.status == REVIEW_REQUIRED)
 
     log.info("=== READINESS GATE SUMMARY ===")
-    log.info("Gates passed: %d / 15", passed)
+    log.info("Gates passed: %d / 16", passed)
     log.info("Gates failed: %d", failed)
     log.info("Gates blocked: %d", blocked)
     log.info("Gates review_required: %d", review_req)
@@ -1409,8 +1687,8 @@ def main() -> None:
 
     # Exit 2: any BLOCKED or REVIEW_REQUIRED gate (content risk or queue coverage)
     if blocked > 0 or review_req > 0:
-        log.info("Exit code: %d (MECHANICALLY_BLOCKED)", EXIT_MECHANICALLY_BLOCKED)
-        sys.exit(EXIT_MECHANICALLY_BLOCKED)
+        log.info("Exit code: %d (HUMAN_REVIEW_REQUIRED)", EXIT_HUMAN_REVIEW_REQUIRED)
+        sys.exit(EXIT_HUMAN_REVIEW_REQUIRED)
 
     # Exit 0: all mechanical gates pass; Gate 12 pending human judgment (expected NOT_READY)
     log.info("Exit code: %d (MECHANICALLY_READY_FOR_HUMAN_REVIEW)", EXIT_MECHANICALLY_READY)

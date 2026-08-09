@@ -1,0 +1,21 @@
+{
+  "_schema_note": "This template must be completed by a human authorizer. Software must never populate human approval fields or set authorization_status to APPROVED. All fields marked HUMAN_REQUIRED must be filled by a named human before training may begin.",
+  "schema_version": "1.0",
+  "corpus_sha256": "HUMAN_REQUIRED — must match 123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
+  "dataset_content_commit": "HUMAN_REQUIRED — must match 2e36f6b977a8af052fced5a532c1168dc1988b6f",
+  "readiness_package_commit": "HUMAN_REQUIRED — must match the commit of the readiness package reviewed",
+  "human_review_status": "HUMAN_REQUIRED — must be COMPLETE",
+  "accepted_count": "HUMAN_REQUIRED — integer: number of records accepted by human reviewer",
+  "revised_count": "HUMAN_REQUIRED — integer: number of records revised by human reviewer",
+  "rejected_count": "HUMAN_REQUIRED — integer: number of records rejected by human reviewer",
+  "unresolved_count": "HUMAN_REQUIRED — integer: must be 0 before authorization",
+  "legal_review_status": "HUMAN_REQUIRED — must be APPROVED",
+  "approved_model_id": "HUMAN_REQUIRED — exact HuggingFace model ID approved for training (e.g. Qwen/Qwen3-4B)",
+  "approval_scope": "HUMAN_REQUIRED — describe the approved use (e.g. internal-only distillation, GCC enterprise pilot)",
+  "maximum_budget_usd": "HUMAN_REQUIRED — maximum approved compute spend in USD",
+  "approved_by": "HUMAN_REQUIRED — full name of the human authorizer",
+  "approved_at_utc": "HUMAN_REQUIRED — ISO 8601 UTC timestamp of approval",
+  "authorization_status": "HUMAN_REQUIRED — must be APPROVED (software must never set this)",
+  "signature_or_typed_confirmation": "HUMAN_REQUIRED — typed confirmation: 'I [full name] authorize training of [model_id] on Jupiter Seed 4B dataset commit [dataset_content_commit] on [date]'",
+  "_software_prohibition": "SOFTWARE MUST NEVER: populate approved_by, approved_at_utc, authorization_status, signature_or_typed_confirmation, human_review_status, legal_review_status, accepted_count, revised_count, rejected_count, unresolved_count, or any other human judgment field. Any automated population of these fields is a critical compliance violation."
+}

@@ -312,6 +312,172 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Training Interlock (V2.4)
+# ---------------------------------------------------------------------------
+
+EXPECTED_CORPUS_SHA256 = (
+    "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0"
+)
+EXPECTED_DATASET_CONTENT_COMMIT = "2e36f6b977a8af052fced5a532c1168dc1988b6f"
+
+HUMAN_APPROVAL_FIELDS = [
+    "approved_by",
+    "approved_at_utc",
+    "authorization_status",
+    "signature_or_typed_confirmation",
+    "human_review_status",
+    "legal_review_status",
+    "accepted_count",
+    "revised_count",
+    "rejected_count",
+    "unresolved_count",
+]
+
+
+def check_training_authorization(
+    auth_path: Path,
+    model_id: str,
+    requested_budget_usd: float,
+) -> None:
+    """
+    V2.4 Training Interlock: Refuse non-dry-run execution unless a valid
+    human-completed authorization artifact exists.
+
+    Checks (in order, before any model download, GPU init, or data load):
+    1. Authorization artifact exists.
+    2. authorization_status == APPROVED.
+    3. human_review_status == COMPLETE.
+    4. unresolved_count == 0.
+    5. legal_review_status == APPROVED.
+    6. corpus_sha256 matches exactly.
+    7. dataset_content_commit matches exactly.
+    8. approved_model_id matches the requested model.
+    9. requested_budget_usd <= maximum_budget_usd.
+    10. approved_by is non-empty (human name required).
+    11. signature_or_typed_confirmation is non-empty.
+    12. Software-prohibited fields are not set to template placeholder values.
+
+    Raises SystemExit(1) on any failure — before any billable action.
+    """
+    if not auth_path.exists():
+        log.error(
+            "TRAINING INTERLOCK: Authorization artifact not found: %s", auth_path
+        )
+        log.error(
+            "Complete docs/jupiter_seed_4b/TRAINING_AUTHORIZATION_TEMPLATE.json "
+            "and save it as the authorization artifact before running training."
+        )
+        sys.exit(1)
+
+    try:
+        with auth_path.open("r", encoding="utf-8") as fh:
+            auth = json.load(fh)
+    except (json.JSONDecodeError, OSError) as e:
+        log.error("TRAINING INTERLOCK: Cannot read authorization artifact: %s", e)
+        sys.exit(1)
+
+    errors = []
+
+    # 1. authorization_status must be APPROVED
+    auth_status = str(auth.get("authorization_status", ""))
+    if auth_status != "APPROVED":
+        errors.append(
+            f"authorization_status must be APPROVED, got: {repr(auth_status)}"
+        )
+
+    # 2. human_review_status must be COMPLETE
+    hr_status = str(auth.get("human_review_status", ""))
+    if hr_status != "COMPLETE":
+        errors.append(
+            f"human_review_status must be COMPLETE, got: {repr(hr_status)}"
+        )
+
+    # 3. unresolved_count must be 0
+    try:
+        unresolved = int(auth.get("unresolved_count", -1))
+    except (ValueError, TypeError):
+        unresolved = -1
+    if unresolved != 0:
+        errors.append(
+            f"unresolved_count must be 0, got: {repr(auth.get('unresolved_count'))}"
+        )
+
+    # 4. legal_review_status must be APPROVED
+    legal_status = str(auth.get("legal_review_status", ""))
+    if legal_status != "APPROVED":
+        errors.append(
+            f"legal_review_status must be APPROVED, got: {repr(legal_status)}"
+        )
+
+    # 5. corpus_sha256 must match exactly
+    auth_corpus_sha = str(auth.get("corpus_sha256", ""))
+    if auth_corpus_sha != EXPECTED_CORPUS_SHA256:
+        errors.append(
+            f"corpus_sha256 mismatch: "
+            f"auth={auth_corpus_sha[:16]}... expected={EXPECTED_CORPUS_SHA256[:16]}..."
+        )
+
+    # 6. dataset_content_commit must match exactly
+    auth_commit = str(auth.get("dataset_content_commit", ""))
+    if auth_commit != EXPECTED_DATASET_CONTENT_COMMIT:
+        errors.append(
+            f"dataset_content_commit mismatch: "
+            f"auth={auth_commit[:12]}... expected={EXPECTED_DATASET_CONTENT_COMMIT[:12]}..."
+        )
+
+    # 7. approved_model_id must match the requested model
+    auth_model = str(auth.get("approved_model_id", ""))
+    if auth_model != model_id:
+        errors.append(
+            f"approved_model_id mismatch: auth={repr(auth_model)} requested={repr(model_id)}"
+        )
+
+    # 8. requested_budget_usd must not exceed maximum_budget_usd
+    try:
+        max_budget = float(auth.get("maximum_budget_usd", 0))
+    except (ValueError, TypeError):
+        max_budget = 0.0
+    if requested_budget_usd > max_budget:
+        errors.append(
+            f"Requested budget USD {requested_budget_usd:.2f} exceeds "
+            f"approved maximum USD {max_budget:.2f}"
+        )
+
+    # 9. approved_by must be non-empty
+    approved_by = str(auth.get("approved_by", "")).strip()
+    if not approved_by or "HUMAN_REQUIRED" in approved_by:
+        errors.append("approved_by must be a non-empty human name")
+
+    # 10. signature_or_typed_confirmation must be non-empty
+    sig = str(auth.get("signature_or_typed_confirmation", "")).strip()
+    if not sig or "HUMAN_REQUIRED" in sig:
+        errors.append("signature_or_typed_confirmation must be completed by a human")
+
+    # 11. No template placeholder values in human-approval fields
+    for field in HUMAN_APPROVAL_FIELDS:
+        val = str(auth.get(field, ""))
+        if "HUMAN_REQUIRED" in val:
+            errors.append(
+                f"Field '{field}' still contains template placeholder 'HUMAN_REQUIRED'"
+            )
+
+    if errors:
+        log.error("TRAINING INTERLOCK: Authorization failed with %d error(s):", len(errors))
+        for err in errors:
+            log.error("  - %s", err)
+        log.error(
+            "Training is BLOCKED. Complete the authorization artifact and resubmit."
+        )
+        sys.exit(1)
+
+    log.info(
+        "Training interlock passed. Authorized by: %s at %s",
+        approved_by,
+        auth.get("approved_at_utc", "UNKNOWN"),
+    )
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
@@ -322,7 +488,8 @@ def main() -> None:
     dataset_path = args.dataset_path or Path(cfg.get("dataset_path", "data/diagnostic_seed.jsonl"))
 
     if args.dry_run:
-        # Estimate without loading model
+        # DRY RUN ONLY — NO TRAINING AUTHORIZED
+        log.info("DRY RUN ONLY — NO TRAINING AUTHORIZED")
         num_examples = 500  # Default diagnostic size
         if dataset_path.exists():
             with dataset_path.open(encoding="utf-8") as fh:
@@ -339,10 +506,19 @@ def main() -> None:
             sys.exit(1)
         log.info(
             "Dry run complete. Estimated cost: USD %.2f. "
-            "Requires Farouq written approval before execution.",
+            "DRY RUN ONLY — NO TRAINING AUTHORIZED. "
+            "Requires human authorization artifact before execution.",
             estimate["estimated_cost_usd"],
         )
         return
+
+    # V2.4 TRAINING INTERLOCK: Must pass before any model download, GPU init, or data load
+    auth_path = Path(cfg.get(
+        "training_authorization_path",
+        "docs/jupiter_seed_4b/TRAINING_AUTHORIZATION.json"
+    ))
+    requested_budget = cfg.get("max_authorized_spend_usd", 0.0)
+    check_training_authorization(auth_path, BASE_MODEL_ID, float(requested_budget))
 
     run_training(cfg, dataset_path)
 

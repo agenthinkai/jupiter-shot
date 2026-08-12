@@ -357,16 +357,18 @@ class TestExitCode3Subprocess:
             (data_dir / "eval.jsonl").write_text("", encoding="utf-8")
             docs_dir = Path(tmpdir) / "docs"
             docs_dir.mkdir()
+            artifact_dir = Path(tmpdir) / "runtime_artifacts"
             result = run_gate([
                 "--data-dir", str(data_dir),
                 "--docs-dir", str(docs_dir),
+                "--artifact-dir", str(artifact_dir),
                 "--output", str(docs_dir / "READINESS_GATE_REPORT.md"),
             ])
             # Check artifact INSIDE the context manager before tmpdir is deleted
             assert result.returncode == EXIT_EXECUTION_ERROR, (
                 f"Expected exit 3, got {result.returncode}"
             )
-            artifact_path = docs_dir / "EXECUTION_ERROR_ARTIFACT.json"
+            artifact_path = artifact_dir / "EXECUTION_ERROR_ARTIFACT.json"
             assert artifact_path.exists(), (
                 f"EXECUTION_ERROR_ARTIFACT.json must be written on exit 3. "
                 f"Not found: {artifact_path}"
@@ -382,13 +384,15 @@ class TestExitCode3Subprocess:
             (data_dir / "eval.jsonl").write_text("", encoding="utf-8")
             docs_dir = Path(tmpdir) / "docs"
             docs_dir.mkdir()
+            artifact_dir = Path(tmpdir) / "runtime_artifacts"
             result = run_gate([
                 "--data-dir", str(data_dir),
                 "--docs-dir", str(docs_dir),
+                "--artifact-dir", str(artifact_dir),
                 "--output", str(docs_dir / "READINESS_GATE_REPORT.md"),
             ])
             assert result.returncode == EXIT_EXECUTION_ERROR
-            artifact_path = docs_dir / "EXECUTION_ERROR_ARTIFACT.json"
+            artifact_path = artifact_dir / "EXECUTION_ERROR_ARTIFACT.json"
             assert artifact_path.exists(), "Artifact must exist inside context manager"
             with artifact_path.open("r", encoding="utf-8") as fh:
                 artifact = json.load(fh)
@@ -409,10 +413,12 @@ class TestExitCode3Subprocess:
             (data_dir / "eval.jsonl").write_text("", encoding="utf-8")
             docs_dir = Path(tmpdir) / "docs"
             docs_dir.mkdir()
+            artifact_dir = Path(tmpdir) / "runtime_artifacts"
             report_path = docs_dir / "READINESS_GATE_REPORT.md"
             result = run_gate([
                 "--data-dir", str(data_dir),
                 "--docs-dir", str(docs_dir),
+                "--artifact-dir", str(artifact_dir),
                 "--output", str(report_path),
             ])
             assert result.returncode == EXIT_EXECUTION_ERROR

@@ -217,10 +217,10 @@ class TestGate11ExitCodeEnforcement:
 class TestAuthorizedTestManifest:
     """Tests for the authorized-test-manifest enforcement in Gate 11."""
 
-    def test_authorized_test_files_has_12_entries(self) -> None:
-        """AUTHORIZED_TEST_FILES must contain exactly 12 entries (V2.4.1 adds identity coverage)."""
-        assert len(AUTHORIZED_TEST_FILES) == 12, (
-            f"Expected 12 authorized test files, got {len(AUTHORIZED_TEST_FILES)}: "
+    def test_authorized_test_files_has_13_entries(self) -> None:
+        """AUTHORIZED_TEST_FILES must contain exactly 13 entries (V2.4.2 adds runtime-isolation coverage)."""
+        assert len(AUTHORIZED_TEST_FILES) == 13, (
+            f"Expected 13 authorized test files, got {len(AUTHORIZED_TEST_FILES)}: "
             f"{AUTHORIZED_TEST_FILES}"
         )
 
@@ -234,6 +234,12 @@ class TestAuthorizedTestManifest:
         """The V2.4.1 fail-closed identity suite must be enforced by Gate 11."""
         assert "test_v241_package_identity.py" in AUTHORIZED_TEST_FILES, (
             "test_v241_package_identity.py must be in AUTHORIZED_TEST_FILES"
+        )
+
+    def test_v242_execution_suite_in_authorized_files(self) -> None:
+        """The V2.4.2 runtime-isolation suite must be enforced by Gate 11."""
+        assert "test_v242_execution_isolation.py" in AUTHORIZED_TEST_FILES, (
+            "test_v242_execution_isolation.py must be in AUTHORIZED_TEST_FILES"
         )
 
     def test_no_duplicate_entries_in_authorized_files(self) -> None:

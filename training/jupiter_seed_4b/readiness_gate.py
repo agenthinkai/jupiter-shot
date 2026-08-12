@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
@@ -81,6 +82,7 @@ AUTHORIZED_TEST_FILES = [
     "test_v23_regression.py", # V2.3: content-risk and exit-code regression tests
     "test_v24_regression.py", # V2.4: review-package propagation and training interlock
     "test_v241_package_identity.py", # V2.4.1: fail-closed package identity
+    "test_v242_execution_isolation.py", # V2.4.2: exit classification and runtime isolation
 ]
 
 # Canonical authorized manifest hash (SHA-256 of sorted filenames joined by '|')
@@ -89,6 +91,22 @@ import hashlib as _hashlib
 AUTHORIZED_MANIFEST_HASH = _hashlib.sha256(
     "|".join(sorted(AUTHORIZED_TEST_FILES)).encode("utf-8")
 ).hexdigest()
+
+
+class RequiredEvidenceError(RuntimeError):
+    """Raised when required readiness evidence cannot be loaded or parsed.
+
+    This is intentionally distinct from a mechanical gate failure: no valid
+    evaluation can occur until the missing, unreadable, or malformed evidence
+    is repaired. The CLI maps it to EXIT_EXECUTION_ERROR (3).
+    """
+
+    def __init__(self, category: str, operation: str, path: Path | None, detail: str):
+        super().__init__(detail)
+        self.category = category
+        self.operation = operation
+        self.path = Path(path) if path is not None else None
+        self.detail = detail
 
 
 class GateResult:
@@ -320,14 +338,96 @@ GCC_TRIP_PHRASES = [
 ]
 
 
+def _require_directory(path: Path, operation: str) -> None:
+    if not path.exists() or not path.is_dir():
+        raise RequiredEvidenceError("missing_required_input", operation, path,
+                                    f"Required directory is missing: {path}")
+    try:
+        next(path.iterdir(), None)
+    except OSError as exc:
+        raise RequiredEvidenceError("unreadable_required_input", operation, path,
+                                    f"Required directory is unreadable: {path}") from exc
+
+
+def _require_readable_file(path: Path, operation: str) -> None:
+    if not path.exists() or not path.is_file():
+        raise RequiredEvidenceError("missing_required_input", operation, path,
+                                    f"Required file is missing: {path}")
+    try:
+        if path.stat().st_mode & 0o444 == 0:
+            raise PermissionError(f"no read permission bits set: {path}")
+        with path.open("r", encoding="utf-8") as fh:
+            fh.read(1)
+    except (OSError, UnicodeError) as exc:
+        raise RequiredEvidenceError("unreadable_required_input", operation, path,
+                                    f"Required file is unreadable: {path}") from exc
+
+
+def _validate_json_file(path: Path, operation: str) -> None:
+    _require_readable_file(path, operation)
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            json.load(fh)
+    except UnicodeError as exc:
+        raise RequiredEvidenceError("malformed_json", operation, path,
+                                    f"Required JSON is not valid UTF-8: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RequiredEvidenceError("malformed_json", operation, path,
+                                    f"Required JSON is malformed: {path}") from exc
+
+
+def _validate_jsonl_file(path: Path, operation: str) -> None:
+    _require_readable_file(path, operation)
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line_number, line in enumerate(fh, 1):
+                if line.strip():
+                    try:
+                        json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise RequiredEvidenceError(
+                            "malformed_jsonl", operation, path,
+                            f"Required JSONL is malformed at line {line_number}: {path}",
+                        ) from exc
+    except UnicodeError as exc:
+        raise RequiredEvidenceError("malformed_jsonl", operation, path,
+                                    f"Required JSONL is not valid UTF-8: {path}") from exc
+
+
+def preflight_required_evidence(args: argparse.Namespace) -> None:
+    """Validate all required inputs before evaluating a single mechanical gate.
+
+    Missing, unreadable, or malformed evidence is an execution failure (exit 3),
+    never a mechanical-quality verdict. Optional `--output` is intentionally
+    excluded: omitting it must not make a readiness run fail.
+    """
+    _require_directory(args.data_dir, "load corpus data directory")
+    for split in ("train", "valid", "eval"):
+        _validate_jsonl_file(args.data_dir / f"{split}.jsonl", f"load {split}.jsonl")
+    _validate_jsonl_file(args.data_dir / "human_review_queue.jsonl", "load human_review_queue.jsonl")
+
+    _require_directory(args.docs_dir, "load reviewer package directory")
+    _validate_json_file(args.docs_dir / "REVIEW_RISK_FINDINGS.json", "load review-risk sidecar")
+    _validate_jsonl_file(args.docs_dir / "REVIEWER_PACKAGE.jsonl", "load reviewer JSONL")
+    _require_readable_file(args.docs_dir / "REVIEWER_TEMPLATE.csv", "load reviewer CSV")
+    _require_readable_file(args.docs_dir / "ARABIC_HUMAN_REVIEW_QUEUE.md", "load reviewer Markdown")
+
+    _require_directory(args.benchmark_dir, "load benchmark directory")
+    _validate_json_file(args.benchmark_dir / "FROZEN_CORPUS_MANIFEST.json", "load frozen corpus manifest")
+    _validate_json_file(args.benchmark_dir / "FROZEN_BENCHMARK_MANIFEST.json", "load current benchmark manifest")
+
+    _require_directory(args.repo_root, "load repository root")
+    _require_directory(args.repo_root / "tests" / "jupiter_seed_4b", "load Seed test directory")
+
+
 def load_split(path: Path) -> List[Dict]:
-    if not path.exists():
-        return []
+    _validate_jsonl_file(path, f"load {path.name}")
     with path.open("r", encoding="utf-8") as fh:
-        return [json.loads(l) for l in fh if l.strip()]
+        return [json.loads(line) for line in fh if line.strip()]
 
 
 def load_all(data_dir: Path) -> List[Dict]:
+    _require_directory(data_dir, "load corpus data directory")
     records = []
     for split in ("train", "valid", "eval"):
         records.extend(load_split(data_dir / f"{split}.jsonl"))
@@ -858,6 +958,8 @@ def gate_test_suite(repo_root: Path) -> GateResult:
         env.pop("PYTHONUTF8", None)
         env.pop("PYTHONIOENCODING", None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # Nested tests use this marker to avoid recursively launching readiness.
+        env["JUPITER_GATE11_SUBPROCESS"] = "1"
 
         try:
             result = subprocess.run(
@@ -873,20 +975,26 @@ def gate_test_suite(repo_root: Path) -> GateResult:
                 cwd=str(repo_root),
                 env=env,
             )
-        except subprocess.TimeoutExpired:
-            return GateResult(11, "Test-Suite Result", FAIL,
-                              "Test suite timed out after 180 seconds")
-        except Exception as e:
-            return GateResult(11, "Test-Suite Result", FAIL, f"subprocess error: {e}")
+        except subprocess.TimeoutExpired as exc:
+            raise RequiredEvidenceError(
+                "subprocess_failure", "run authorized Seed test suite", test_dir,
+                "Authorized Seed test suite timed out after 180 seconds",
+            ) from exc
+        except Exception as exc:
+            raise RequiredEvidenceError(
+                "subprocess_failure", "run authorized Seed test suite", test_dir,
+                "Authorized Seed test suite could not be executed",
+            ) from exc
 
         end_ts = datetime.datetime.utcnow().isoformat() + "Z"
         exit_code = result.returncode
 
         # Parse JUnit XML (Defect 1: structured parsing, not text parsing)
         if not xml_path.exists() or xml_path.stat().st_size == 0:
-            return GateResult(11, "Test-Suite Result", FAIL,
-                              "JUnit XML result file missing or empty — cannot determine test outcome",
-                              errors=[result.stdout[-500:] if result.stdout else "no output"])
+            raise RequiredEvidenceError(
+                "missing_required_input", "read Gate 11 JUnit XML result", xml_path,
+                "Authorized test-suite result evidence is missing or empty",
+            )
 
         try:
             tree = ET.parse(str(xml_path))
@@ -915,10 +1023,11 @@ def gate_test_suite(repo_root: Path) -> GateResult:
 
             passed = collected - failed_count - errors_count - skipped_count
 
-        except ET.ParseError as e:
-            return GateResult(11, "Test-Suite Result", FAIL,
-                              f"JUnit XML malformed: {e}",
-                              errors=[result.stdout[-300:] if result.stdout else ""])
+        except ET.ParseError as exc:
+            raise RequiredEvidenceError(
+                "malformed_json", "parse Gate 11 JUnit XML result", xml_path,
+                "Authorized test-suite result evidence is malformed",
+            ) from exc
 
     # Defect 1: Gate 11 must NEVER pass when zero tests ran
     if collected == 0:
@@ -1516,10 +1625,8 @@ def gate_review_package_identity(
 
 # ─── Report writer ────────────────────────────────────────────────────────
 
-def write_report(gates: List[GateResult], output_path: Path,
+def write_report(gates: List[GateResult], output_path: Optional[Path],
                  honest_count: Dict, dataset_version: str) -> str:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
     # Gate 12 (human review) is expected NOT_READY.
     # Gates 14/15 may be BLOCKED or REVIEW_REQUIRED (not a FAIL, but blocks authorization).
     # All other gates must PASS for mechanical readiness.
@@ -1607,115 +1714,141 @@ def write_report(gates: List[GateResult], output_path: Path,
         "AI-ASSISTED INTERNAL CONTENT AUDIT — NOT HUMAN APPROVAL",
     ]
 
-    with output_path.open("w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
-    log.info("Readiness gate report written to %s", output_path)
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        log.info("Readiness gate report written to %s", output_path)
+    else:
+        log.info("Readiness gate report not written; no --output path was supplied")
     return final_verdict
 
 
+def _default_artifact_dir() -> Path:
+    run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:12]
+    return Path(tempfile.gettempdir()) / "jupiter_seed_4b" / run_id
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Jupiter Seed 4B — Dataset Readiness Gate v2.1")
+    parser = argparse.ArgumentParser(description="Jupiter Seed 4B — Dataset Readiness Gate v2.4.2")
     parser.add_argument("--data-dir", type=Path,
-                        default=Path("training/jupiter_seed_4b/data"))
+                        default=REPO_ROOT / "training" / "jupiter_seed_4b" / "data")
     parser.add_argument("--docs-dir", type=Path,
-                        default=Path("docs/jupiter_seed_4b"))
+                        default=REPO_ROOT / "docs" / "jupiter_seed_4b")
     parser.add_argument("--benchmark-dir", type=Path,
-                        default=Path("benchmarks/jupiter_seed_4b"))
-    parser.add_argument("--output", type=Path,
-                        default=Path("docs/jupiter_seed_4b/READINESS_GATE_REPORT.md"))
-    parser.add_argument("--repo-root", type=Path,
-                        default=Path("."))
+                        default=REPO_ROOT / "benchmarks" / "jupiter_seed_4b")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Optional readiness-report path. Omit for a read-only run.")
+    parser.add_argument("--artifact-dir", type=Path, default=None,
+                        help="Optional runtime directory for execution-error artifacts; defaults outside docs/.")
+    parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     return parser.parse_args()
 
 
-def _write_execution_error_artifact(
-    stage: str,
-    exc: Exception,
-    exc_category: str,
-    docs_dir: Path,
-) -> None:
-    """Write a machine-readable execution-error artifact before exiting with code 3."""
-    import traceback as _tb
+def _safe_package_commit(revision: str) -> str:
     try:
-        import subprocess as _sp
-        result = _sp.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=REPO_ROOT,
-            capture_output=True, text=True, timeout=5
-        )
-        commit = result.stdout.strip() if result.returncode == 0 else "UNKNOWN"
+        return resolve_git_commit(revision)
     except Exception:
-        commit = "UNKNOWN"
+        return "UNAVAILABLE"
+
+
+def _write_execution_error_artifact(
+    artifact_dir: Path,
+    exc: Exception,
+    fallback_category: str,
+) -> bool:
+    """Write a public atomic execution-error artifact outside reviewer documents.
+
+    The public artifact is deliberately summary-only: no traceback, environment
+    values, secrets, or corpus text. Internal diagnostics are not persisted by
+    this production path.
+    """
+    if isinstance(exc, RequiredEvidenceError):
+        category = exc.category
+        operation = exc.operation
+        failed_path = str(exc.path) if exc.path is not None else None
+        safe_message = exc.detail
+    else:
+        category = fallback_category
+        operation = "readiness execution"
+        failed_path = None
+        safe_message = f"{type(exc).__name__}: {str(exc)[:300]}"
 
     artifact = {
+        "schema_version": "2.0",
         "outcome": "EXECUTION_ERROR",
         "exit_code": EXIT_EXECUTION_ERROR,
-        "exception_category": exc_category,
-        "safe_error_message": str(exc)[:500],
-        "failing_stage": stage,
+        "error_category": category,
+        "error_type": type(exc).__name__,
+        "safe_message": safe_message[:500],
+        "failed_operation": operation,
         "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "commit": commit,
+        "package_release_commit": _safe_package_commit("HEAD"),
+        "package_source_commit": _safe_package_commit("HEAD^"),
+        "corpus_sha256": EXPECTED_CORPUS_HASH,
+        "training_authorized": False,
     }
-    # Internal diagnostic (full traceback, not reviewer-facing)
-    internal = dict(artifact)
-    internal["full_traceback"] = _tb.format_exc()[:4000]
+    if failed_path:
+        artifact["failed_path"] = failed_path
 
     try:
-        docs_dir.mkdir(parents=True, exist_ok=True)
-        public_path = docs_dir / "EXECUTION_ERROR_ARTIFACT.json"
-        with public_path.open("w", encoding="utf-8") as fh:
-            json.dump(artifact, fh, ensure_ascii=False, indent=2)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        public_path = artifact_dir / "EXECUTION_ERROR_ARTIFACT.json"
+        temporary_path = artifact_dir / f".{public_path.name}.{uuid.uuid4().hex}.tmp"
+        with temporary_path.open("w", encoding="utf-8") as fh:
+            json.dump(artifact, fh, ensure_ascii=False, indent=2, sort_keys=True)
             fh.write("\n")
-        internal_path = docs_dir / "EXECUTION_ERROR_INTERNAL.json"
-        with internal_path.open("w", encoding="utf-8") as fh:
-            json.dump(internal, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
-        log.info("Execution-error artifact written to %s", public_path)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary_path, public_path)
+        log.error("EXECUTION_ERROR artifact written to %s", public_path)
+        return True
     except Exception as write_exc:
-        log.error("Could not write execution-error artifact: %s", write_exc)
+        log.error("EXECUTION_ERROR artifact write failed; no public artifact persisted: %s", type(write_exc).__name__)
+        return False
+
+
+def _exit_execution_error(args: argparse.Namespace, exc: Exception, fallback_category: str) -> None:
+    artifact_dir = args.artifact_dir or _default_artifact_dir()
+    wrote = _write_execution_error_artifact(artifact_dir, exc, fallback_category)
+    if not wrote:
+        log.error("EXECUTION_ERROR safe fallback: %s", type(exc).__name__)
+    sys.exit(EXIT_EXECUTION_ERROR)
 
 
 def main() -> None:
-    # Parse args first so we know where to write the error artifact
-    try:
-        _args = parse_args()
-        _docs_dir = _args.docs_dir
-    except Exception:
-        _docs_dir = Path("docs/jupiter_seed_4b")
-
-    try:
-        _main_inner()
-    except SystemExit:
-        raise  # Let sys.exit() pass through normally
-    except json.JSONDecodeError as e:
-        log.error("EXECUTION_ERROR: malformed JSON: %s", e)
-        _write_execution_error_artifact("json_parsing", e, "JSONDecodeError", _docs_dir)
-        sys.exit(EXIT_EXECUTION_ERROR)
-    except FileNotFoundError as e:
-        log.error("EXECUTION_ERROR: missing required file: %s", e)
-        _write_execution_error_artifact("file_loading", e, "FileNotFoundError", _docs_dir)
-        sys.exit(EXIT_EXECUTION_ERROR)
-    except PermissionError as e:
-        log.error("EXECUTION_ERROR: unreadable file: %s", e)
-        _write_execution_error_artifact("file_loading", e, "PermissionError", _docs_dir)
-        sys.exit(EXIT_EXECUTION_ERROR)
-    except subprocess.SubprocessError as e:
-        log.error("EXECUTION_ERROR: subprocess failure: %s", e)
-        _write_execution_error_artifact("subprocess", e, "SubprocessError", _docs_dir)
-        sys.exit(EXIT_EXECUTION_ERROR)
-    except Exception as e:
-        log.error("EXECUTION_ERROR: unexpected exception before valid verdict: %s", e)
-        _write_execution_error_artifact("unexpected", e, type(e).__name__, _docs_dir)
-        sys.exit(EXIT_EXECUTION_ERROR)
-
-
-def _main_inner() -> None:
     args = parse_args()
+    try:
+        _main_inner(args)
+    except SystemExit:
+        raise
+    except RequiredEvidenceError as exc:
+        log.error("EXECUTION_ERROR: %s", exc.detail)
+        _exit_execution_error(args, exc, exc.category)
+    except json.JSONDecodeError as exc:
+        log.error("EXECUTION_ERROR: malformed JSON")
+        _exit_execution_error(args, exc, "malformed_json")
+    except PermissionError as exc:
+        log.error("EXECUTION_ERROR: unreadable required input")
+        _exit_execution_error(args, exc, "unreadable_required_input")
+    except FileNotFoundError as exc:
+        log.error("EXECUTION_ERROR: missing required input")
+        _exit_execution_error(args, exc, "missing_required_input")
+    except subprocess.SubprocessError as exc:
+        log.error("EXECUTION_ERROR: subprocess failure")
+        _exit_execution_error(args, exc, "subprocess_failure")
+    except Exception as exc:
+        log.error("EXECUTION_ERROR: unexpected exception: %s", type(exc).__name__)
+        _exit_execution_error(args, exc, "unexpected_exception")
+
+
+def _main_inner(args: argparse.Namespace) -> None:
+    preflight_required_evidence(args)
     records = load_all(args.data_dir)
 
     if not records:
-        log.error("No records found in %s", args.data_dir)
-        sys.exit(EXIT_MECHANICAL_FAILURE)
+        raise RequiredEvidenceError("missing_required_input", "load corpus records", args.data_dir,
+                                    f"No records found in required corpus directory: {args.data_dir}")
 
     log.info("Loaded %d records from %s", len(records), args.data_dir)
 

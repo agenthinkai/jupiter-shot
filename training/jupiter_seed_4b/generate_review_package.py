@@ -58,7 +58,6 @@ EXPECTED_CORPUS_SHA256 = (
 )
 
 REVIEWER_FACING_FIELDS = [
-    "package_commit",
     "content_risk_status",
     "content_risk_severity",
     "content_risk_rule_id",

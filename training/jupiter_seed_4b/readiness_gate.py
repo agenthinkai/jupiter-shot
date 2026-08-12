@@ -233,7 +233,7 @@ def _markdown_all_queue_ids(markdown: str) -> List[str]:
     if marker not in markdown:
         return []
     section = markdown.split(marker, 1)[1]
-    return re.findall(r'^\\|\\s*\\d+\\s*\\|\\s*`([^`]+)`\\s*\\|', section, flags=re.MULTILINE)
+    return re.findall(r'^\|\s*\d+\s*\|\s*`([^`]+)`\s*\|', section, flags=re.MULTILINE)
 
 
 # ─── Required schema fields ───────────────────────────────────────────────

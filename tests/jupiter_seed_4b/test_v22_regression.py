@@ -217,10 +217,10 @@ class TestGate11ExitCodeEnforcement:
 class TestAuthorizedTestManifest:
     """Tests for the authorized-test-manifest enforcement in Gate 11."""
 
-    def test_authorized_test_files_has_13_entries(self) -> None:
-        """AUTHORIZED_TEST_FILES must contain exactly 13 entries (V2.4.2 adds runtime-isolation coverage)."""
-        assert len(AUTHORIZED_TEST_FILES) == 13, (
-            f"Expected 13 authorized test files, got {len(AUTHORIZED_TEST_FILES)}: "
+    def test_authorized_test_files_has_14_entries(self) -> None:
+        """AUTHORIZED_TEST_FILES must contain exactly 14 entries (V2.4.3 adds portability/interlock coverage)."""
+        assert len(AUTHORIZED_TEST_FILES) == 14, (
+            f"Expected 14 authorized test files, got {len(AUTHORIZED_TEST_FILES)}: "
             f"{AUTHORIZED_TEST_FILES}"
         )
 
@@ -241,6 +241,10 @@ class TestAuthorizedTestManifest:
         assert "test_v242_execution_isolation.py" in AUTHORIZED_TEST_FILES, (
             "test_v242_execution_isolation.py must be in AUTHORIZED_TEST_FILES"
         )
+
+    def test_v243_portability_and_interlock_suite_in_authorized_files(self) -> None:
+        """The V2.4.3 portability/interlock suite must be enforced by Gate 11."""
+        assert "test_v243_portability_and_interlock.py" in AUTHORIZED_TEST_FILES
 
     def test_no_duplicate_entries_in_authorized_files(self) -> None:
         """AUTHORIZED_TEST_FILES must not contain duplicate entries."""

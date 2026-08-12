@@ -19,15 +19,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import yaml
 
@@ -307,175 +309,355 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--seed", type=int, default=None,
-        help="Override seed from config.",
+        help="Override seed for dry-run estimation only; non-dry-run overrides are rejected.",
+    )
+    parser.add_argument(
+        "--compute-environment", type=Path, default=None,
+        help="Required JSON description of the requested non-dry-run compute environment.",
+    )
+    parser.add_argument(
+        "--training-authorization", type=Path, default=None,
+        help="Optional explicit human authorization artifact path for non-dry-run execution.",
     )
     return parser.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Training Interlock (V2.4)
+# Training Interlock (V2.4.3)
 # ---------------------------------------------------------------------------
 
 EXPECTED_CORPUS_SHA256 = (
     "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0"
 )
 EXPECTED_DATASET_CONTENT_COMMIT = "2e36f6b977a8af052fced5a532c1168dc1988b6f"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+READINESS_SCRIPT = Path(__file__).resolve().parent / "readiness_gate.py"
 
 HUMAN_APPROVAL_FIELDS = [
-    "approved_by",
-    "approved_at_utc",
-    "authorization_status",
-    "signature_or_typed_confirmation",
-    "human_review_status",
-    "legal_review_status",
-    "accepted_count",
-    "revised_count",
-    "rejected_count",
-    "unresolved_count",
+    "approved_by", "approved_at_utc", "authorization_status",
+    "signature_or_typed_confirmation", "human_review_status",
+    "legal_review_status", "accepted_count", "revised_count",
+    "rejected_count", "unresolved_count",
 ]
+COMPUTE_ENVIRONMENT_FIELDS = {
+    "device_class", "execution_location", "gpu_model", "maximum_gpu_count",
+    "provider", "region", "approved_cost_ceiling_usd",
+}
+READINESS_BINDING_FIELDS = {
+    "artifact_release_commit", "artifact_source_commit", "corpus_sha256",
+    "review_package_sha256", "training_config_path", "training_config_sha256",
+    "authorization_binding_sha256", "exit_code",
+}
+GIT_COMMIT_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
+
+
+class TrainingInterlockError(RuntimeError):
+    """Raised for a default-deny authorization or readiness failure."""
+
+
+def _block(message: str) -> None:
+    log.error("TRAINING INTERLOCK: %s", message)
+    raise TrainingInterlockError(message)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def canonical_config_identity(config_path: Path) -> Dict[str, str]:
+    """Resolve a config path and bind approval to exact bytes, not aliases."""
+    try:
+        resolved = config_path.expanduser().resolve(strict=True)
+    except OSError as exc:
+        _block(f"requested training configuration cannot be resolved: {config_path}")
+        raise AssertionError from exc
+    if not resolved.is_file():
+        _block(f"requested training configuration is not a file: {resolved}")
+    try:
+        digest = _sha256_bytes(resolved.read_bytes())
+    except OSError as exc:
+        _block(f"requested training configuration is unreadable: {resolved}")
+        raise AssertionError from exc
+    return {"path": str(resolved), "sha256": digest}
+
+
+def _normalize_optional_string(value: Any, field: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        _block(f"compute environment field {field!r} must be a string or null")
+    normalized = value.strip()
+    return normalized.lower() if normalized else None
+
+
+def canonicalize_compute_environment(raw: Any, label: str) -> Dict[str, Any]:
+    """Reject missing, extra, conflicting, or noncanonical material environment fields."""
+    if not isinstance(raw, dict):
+        _block(f"{label} compute environment must be a JSON object")
+    keys = set(raw)
+    if keys != COMPUTE_ENVIRONMENT_FIELDS:
+        _block(
+            f"{label} compute environment fields mismatch: "
+            f"missing={sorted(COMPUTE_ENVIRONMENT_FIELDS - keys)} "
+            f"unexpected={sorted(keys - COMPUTE_ENVIRONMENT_FIELDS)}"
+        )
+    device = _normalize_optional_string(raw["device_class"], "device_class")
+    location = _normalize_optional_string(raw["execution_location"], "execution_location")
+    gpu_model = _normalize_optional_string(raw["gpu_model"], "gpu_model")
+    provider = _normalize_optional_string(raw["provider"], "provider")
+    region = _normalize_optional_string(raw["region"], "region")
+    try:
+        gpu_count = int(raw["maximum_gpu_count"])
+        cost = float(raw["approved_cost_ceiling_usd"])
+    except (TypeError, ValueError):
+        _block(f"{label} compute environment GPU count and cost ceiling must be numeric")
+        raise AssertionError
+    if gpu_count < 0 or cost < 0:
+        _block(f"{label} compute environment GPU count and cost ceiling must be non-negative")
+    if device not in {"cpu", "gpu"}:
+        _block(f"{label} compute environment device_class must be cpu or gpu")
+    if location not in {"local", "cloud"}:
+        _block(f"{label} compute environment execution_location must be local or cloud")
+    if device == "gpu" and (gpu_count < 1 or not gpu_model):
+        _block(f"{label} GPU environment requires gpu_model and maximum_gpu_count >= 1")
+    if device == "cpu" and (gpu_count != 0 or gpu_model is not None):
+        _block(f"{label} CPU environment requires maximum_gpu_count=0 and gpu_model=null")
+    if location == "cloud" and (not provider or not region):
+        _block(f"{label} cloud environment requires provider and region")
+    if location == "local" and (provider is not None or region is not None):
+        _block(f"{label} local environment requires provider and region to be null")
+    return {
+        "device_class": device,
+        "execution_location": location,
+        "gpu_model": gpu_model,
+        "maximum_gpu_count": gpu_count,
+        "provider": provider,
+        "region": region,
+        "approved_cost_ceiling_usd": round(cost, 6),
+    }
+
+
+def load_requested_compute_environment(path: Optional[Path]) -> Dict[str, Any]:
+    if path is None:
+        _block("requested compute environment is required for non-dry-run training")
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        raw = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        _block(f"requested compute environment cannot be loaded: {type(exc).__name__}")
+        raise AssertionError from exc
+    return canonicalize_compute_environment(raw, "requested")
+
+
+def _resolve_commit(revision: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{revision}^{{commit}}"],
+            cwd=REPO_ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10, check=False,
+        )
+    except Exception as exc:
+        _block(f"commit resolution failure for {revision}: {type(exc).__name__}")
+        raise AssertionError from exc
+    value = result.stdout.strip().lower()
+    if result.returncode != 0 or not GIT_COMMIT_RE.fullmatch(value):
+        _block(f"commit resolution failure for {revision}")
+    return value
+
+
+def _review_package_sha256() -> str:
+    path = REPO_ROOT / "docs" / "jupiter_seed_4b" / "REVIEWER_PACKAGE.jsonl"
+    try:
+        return _sha256_bytes(path.read_bytes())
+    except OSError as exc:
+        _block(f"current review package cannot be read: {type(exc).__name__}")
+        raise AssertionError from exc
+
+
+def _authorization_binding_sha256(auth: Dict[str, Any]) -> str:
+    """Hash the completed authorization excluding only the self-binding value."""
+    clone = json.loads(_canonical_json(auth))
+    readiness = clone.get("approved_readiness")
+    if isinstance(readiness, dict):
+        readiness.pop("authorization_binding_sha256", None)
+    return _sha256_bytes(_canonical_json(clone).encode("utf-8"))
+
+
+def _load_authorization(auth_path: Path) -> Dict[str, Any]:
+    try:
+        with auth_path.expanduser().resolve(strict=True).open("r", encoding="utf-8") as fh:
+            value = json.load(fh)
+    except FileNotFoundError:
+        _block(f"Authorization artifact not found: {auth_path}")
+    except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+        _block(f"Cannot read authorization artifact: {type(exc).__name__}")
+    if not isinstance(value, dict):
+        _block("authorization artifact must be a JSON object")
+    return value
+
+
+def _check_training_authorization_internal(
+    auth_path: Path,
+    model_id: str,
+    requested_budget_usd: float,
+    config_identity: Optional[Dict[str, str]] = None,
+    requested_compute_environment: Optional[Dict[str, Any]] = None,
+    release_commit: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate every static authorization field before readiness or heavy operations.
+
+    This function never downloads, initializes CUDA, loads a tokenizer, accesses a
+    dataset, provisions cloud resources, or calls a paid service.
+    """
+    auth = _load_authorization(auth_path)
+    errors = []
+    def check(condition: bool, message: str) -> None:
+        if not condition:
+            errors.append(message)
+
+    check(str(auth.get("authorization_status", "")) == "APPROVED", "authorization_status must be APPROVED")
+    check(str(auth.get("human_review_status", "")) == "COMPLETE", "human_review_status must be COMPLETE")
+    try:
+        unresolved = int(auth.get("unresolved_count", -1))
+    except (ValueError, TypeError):
+        unresolved = -1
+    check(unresolved == 0, "unresolved_count must be 0")
+    check(str(auth.get("legal_review_status", "")) == "APPROVED", "legal_review_status must be APPROVED")
+    check(str(auth.get("corpus_sha256", "")) == EXPECTED_CORPUS_SHA256, "corpus_sha256 mismatch")
+    check(str(auth.get("dataset_content_commit", "")) == EXPECTED_DATASET_CONTENT_COMMIT,
+          "dataset_content_commit mismatch")
+    check(str(auth.get("approved_model_id", "")) == model_id, "approved_model_id mismatch")
+    try:
+        max_budget = float(auth.get("maximum_budget_usd", -1))
+    except (TypeError, ValueError):
+        max_budget = -1
+    check(requested_budget_usd <= max_budget, "requested budget exceeds approved maximum")
+    check(bool(str(auth.get("approved_by", "")).strip()) and "HUMAN_REQUIRED" not in str(auth.get("approved_by", "")),
+          "approved_by must be a completed human name")
+    check(bool(str(auth.get("signature_or_typed_confirmation", "")).strip()) and
+          "HUMAN_REQUIRED" not in str(auth.get("signature_or_typed_confirmation", "")),
+          "signature_or_typed_confirmation must be completed")
+    for field in HUMAN_APPROVAL_FIELDS:
+        check("HUMAN_REQUIRED" not in str(auth.get(field, "")), f"{field} contains template placeholder")
+
+    if config_identity is None:
+        errors.append("requested training configuration identity is required")
+    else:
+        approved = auth.get("approved_training_configuration")
+        if not isinstance(approved, dict) or set(approved) != {"path", "sha256"}:
+            errors.append("approved_training_configuration must contain exactly path and sha256")
+        elif approved != config_identity:
+            errors.append("approved training configuration path or SHA-256 mismatch")
+
+    if requested_compute_environment is None:
+        errors.append("requested compute environment is required")
+    else:
+        try:
+            approved_env = canonicalize_compute_environment(auth.get("approved_compute_environment"), "approved")
+            if approved_env != requested_compute_environment:
+                errors.append("approved compute environment does not exactly match requested environment")
+            if round(max_budget, 6) != requested_compute_environment["approved_cost_ceiling_usd"]:
+                errors.append("compute environment cost ceiling must equal maximum_budget_usd")
+        except TrainingInterlockError as exc:
+            errors.append(str(exc))
+
+    actual_release = release_commit or _resolve_commit("HEAD")
+    supplied_release = str(auth.get("readiness_package_commit", "")).strip().lower()
+    if not GIT_COMMIT_RE.fullmatch(supplied_release):
+        errors.append("readiness_package_commit must be a full 40-character commit hash")
+    elif supplied_release != actual_release:
+        errors.append("readiness_package_commit must equal the current artifact-release commit")
+
+    if errors:
+        for error in errors:
+            log.error("TRAINING INTERLOCK: %s", error)
+        raise TrainingInterlockError("static authorization validation failed")
+    return auth
 
 
 def check_training_authorization(
     auth_path: Path,
     model_id: str,
     requested_budget_usd: float,
-) -> None:
-    """
-    V2.4 Training Interlock: Refuse non-dry-run execution unless a valid
-    human-completed authorization artifact exists.
-
-    Checks (in order, before any model download, GPU init, or data load):
-    1. Authorization artifact exists.
-    2. authorization_status == APPROVED.
-    3. human_review_status == COMPLETE.
-    4. unresolved_count == 0.
-    5. legal_review_status == APPROVED.
-    6. corpus_sha256 matches exactly.
-    7. dataset_content_commit matches exactly.
-    8. approved_model_id matches the requested model.
-    9. requested_budget_usd <= maximum_budget_usd.
-    10. approved_by is non-empty (human name required).
-    11. signature_or_typed_confirmation is non-empty.
-    12. Software-prohibited fields are not set to template placeholder values.
-
-    Raises SystemExit(1) on any failure — before any billable action.
-    """
-    if not auth_path.exists():
-        log.error(
-            "TRAINING INTERLOCK: Authorization artifact not found: %s", auth_path
+    config_identity: Optional[Dict[str, str]] = None,
+    requested_compute_environment: Optional[Dict[str, Any]] = None,
+    release_commit: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Public default-deny authorization API; exits before any heavy operation."""
+    try:
+        return _check_training_authorization_internal(
+            auth_path, model_id, requested_budget_usd, config_identity,
+            requested_compute_environment, release_commit,
         )
-        log.error(
-            "Complete docs/jupiter_seed_4b/TRAINING_AUTHORIZATION_TEMPLATE.json "
-            "and save it as the authorization artifact before running training."
-        )
+    except TrainingInterlockError as exc:
+        log.error("Training is BLOCKED: %s", exc)
         sys.exit(1)
 
-    try:
-        with auth_path.open("r", encoding="utf-8") as fh:
-            auth = json.load(fh)
-    except (json.JSONDecodeError, OSError) as e:
-        log.error("TRAINING INTERLOCK: Cannot read authorization artifact: %s", e)
-        sys.exit(1)
 
-    errors = []
-
-    # 1. authorization_status must be APPROVED
-    auth_status = str(auth.get("authorization_status", ""))
-    if auth_status != "APPROVED":
-        errors.append(
-            f"authorization_status must be APPROVED, got: {repr(auth_status)}"
-        )
-
-    # 2. human_review_status must be COMPLETE
-    hr_status = str(auth.get("human_review_status", ""))
-    if hr_status != "COMPLETE":
-        errors.append(
-            f"human_review_status must be COMPLETE, got: {repr(hr_status)}"
-        )
-
-    # 3. unresolved_count must be 0
-    try:
-        unresolved = int(auth.get("unresolved_count", -1))
-    except (ValueError, TypeError):
-        unresolved = -1
-    if unresolved != 0:
-        errors.append(
-            f"unresolved_count must be 0, got: {repr(auth.get('unresolved_count'))}"
-        )
-
-    # 4. legal_review_status must be APPROVED
-    legal_status = str(auth.get("legal_review_status", ""))
-    if legal_status != "APPROVED":
-        errors.append(
-            f"legal_review_status must be APPROVED, got: {repr(legal_status)}"
-        )
-
-    # 5. corpus_sha256 must match exactly
-    auth_corpus_sha = str(auth.get("corpus_sha256", ""))
-    if auth_corpus_sha != EXPECTED_CORPUS_SHA256:
-        errors.append(
-            f"corpus_sha256 mismatch: "
-            f"auth={auth_corpus_sha[:16]}... expected={EXPECTED_CORPUS_SHA256[:16]}..."
-        )
-
-    # 6. dataset_content_commit must match exactly
-    auth_commit = str(auth.get("dataset_content_commit", ""))
-    if auth_commit != EXPECTED_DATASET_CONTENT_COMMIT:
-        errors.append(
-            f"dataset_content_commit mismatch: "
-            f"auth={auth_commit[:12]}... expected={EXPECTED_DATASET_CONTENT_COMMIT[:12]}..."
-        )
-
-    # 7. approved_model_id must match the requested model
-    auth_model = str(auth.get("approved_model_id", ""))
-    if auth_model != model_id:
-        errors.append(
-            f"approved_model_id mismatch: auth={repr(auth_model)} requested={repr(model_id)}"
-        )
-
-    # 8. requested_budget_usd must not exceed maximum_budget_usd
-    try:
-        max_budget = float(auth.get("maximum_budget_usd", 0))
-    except (ValueError, TypeError):
-        max_budget = 0.0
-    if requested_budget_usd > max_budget:
-        errors.append(
-            f"Requested budget USD {requested_budget_usd:.2f} exceeds "
-            f"approved maximum USD {max_budget:.2f}"
-        )
-
-    # 9. approved_by must be non-empty
-    approved_by = str(auth.get("approved_by", "")).strip()
-    if not approved_by or "HUMAN_REQUIRED" in approved_by:
-        errors.append("approved_by must be a non-empty human name")
-
-    # 10. signature_or_typed_confirmation must be non-empty
-    sig = str(auth.get("signature_or_typed_confirmation", "")).strip()
-    if not sig or "HUMAN_REQUIRED" in sig:
-        errors.append("signature_or_typed_confirmation must be completed by a human")
-
-    # 11. No template placeholder values in human-approval fields
-    for field in HUMAN_APPROVAL_FIELDS:
-        val = str(auth.get(field, ""))
-        if "HUMAN_REQUIRED" in val:
-            errors.append(
-                f"Field '{field}' still contains template placeholder 'HUMAN_REQUIRED'"
+def run_fresh_readiness(config_identity: Dict[str, str]) -> Dict[str, Any]:
+    """Execute the production readiness CLI and bind its result to current evidence."""
+    with tempfile.TemporaryDirectory(prefix="jupiter-seed-readiness-") as raw:
+        artifact_dir = Path(raw) / "runtime"
+        environment = dict(os.environ)
+        # PYTEST_CURRENT_TEST is a test-runner implementation detail, not part
+        # of the readiness execution environment.
+        environment.pop("PYTEST_CURRENT_TEST", None)
+        try:
+            result = subprocess.run(
+                [sys.executable, str(READINESS_SCRIPT), "--artifact-dir", str(artifact_dir)],
+                cwd=REPO_ROOT, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=240, check=False,
+                env=environment,
             )
+        except Exception as exc:
+            _block(f"fresh readiness execution failed: {type(exc).__name__}")
+            raise AssertionError from exc
+    return {
+        "artifact_release_commit": _resolve_commit("HEAD"),
+        "artifact_source_commit": _resolve_commit("HEAD^"),
+        "corpus_sha256": EXPECTED_CORPUS_SHA256,
+        "review_package_sha256": _review_package_sha256(),
+        "training_config_path": config_identity["path"],
+        "training_config_sha256": config_identity["sha256"],
+        "exit_code": result.returncode,
+    }
 
-    if errors:
-        log.error("TRAINING INTERLOCK: Authorization failed with %d error(s):", len(errors))
-        for err in errors:
-            log.error("  - %s", err)
-        log.error(
-            "Training is BLOCKED. Complete the authorization artifact and resubmit."
-        )
-        sys.exit(1)
 
-    log.info(
-        "Training interlock passed. Authorized by: %s at %s",
-        approved_by,
-        auth.get("approved_at_utc", "UNKNOWN"),
+def validate_fresh_readiness(auth: Dict[str, Any], readiness: Dict[str, Any]) -> None:
+    """Require fresh exit 0 plus an authorization-bound result with exact identities."""
+    if readiness.get("exit_code") != 0:
+        _block(f"fresh readiness must exit 0; got {readiness.get('exit_code')}")
+    approved = auth.get("approved_readiness")
+    if not isinstance(approved, dict) or set(approved) != READINESS_BINDING_FIELDS:
+        _block("approved_readiness must contain exactly the required binding fields")
+    expected = dict(readiness)
+    expected["authorization_binding_sha256"] = _authorization_binding_sha256(auth)
+    if approved != expected:
+        _block("approved_readiness does not exactly match fresh readiness, configuration, corpus, package, and authorization binding")
+
+
+def authorize_non_dry_run(
+    auth_path: Path,
+    config_path: Path,
+    requested_compute_environment: Dict[str, Any],
+    model_id: str,
+    requested_budget_usd: float,
+    readiness_runner: Callable[[Dict[str, str]], Dict[str, Any]] = run_fresh_readiness,
+) -> None:
+    """Complete default-deny interlock. Call immediately before run_training only."""
+    config_identity = canonical_config_identity(config_path)
+    release = _resolve_commit("HEAD")
+    auth = check_training_authorization(
+        auth_path, model_id, requested_budget_usd, config_identity,
+        requested_compute_environment, release,
     )
+    readiness = readiness_runner(config_identity)
+    validate_fresh_readiness(auth, readiness)
+    log.info("Training interlock passed for release %s", release)
 
 
 def main() -> None:
@@ -512,13 +694,26 @@ def main() -> None:
         )
         return
 
-    # V2.4 TRAINING INTERLOCK: Must pass before any model download, GPU init, or data load
-    auth_path = Path(cfg.get(
-        "training_authorization_path",
-        "docs/jupiter_seed_4b/TRAINING_AUTHORIZATION.json"
-    ))
-    requested_budget = cfg.get("max_authorized_spend_usd", 0.0)
-    check_training_authorization(auth_path, BASE_MODEL_ID, float(requested_budget))
+    # V2.4.3 TRAINING INTERLOCK: every authorization/readiness check occurs
+    # before run_training imports torch/transformers, touches CUDA, downloads,
+    # reads data, accesses a network, or could create a billable operation.
+    if args.seed is not None or args.dataset_path is not None:
+        log.error("TRAINING INTERLOCK: non-dry-run seed or dataset overrides are not approved configuration identity")
+        sys.exit(1)
+    try:
+        requested_environment = load_requested_compute_environment(args.compute_environment)
+        auth_path = args.training_authorization or (REPO_ROOT / "docs" / "jupiter_seed_4b" / "TRAINING_AUTHORIZATION.json")
+        requested_budget = float(cfg.get("max_authorized_spend_usd", 0.0))
+        authorize_non_dry_run(
+            auth_path=auth_path,
+            config_path=args.config,
+            requested_compute_environment=requested_environment,
+            model_id=BASE_MODEL_ID,
+            requested_budget_usd=requested_budget,
+        )
+    except TrainingInterlockError:
+        log.error("Training is BLOCKED. No model, tokenizer, CUDA, GPU, cloud, API, or training action was reached.")
+        sys.exit(1)
 
     run_training(cfg, dataset_path)
 

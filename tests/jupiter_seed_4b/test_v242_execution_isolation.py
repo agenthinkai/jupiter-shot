@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -96,6 +99,117 @@ def copy_bench(tmp: Path) -> Path:
     return destination
 
 
+def _can_read(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            fh.read(1)
+        return True
+    except OSError:
+        return False
+
+
+def _can_create_child(parent: Path) -> bool:
+    probe = parent / f"probe-{uuid.uuid4().hex}"
+    try:
+        probe.mkdir()
+        return True
+    except OSError:
+        return False
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+
+
+def _windows_icacls() -> str | None:
+    if os.name != "nt":
+        return None
+    executable = shutil.which("icacls")
+    if not executable:
+        pytest.skip("Windows ACL test skipped: icacls is unavailable")
+    return executable
+
+
+@contextmanager
+def _windows_acl_deny(path: Path, permission: str):
+    """Deny a Windows ACL permission in a temporary directory and restore it exactly."""
+    icacls = _windows_icacls()
+    assert icacls is not None
+    backup_dir = path.parent / f"acl-backup-{uuid.uuid4().hex}"
+    backup_dir.mkdir()
+    backup_name = "original.acl"
+    saved = subprocess.run(
+        [icacls, str(path.parent), "/save", backup_name, "/t", "/c"],
+        cwd=backup_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if saved.returncode != 0:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        pytest.skip("Windows ACL test skipped: unable to back up temporary-directory ACL")
+    user = subprocess.run(
+        ["whoami"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+    ).stdout.strip()
+    if not user:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        pytest.skip("Windows ACL test skipped: unable to resolve current user")
+    changed = subprocess.run(
+        [icacls, str(path), "/deny", f"{user}:({permission})", "/c"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if changed.returncode != 0:
+        subprocess.run([icacls, str(path.parent), "/restore", backup_name, "/c"],
+                       cwd=backup_dir, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        pytest.skip("Windows ACL test skipped: ACL denial could not be applied safely")
+    try:
+        yield
+    finally:
+        restored = subprocess.run(
+            [icacls, str(path.parent), "/restore", backup_name, "/c"],
+            cwd=backup_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        if restored.returncode != 0:
+            pytest.fail("Windows ACL restoration failed for a pytest temporary path")
+
+
+@contextmanager
+def verified_unreadable_file(path: Path):
+    """Make a temporary file actually unreadable, or explicitly skip."""
+    if os.name == "nt":
+        with _windows_acl_deny(path, "R"):
+            if _can_read(path):
+                pytest.skip("Windows ACL denial did not make the temporary file unreadable")
+            yield
+        return
+
+    original_mode = path.stat().st_mode
+    path.chmod(0)
+    try:
+        if _can_read(path):
+            pytest.skip("POSIX environment can still read chmod(000) temporary file")
+        yield
+    finally:
+        path.chmod(original_mode)
+
+
+@contextmanager
+def verified_unwritable_artifact_parent(parent: Path):
+    """Make a temporary parent genuinely unwritable for child creation, or skip."""
+    if os.name == "nt":
+        with _windows_acl_deny(parent, "W"):
+            if _can_create_child(parent):
+                pytest.skip("Windows ACL denial did not make temporary artifact parent unwritable")
+            yield parent / "runtime-artifacts"
+        return
+
+    original_mode = parent.stat().st_mode
+    parent.chmod(0o500)
+    try:
+        if _can_create_child(parent):
+            pytest.skip("POSIX environment can still create in chmod(0500) temporary directory")
+        yield parent / "runtime-artifacts"
+    finally:
+        parent.chmod(original_mode)
+
+
 class TestV242RequiredEvidenceExit3:
     def test_missing_data_directory_is_exit_3_with_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -160,15 +274,19 @@ class TestV242RequiredEvidenceExit3:
             assert artifact["error_category"] == "malformed_json"
 
     def test_unreadable_required_file_is_exit_3(self) -> None:
+        """Use verified Windows ACL or POSIX permission denial only inside pytest temp space."""
         with tempfile.TemporaryDirectory() as raw:
             data = copy_data(Path(raw))
             target = data / "train.jsonl"
-            target.chmod(0o000)
-            try:
+            original_mode = target.stat().st_mode
+            with verified_unreadable_file(target):
+                assert not _can_read(target), "test setup must prove the file is actually unreadable"
                 result, artifact_dir = run_cli(["--data-dir", str(data)])
-                assert_execution_error(result, artifact_dir)
-            finally:
-                target.chmod(0o644)
+                artifact = assert_execution_error(result, artifact_dir)
+                assert artifact["error_category"] == "unreadable_required_input"
+            # POSIX restoration is checked directly; Windows restoration is enforced by icacls /restore.
+            if os.name != "nt":
+                assert target.stat().st_mode == original_mode
 
     def test_output_write_failure_is_exit_3_with_safe_stderr_fallback(self) -> None:
         if not Path("/dev/full").exists():
@@ -178,19 +296,24 @@ class TestV242RequiredEvidenceExit3:
         assert "traceback" not in result.stderr.lower()
 
     def test_error_artifact_write_failure_remains_exit_3(self) -> None:
-        # /dev/null is a file, so creating a child directory must fail safely.
+        """Verify a real unwritable temporary destination; never depend on /dev or null paths."""
         env = dict(os.environ)
         env.pop("PYTHONUTF8", None)
         env.pop("PYTHONIOENCODING", None)
         if not env.get("JUPITER_GATE11_SUBPROCESS"):
             env.pop("PYTEST_CURRENT_TEST", None)
         with tempfile.TemporaryDirectory() as raw:
-            missing = Path(raw) / "missing-data"
-            result = subprocess.run(
-                [sys.executable, str(SCRIPT), "--data-dir", str(missing),
-                 "--artifact-dir", "/dev/null/v242-artifacts"],
-                cwd=REPO_ROOT, capture_output=True, text=True, timeout=60, env=env,
-            )
+            root = Path(raw)
+            missing = root / "missing-data"
+            parent = root / "unwritable-parent"
+            parent.mkdir()
+            with verified_unwritable_artifact_parent(parent) as artifact_dir:
+                assert not _can_create_child(parent), "test setup must prove artifact parent is unwritable"
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--data-dir", str(missing),
+                     "--artifact-dir", str(artifact_dir)],
+                    cwd=REPO_ROOT, capture_output=True, text=True, timeout=60, env=env,
+                )
         assert result.returncode == EXIT_EXECUTION_ERROR
         assert "safe fallback" in result.stderr.lower()
         assert "traceback" not in result.stderr.lower()

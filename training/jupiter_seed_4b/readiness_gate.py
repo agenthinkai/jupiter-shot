@@ -83,6 +83,7 @@ AUTHORIZED_TEST_FILES = [
     "test_v24_regression.py", # V2.4: review-package propagation and training interlock
     "test_v241_package_identity.py", # V2.4.1: fail-closed package identity
     "test_v242_execution_isolation.py", # V2.4.2: exit classification and runtime isolation
+    "test_v243_portability_and_interlock.py", # V2.4.3: portable permissions and completed authorization
 ]
 
 # Canonical authorized manifest hash (SHA-256 of sorted filenames joined by '|')
@@ -942,7 +943,7 @@ def gate_test_suite(repo_root: Path) -> GateResult:
         v_result = subprocess.run(
             [interpreter, "-m", "pytest", "--version"],
             capture_output=True, text=True, timeout=10,
-            encoding="utf-8",
+            encoding="utf-8", errors="replace",
         )
         pytest_version = v_result.stdout.strip() + v_result.stderr.strip()
     except Exception:
@@ -970,7 +971,7 @@ def gate_test_suite(repo_root: Path) -> GateResult:
                  "-q"],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
+                encoding="utf-8", errors="replace",
                 timeout=180,
                 cwd=str(repo_root),
                 env=env,

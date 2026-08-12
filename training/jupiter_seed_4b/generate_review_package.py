@@ -15,7 +15,7 @@ Rules:
   - Frozen corpus files are never modified.
   - Human judgment fields are never populated by software.
   - content_risk_status = REVIEW_REQUIRED for flagged records.
-  - content_risk_status = CLEAR for unflagged records.
+  - content_risk_status = NONE for unflagged records.
   - integrity_flags = REVIEW_REQUIRED_CONTENT_RISK for flagged records.
   - integrity_flags = OK for unflagged records.
 
@@ -48,6 +48,8 @@ from readiness_gate import (
     GCC_TRIP_PHRASES,
     BLOCKING_CONTENT_PATTERNS,
     REVIEWER_JUDGMENT_FIELDS,
+    is_valid_git_commit,
+    resolve_git_commit,
 )
 
 SIDECAR_SCHEMA_VERSION = "1.0"
@@ -56,6 +58,7 @@ EXPECTED_CORPUS_SHA256 = (
 )
 
 REVIEWER_FACING_FIELDS = [
+    "package_commit",
     "content_risk_status",
     "content_risk_severity",
     "content_risk_rule_id",
@@ -169,7 +172,7 @@ def compute_content_risk_fields(
 
     if not findings:
         return {
-            "content_risk_status": "CLEAR",
+            "content_risk_status": "NONE",
             "content_risk_severity": "NONE",
             "content_risk_rule_id": "",
             "content_risk_rule_description": "",
@@ -339,6 +342,7 @@ def generate_sidecar(
 def generate_reviewer_package(
     queue_records: List[Dict],
     findings_by_id: Dict[str, List[Dict]],
+    package_commit: str,
     output_path: Path,
 ) -> None:
     """Generate REVIEWER_PACKAGE.jsonl — joined representation."""
@@ -348,6 +352,7 @@ def generate_reviewer_package(
             risk_fields = compute_content_risk_fields(r, findings_by_id)
             row = dict(r)
             row.update(risk_fields)
+            row["package_commit"] = package_commit
             # Ensure all human judgment fields are empty
             for jf in REVIEWER_JUDGMENT_FIELDS:
                 row[jf] = ""
@@ -358,6 +363,7 @@ def generate_reviewer_package(
 def generate_reviewer_csv(
     queue_records: List[Dict],
     findings_by_id: Dict[str, List[Dict]],
+    package_commit: str,
     output_path: Path,
 ) -> None:
     """Generate REVIEWER_TEMPLATE.csv — UTF-8 BOM for Excel."""
@@ -366,7 +372,7 @@ def generate_reviewer_csv(
 
     # Build column order: identity fields, content-risk fields, human judgment fields
     identity_cols = [
-        "example_id", "split", "language", "domain", "task_type",
+        "example_id", "package_commit", "split", "language", "domain", "task_type",
         "difficulty", "provenance_type", "content_family_id",
     ]
     content_cols = [
@@ -386,6 +392,7 @@ def generate_reviewer_csv(
             risk_fields = compute_content_risk_fields(r, findings_by_id)
             row = {col: r.get(col, "") for col in all_cols}
             row.update(risk_fields)
+            row["package_commit"] = package_commit
             # Ensure all human judgment fields are empty
             for jf in judgment_cols:
                 row[jf] = ""
@@ -396,6 +403,7 @@ def generate_reviewer_csv(
 def generate_markdown(
     queue_records: List[Dict],
     findings_by_id: Dict[str, List[Dict]],
+    package_commit: str,
     output_path: Path,
 ) -> None:
     """Generate ARABIC_HUMAN_REVIEW_QUEUE.md — Markdown index with content-risk disclosure."""
@@ -408,6 +416,8 @@ def generate_markdown(
         "> This document is generated from the frozen corpus and Gate 14 findings.",
         "> Human reviewers must independently judge every record.",
         "> Software has not populated any reviewer judgment field.",
+        f"> Package source commit: `{package_commit}`",
+        "> Package identity scheme: `package_commit` identifies the source commit; the artifact release commit is its direct child.",
         "",
         "## Coverage",
         "",
@@ -490,10 +500,21 @@ def main() -> None:
     )
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--docs-dir", type=Path, default=DOCS_DIR)
+    parser.add_argument(
+        "--package-commit",
+        default=None,
+        help=(
+            "Full 40-character artifact source commit to embed. Defaults to HEAD. "
+            "The release procedure supplies HEAD^ after the source commit."
+        ),
+    )
     args = parser.parse_args()
 
-    package_commit = get_current_commit()
-    print(f"Package commit: {package_commit}")
+    package_commit = args.package_commit or resolve_git_commit("HEAD")
+    if not is_valid_git_commit(package_commit):
+        raise ValueError("package_commit must be a full 40-character hexadecimal Git commit")
+    package_commit = package_commit.lower()
+    print(f"Package source commit: {package_commit}")
 
     # Load frozen queue (never modified)
     queue_records = load_queue()
@@ -509,15 +530,15 @@ def main() -> None:
 
     # Generate reviewer-facing representations
     generate_reviewer_package(
-        queue_records, findings_by_id,
+        queue_records, findings_by_id, package_commit,
         args.docs_dir / "REVIEWER_PACKAGE.jsonl"
     )
     generate_reviewer_csv(
-        queue_records, findings_by_id,
+        queue_records, findings_by_id, package_commit,
         args.docs_dir / "REVIEWER_TEMPLATE.csv"
     )
     generate_markdown(
-        queue_records, findings_by_id,
+        queue_records, findings_by_id, package_commit,
         args.docs_dir / "ARABIC_HUMAN_REVIEW_QUEUE.md"
     )
 

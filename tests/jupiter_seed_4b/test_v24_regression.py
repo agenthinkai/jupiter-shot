@@ -8,7 +8,7 @@ Blocker 1 — Review-package propagation:
   2.  Three flagged records are in sidecar
   3.  Flagged records show REVIEW_REQUIRED_CONTENT_RISK in REVIEWER_PACKAGE.jsonl
   4.  Flagged records do NOT show integrity_flags=OK
-  5.  Unflagged records show content_risk_status=CLEAR
+  5.  Unflagged records show content_risk_status=NONE
   6.  Gate 16 passes on current package
   7.  Gate 16 fails when sidecar is missing
   8.  Gate 16 fails when flagged record shows integrity_flags=OK
@@ -196,7 +196,7 @@ class TestReviewPackagePropagation:
                         f"Got: {flags}"
                     )
 
-    def test_unflagged_records_show_clear(self) -> None:
+    def test_unflagged_records_show_none(self) -> None:
         pkg_path = DOCS_DIR / "REVIEWER_PACKAGE.jsonl"
         if not pkg_path.exists():
             pytest.skip("REVIEWER_PACKAGE.jsonl not found")
@@ -206,9 +206,9 @@ class TestReviewPackagePropagation:
                 r = json.loads(line)
                 if r["example_id"] not in THREE_FLAGGED:
                     status = r.get("content_risk_status", "")
-                    if status != "CLEAR":
+                    if status != "NONE":
                         violations.append(f"{r['example_id']}: {status}")
-        assert not violations, f"Unflagged records must show CLEAR: {violations[:5]}"
+        assert not violations, f"Unflagged records must show NONE: {violations[:5]}"
 
     def test_gate16_passes_on_current_package(self) -> None:
         import json as _json

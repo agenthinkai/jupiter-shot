@@ -34,7 +34,9 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
 # Import canonicalization engine
-_TRAINING_DIR = Path(__file__).parent
+_TRAINING_DIR = Path(__file__).resolve().parent
+# Deterministic repository root: training/jupiter_seed_4b/readiness_gate.py -> repo root
+REPO_ROOT = _TRAINING_DIR.parents[1]
 sys.path.insert(0, str(_TRAINING_DIR))
 from canonicalize import (
     canonicalize,
@@ -78,6 +80,7 @@ AUTHORIZED_TEST_FILES = [
     "test_v23_regex.py",      # V2.3: regex regression tests
     "test_v23_regression.py", # V2.3: content-risk and exit-code regression tests
     "test_v24_regression.py", # V2.4: review-package propagation and training interlock
+    "test_v241_package_identity.py", # V2.4.1: fail-closed package identity
 ]
 
 # Canonical authorized manifest hash (SHA-256 of sorted filenames joined by '|')
@@ -115,6 +118,122 @@ class GateResult:
     @property
     def is_review_required(self) -> bool:
         return self.status == REVIEW_REQUIRED
+
+
+# ─── Package identity helpers (V2.4.1) ─────────────────────────────────────
+
+GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+class PackageIdentityResolutionError(RuntimeError):
+    """A fail-closed failure while resolving a Git package identity."""
+
+
+def is_valid_git_commit(value: Any) -> bool:
+    """Return True only for a full 40-character hexadecimal Git object ID."""
+    return isinstance(value, str) and GIT_COMMIT_RE.fullmatch(value.strip()) is not None
+
+
+def resolve_git_commit(
+    revision: str,
+    repo_root: Optional[Path] = None,
+    run_fn: Any = None,
+) -> str:
+    """Resolve `revision` to a full Git commit hash or raise a typed fail-closed error.
+
+    The root is derived from this module by default and never from the caller's
+    current working directory. Callers must not convert any error into an empty
+    string, because an empty identity is not evidence of equality.
+    """
+    root = Path(repo_root if repo_root is not None else REPO_ROOT).resolve()
+    if not root.is_dir() or not (root / '.git').exists():
+        raise PackageIdentityResolutionError(f'invalid repository root: {root}')
+    runner = run_fn or subprocess.run
+    try:
+        result = runner(
+            ['git', 'rev-parse', '--verify', f'{revision}^{{commit}}'],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PackageIdentityResolutionError(f'git resolution timed out for {revision}') from exc
+    except FileNotFoundError as exc:
+        raise PackageIdentityResolutionError('git executable unavailable') from exc
+    except OSError as exc:
+        raise PackageIdentityResolutionError(f'git resolution OS error: {type(exc).__name__}') from exc
+    except Exception as exc:
+        raise PackageIdentityResolutionError(f'git resolution unexpected error: {type(exc).__name__}') from exc
+
+    if getattr(result, 'returncode', None) != 0:
+        raise PackageIdentityResolutionError(f'git rev-parse returned nonzero for {revision}')
+    stdout = str(getattr(result, 'stdout', '') or '').strip()
+    if not stdout:
+        raise PackageIdentityResolutionError(f'git rev-parse returned empty output for {revision}')
+    if not is_valid_git_commit(stdout):
+        raise PackageIdentityResolutionError(f'git rev-parse returned malformed commit for {revision}')
+    return stdout.lower()
+
+
+def _read_jsonl_by_id(path: Path, label: str, errors: List[str]) -> Dict[str, Dict]:
+    """Load a reviewer JSONL representation and fail closed on malformed identities."""
+    rows: Dict[str, Dict] = {}
+    if not path.exists():
+        errors.append(f'{label} not found: {path}')
+        return rows
+    try:
+        with path.open('r', encoding='utf-8') as fh:
+            for number, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                eid = row.get('example_id', '')
+                if not eid:
+                    errors.append(f'{label}:{number}: missing example_id')
+                elif eid in rows:
+                    errors.append(f'{label}: duplicate example_id: {eid}')
+                else:
+                    rows[eid] = row
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f'cannot read {label}: {type(exc).__name__}')
+    return rows
+
+
+def _read_csv_by_id(path: Path, errors: List[str]) -> Dict[str, Dict]:
+    rows: Dict[str, Dict] = {}
+    if not path.exists():
+        errors.append(f'REVIEWER_TEMPLATE.csv not found: {path}')
+        return rows
+    try:
+        with path.open('r', encoding='utf-8-sig', newline='') as fh:
+            reader = csv.DictReader(fh)
+            required = {'example_id', 'package_commit', 'content_risk_status', 'integrity_flags'}
+            if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+                errors.append('REVIEWER_TEMPLATE.csv: required identity or risk columns missing')
+                return rows
+            for number, row in enumerate(reader, 2):
+                eid = row.get('example_id', '')
+                if not eid:
+                    errors.append(f'REVIEWER_TEMPLATE.csv:{number}: missing example_id')
+                elif eid in rows:
+                    errors.append(f'REVIEWER_TEMPLATE.csv: duplicate example_id: {eid}')
+                else:
+                    rows[eid] = row
+    except (OSError, csv.Error, UnicodeError) as exc:
+        errors.append(f'cannot read REVIEWER_TEMPLATE.csv: {type(exc).__name__}')
+    return rows
+
+
+def _markdown_all_queue_ids(markdown: str) -> List[str]:
+    """Extract IDs only from the All Queue Records table, avoiding the flagged summary."""
+    marker = '## All Queue Records'
+    if marker not in markdown:
+        return []
+    section = markdown.split(marker, 1)[1]
+    return re.findall(r'^\\|\\s*\\d+\\s*\\|\\s*`([^`]+)`\\s*\\|', section, flags=re.MULTILINE)
 
 
 # ─── Required schema fields ───────────────────────────────────────────────
@@ -1237,182 +1356,161 @@ def gate_review_package_identity(
     data_dir: Path,
     content_risk_gate: GateResult,
 ) -> GateResult:
-    """
-    V2.4 Gate 16: Proves identity and coverage across all reviewer-facing representations.
+    """Fail-closed Gate 16 identity and representation verification (V2.4.1).
 
-    Checks:
-    1. All 50 frozen queue IDs appear exactly once in REVIEWER_PACKAGE.jsonl.
-    2. All Gate 14 REVIEW_REQUIRED records appear in REVIEWER_PACKAGE.jsonl.
-    3. Rule, field, severity and excerpt agree across sidecar, JSONL, CSV and Markdown.
-    4. A flagged record showing integrity_flags=OK causes FAIL.
-    5. Missing or stale sidecar causes FAIL.
-    6. Sidecar corpus hash must match the frozen corpus hash.
-    7. Sidecar package commit must match the checked-out commit.
-    8. No reviewer-facing file can claim CLEAR when Gate 14 says REVIEW_REQUIRED.
+    Artifact `package_commit` uses the documented source-commit scheme: it must
+    equal the direct parent of the artifact release commit (HEAD^). This avoids
+    an impossible self-referential commit hash while guaranteeing that the
+    artifacts were generated from the exact source tree that precedes them.
     """
-    errors = []
-    warnings = []
+    errors: List[str] = []
+    warnings: List[str] = []
 
-    # 1. Load sidecar
-    sidecar_path = docs_dir / "REVIEW_RISK_FINDINGS.json"
-    if not sidecar_path.exists():
+    # Identity resolution is independent and fail-closed. Never replace failure
+    # with an empty string or permit a comparison bypass.
+    try:
+        release_commit = resolve_git_commit('HEAD')
+        source_commit = resolve_git_commit('HEAD^')
+    except PackageIdentityResolutionError as exc:
         return GateResult(
-            16, "Review-Package Identity", FAIL,
-            "REVIEW_RISK_FINDINGS.json sidecar not found.",
-            errors=[f"Missing: {sidecar_path}"],
+            16, 'Review-Package Identity', FAIL,
+            f'Package identity resolution failed: {exc}', errors=[str(exc)]
         )
 
+    sidecar_path = docs_dir / 'REVIEW_RISK_FINDINGS.json'
     try:
-        with sidecar_path.open("r", encoding="utf-8") as fh:
+        with sidecar_path.open('r', encoding='utf-8') as fh:
             sidecar = json.load(fh)
-    except (json.JSONDecodeError, OSError) as e:
-        return GateResult(
-            16, "Review-Package Identity", FAIL,
-            f"Malformed or unreadable sidecar: {e}",
-            errors=[str(e)],
-        )
+    except FileNotFoundError:
+        return GateResult(16, 'Review-Package Identity', FAIL,
+                          'REVIEW_RISK_FINDINGS.json sidecar not found.',
+                          errors=[f'Missing: {sidecar_path}'])
+    except (OSError, json.JSONDecodeError) as exc:
+        return GateResult(16, 'Review-Package Identity', FAIL,
+                          f'Malformed or unreadable sidecar: {type(exc).__name__}',
+                          errors=[type(exc).__name__])
 
-    # 2. Sidecar corpus hash must match frozen hash
-    sidecar_corpus_sha = sidecar.get("corpus_sha256", "")
-    if sidecar_corpus_sha != EXPECTED_CORPUS_HASH:
+    sidecar_commit = sidecar.get('package_commit')
+    if not is_valid_git_commit(sidecar_commit):
+        errors.append('Sidecar package_commit is missing, blank, or malformed')
+    elif sidecar_commit.lower() != source_commit:
         errors.append(
-            f"Sidecar corpus_sha256 mismatch: "
-            f"sidecar={sidecar_corpus_sha[:16]}... expected={EXPECTED_CORPUS_HASH[:16]}..."
+            f'Sidecar package_commit mismatch: sidecar={sidecar_commit[:12]}... '
+            f'expected artifact-source={source_commit[:12]}...'
+        )
+    if sidecar.get('corpus_sha256') != EXPECTED_CORPUS_HASH:
+        errors.append('Sidecar corpus_sha256 mismatch')
+
+    review_required_ids = set(content_risk_gate.metadata.get('review_required_records', []))
+    sidecar_findings: Dict[str, Dict] = {}
+    for finding in sidecar.get('findings', []):
+        eid = finding.get('record_id', '')
+        if not eid:
+            errors.append('Sidecar finding missing record_id')
+        elif eid in sidecar_findings:
+            errors.append(f'Duplicate sidecar finding for record: {eid}')
+        else:
+            sidecar_findings[eid] = finding
+    if set(sidecar_findings) != review_required_ids:
+        errors.append(
+            f'Sidecar finding IDs mismatch Gate 14: sidecar={sorted(sidecar_findings)} '
+            f'gate14={sorted(review_required_ids)}'
         )
 
-    # 3. Sidecar package commit must match checked-out commit
+    queue_rows = _read_jsonl_by_id(data_dir / 'human_review_queue.jsonl', 'human_review_queue.jsonl', errors)
+    package_rows = _read_jsonl_by_id(docs_dir / 'REVIEWER_PACKAGE.jsonl', 'REVIEWER_PACKAGE.jsonl', errors)
+    csv_rows = _read_csv_by_id(docs_dir / 'REVIEWER_TEMPLATE.csv', errors)
+    queue_ids = set(queue_rows)
+
+    for label, rows in (('REVIEWER_PACKAGE.jsonl', package_rows), ('REVIEWER_TEMPLATE.csv', csv_rows)):
+        if set(rows) != queue_ids:
+            errors.append(
+                f'{label} ID set mismatch: missing={sorted(queue_ids - set(rows))[:5]} '
+                f'unexpected={sorted(set(rows) - queue_ids)[:5]}'
+            )
+        for eid, row in rows.items():
+            commit = row.get('package_commit')
+            if not is_valid_git_commit(commit):
+                errors.append(f'{label}:{eid}: package_commit is missing, blank, or malformed')
+            elif commit.lower() != source_commit:
+                errors.append(f'{label}:{eid}: package_commit mismatch')
+
+    markdown_path = docs_dir / 'ARABIC_HUMAN_REVIEW_QUEUE.md'
     try:
-        import subprocess as _sp
-        result = _sp.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=REPO_ROOT,
-            capture_output=True, text=True, timeout=10
-        )
-        current_commit = result.stdout.strip() if result.returncode == 0 else ""
-    except Exception:
-        current_commit = ""
+        markdown = markdown_path.read_text(encoding='utf-8')
+    except OSError as exc:
+        markdown = ''
+        errors.append(f'cannot read ARABIC_HUMAN_REVIEW_QUEUE.md: {type(exc).__name__}')
+    matches = re.findall(r'^> Package source commit:\s*`([0-9a-fA-F]{40})`\s*$', markdown, flags=re.MULTILINE)
+    if len(matches) != 1:
+        errors.append('Markdown package_commit is missing, malformed, or duplicated')
+    elif matches[0].lower() != source_commit:
+        errors.append('Markdown package_commit mismatch')
+    markdown_ids = _markdown_all_queue_ids(markdown)
+    if len(markdown_ids) != len(set(markdown_ids)) or set(markdown_ids) != queue_ids:
+        errors.append('Markdown queue-ID set is missing, duplicated, or unexpected')
 
-    sidecar_commit = sidecar.get("package_commit", "")
-    if current_commit and sidecar_commit != current_commit:
-        errors.append(
-            f"Sidecar package_commit mismatch: "
-            f"sidecar={sidecar_commit[:12]}... current={current_commit[:12]}..."
-        )
+    # Validate risk-state and reason identity across sidecar, JSONL, CSV, and Markdown.
+    for eid in review_required_ids:
+        finding = sidecar_findings.get(eid, {})
+        if eid not in package_rows or eid not in csv_rows:
+            continue
+        pkg, row = package_rows[eid], csv_rows[eid]
+        for label, representation in (('REVIEWER_PACKAGE.jsonl', pkg), ('REVIEWER_TEMPLATE.csv', row)):
+            if representation.get('content_risk_status') != REVIEW_REQUIRED:
+                errors.append(f'{label}:{eid}: flagged record risk status must be REVIEW_REQUIRED')
+            if str(representation.get('reviewer_attention_required')).lower() != 'true':
+                errors.append(f'{label}:{eid}: flagged record attention must be true')
+            if representation.get('integrity_flags') != 'REVIEW_REQUIRED_CONTENT_RISK':
+                errors.append(f'{label}:{eid}: flagged record integrity_flags invalid')
+            field_map = {
+                'content_risk_rule_id': 'matched_rule_id',
+                'content_risk_rule_description': 'matched_rule_description',
+                'content_risk_field': 'matched_field',
+                'content_risk_excerpt': 'safe_excerpt',
+            }
+            for out_field, sidecar_field in field_map.items():
+                if representation.get(out_field) != finding.get(sidecar_field):
+                    errors.append(f'{label}:{eid}: {out_field} disagrees with sidecar')
+        if eid not in markdown or finding.get('matched_rule_id', '') not in markdown or finding.get('safe_excerpt', '')[:30] not in markdown:
+            errors.append(f'Markdown missing risk disclosure for {eid}')
 
-    # 4. Build expected flagged IDs from Gate 14
-    review_required_ids: set = set()
-    if content_risk_gate.metadata:
-        review_required_ids = set(
-            content_risk_gate.metadata.get("review_required_records", [])
-        )
+    for eid in queue_ids - review_required_ids:
+        for label, rows in (('REVIEWER_PACKAGE.jsonl', package_rows), ('REVIEWER_TEMPLATE.csv', csv_rows)):
+            row = rows.get(eid, {})
+            if row.get('content_risk_status') != 'NONE':
+                errors.append(f'{label}:{eid}: unflagged risk status must be NONE')
+            if str(row.get('reviewer_attention_required')).lower() != 'false':
+                errors.append(f'{label}:{eid}: unflagged attention must be false')
 
-    # 5. Load REVIEWER_PACKAGE.jsonl
-    pkg_path = docs_dir / "REVIEWER_PACKAGE.jsonl"
-    if not pkg_path.exists():
-        errors.append(f"REVIEWER_PACKAGE.jsonl not found: {pkg_path}")
-    else:
-        pkg_records: Dict[str, Dict] = {}
-        try:
-            with pkg_path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        r = json.loads(line)
-                        eid = r.get("example_id", "")
-                        if eid in pkg_records:
-                            errors.append(f"Duplicate example_id in REVIEWER_PACKAGE.jsonl: {eid}")
-                        pkg_records[eid] = r
-        except (json.JSONDecodeError, OSError) as e:
-            errors.append(f"Cannot read REVIEWER_PACKAGE.jsonl: {e}")
-            pkg_records = {}
-
-        # 5a. All 50 frozen queue IDs appear exactly once
-        queue_path = data_dir / "human_review_queue.jsonl"
-        if queue_path.exists():
-            queue_ids = set()
-            with queue_path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        queue_ids.add(json.loads(line).get("example_id", ""))
-            missing_from_pkg = queue_ids - set(pkg_records.keys())
-            if missing_from_pkg:
-                errors.append(
-                    f"{len(missing_from_pkg)} queue record(s) missing from REVIEWER_PACKAGE.jsonl: "
-                    f"{sorted(missing_from_pkg)[:5]}"
-                )
-
-        # 5b. All Gate 14 REVIEW_REQUIRED records appear in REVIEWER_PACKAGE.jsonl
-        for eid in review_required_ids:
-            if eid not in pkg_records:
-                errors.append(
-                    f"REVIEW_REQUIRED record {eid} absent from REVIEWER_PACKAGE.jsonl"
-                )
-
-        # 5c. Flagged records must not show integrity_flags=OK
-        for eid in review_required_ids:
-            if eid in pkg_records:
-                flags = pkg_records[eid].get("integrity_flags", "")
-                if flags == "OK":
-                    errors.append(
-                        f"Flagged record {eid} shows integrity_flags=OK in REVIEWER_PACKAGE.jsonl — must be REVIEW_REQUIRED_CONTENT_RISK"
-                    )
-                status = pkg_records[eid].get("content_risk_status", "")
-                if status == "CLEAR":
-                    errors.append(
-                        f"Flagged record {eid} shows content_risk_status=CLEAR in REVIEWER_PACKAGE.jsonl — must be REVIEW_REQUIRED"
-                    )
-
-        # 5d. Unflagged records must show content_risk_status=CLEAR
-        for eid, r in pkg_records.items():
-            if eid not in review_required_ids:
-                status = r.get("content_risk_status", "")
-                if status not in ("CLEAR", ""):
-                    warnings.append(
-                        f"Unflagged record {eid} has content_risk_status={status} (expected CLEAR)"
-                    )
-
-    # 6. Cross-representation identity: sidecar findings vs REVIEWER_PACKAGE.jsonl
-    sidecar_findings = {f["record_id"]: f for f in sidecar.get("findings", [])}
-    for eid, sf in sidecar_findings.items():
-        if eid in pkg_records:
-            pr = pkg_records[eid]
-            if pr.get("content_risk_rule_id") != sf.get("matched_rule_id"):
-                errors.append(
-                    f"{eid}: rule_id mismatch: pkg={pr.get('content_risk_rule_id')} "
-                    f"sidecar={sf.get('matched_rule_id')}"
-                )
-            if pr.get("content_risk_field") != sf.get("matched_field"):
-                errors.append(
-                    f"{eid}: field mismatch: pkg={pr.get('content_risk_field')} "
-                    f"sidecar={sf.get('matched_field')}"
-                )
-            if pr.get("content_risk_severity") != sf.get("severity"):
-                errors.append(
-                    f"{eid}: severity mismatch: pkg={pr.get('content_risk_severity')} "
-                    f"sidecar={sf.get('severity')}"
-                )
+    for eid, row in package_rows.items():
+        for field in REVIEWER_JUDGMENT_FIELDS:
+            if str(row.get(field, '')).strip():
+                errors.append(f'REVIEWER_PACKAGE.jsonl:{eid}: reviewer field {field} populated')
+    for eid, row in csv_rows.items():
+        for field in REVIEWER_JUDGMENT_FIELDS:
+            if str(row.get(field, '')).strip():
+                errors.append(f'REVIEWER_TEMPLATE.csv:{eid}: reviewer field {field} populated')
 
     if errors:
         return GateResult(
-            16, "Review-Package Identity", FAIL,
-            f"{len(errors)} identity/coverage error(s) in reviewer-facing files.",
-            errors=errors[:15],
-            warnings=warnings,
-            metadata={"review_required_ids": sorted(review_required_ids)},
+            16, 'Review-Package Identity', FAIL,
+            f'{len(errors)} identity/coverage error(s) in reviewer-facing files.',
+            errors=errors[:20], warnings=warnings,
+            metadata={'artifact_release_commit': release_commit,
+                      'artifact_source_commit': source_commit,
+                      'review_required_ids': sorted(review_required_ids)},
         )
-
     return GateResult(
-        16, "Review-Package Identity", PASS,
-        f"All reviewer-facing representations are consistent. "
-        f"{len(review_required_ids)} flagged record(s) correctly disclosed. "
-        f"Sidecar corpus hash and package commit verified.",
+        16, 'Review-Package Identity', PASS,
+        f'All reviewer-facing representations are consistent. '
+        f'{len(review_required_ids)} flagged record(s) correctly disclosed. '
+        f'Artifact source commit verified against HEAD^.',
         warnings=warnings,
-        metadata={
-            "review_required_ids": sorted(review_required_ids),
-            "sidecar_corpus_sha256": sidecar_corpus_sha,
-            "sidecar_package_commit": sidecar_commit,
-        },
+        metadata={'artifact_release_commit': release_commit,
+                  'artifact_source_commit': source_commit,
+                  'sidecar_package_commit': sidecar_commit,
+                  'review_required_ids': sorted(review_required_ids)},
     )
 
 

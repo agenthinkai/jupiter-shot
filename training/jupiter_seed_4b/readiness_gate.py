@@ -84,6 +84,7 @@ AUTHORIZED_TEST_FILES = [
     "test_v241_package_identity.py", # V2.4.1: fail-closed package identity
     "test_v242_execution_isolation.py", # V2.4.2: exit classification and runtime isolation
     "test_v243_portability_and_interlock.py", # V2.4.3: portable permissions and completed authorization
+    "test_v244_windows_acl_and_cache.py", # V2.4.4: deny-ACE cleanup and cache isolation
 ]
 
 # Canonical authorized manifest hash (SHA-256 of sorted filenames joined by '|')
@@ -968,7 +969,8 @@ def gate_test_suite(repo_root: Path) -> GateResult:
                  str(test_dir),
                  f"--junitxml={xml_path}",
                  "--tb=short",
-                 "-q"],
+                 "-q",
+                 "-p", "no:cacheprovider"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8", errors="replace",

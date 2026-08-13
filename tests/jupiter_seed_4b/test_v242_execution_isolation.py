@@ -8,12 +8,14 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -128,56 +130,111 @@ def _windows_icacls() -> str | None:
     return executable
 
 
+def _windows_identity() -> str:
+    result = subprocess.run(
+        ["whoami"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    identity = result.stdout.strip()
+    if result.returncode != 0 or not identity:
+        pytest.skip("Windows ACL test skipped: unable to resolve exact current identity")
+    return identity
+
+
+def _icacls_run(icacls: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [icacls, *args], capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+
+
+def _icacls_snapshot(icacls: str, path: Path) -> str:
+    result = _icacls_run(icacls, str(path))
+    if result.returncode != 0:
+        pytest.skip("Windows ACL test skipped: unable to inspect pytest temporary-path ACL")
+    return result.stdout.replace("\r\n", "\n").strip()
+
+
+def _has_explicit_deny(snapshot: str, identity: str) -> bool:
+    """Detect the deny entry for the exact identity, not merely any DENY ACE."""
+    folded_identity = identity.casefold()
+    for line in snapshot.splitlines():
+        folded_line = line.casefold()
+        if folded_identity in folded_line and "(deny)" in folded_line:
+            return True
+    return False
+
+
+def _cleanup_test_deny(icacls: str, path: Path, identity: str) -> str:
+    """Remove only this test's deny ACE and return the verified post-cleanup ACL."""
+    removed = _icacls_run(icacls, str(path), "/remove:d", identity, "/c")
+    if removed.returncode != 0:
+        pytest.fail("Windows ACL cleanup failed: icacls /remove:d could not remove the test-owned DENY ACE")
+    inspected = _icacls_run(icacls, str(path))
+    if inspected.returncode != 0:
+        pytest.fail("Windows ACL cleanup failed: unable to verify post-cleanup ACL")
+    after = inspected.stdout.replace("\\r\\n", "\\n").strip()
+    if _has_explicit_deny(after, identity):
+        pytest.fail("Windows ACL cleanup failed: test-owned DENY ACE remains after /remove:d")
+    return after
+
+
+@dataclass
+class WindowsDenyLease:
+    path: Path
+    identity: str
+    permission: str
+    acl_before: str
+    acl_during: str = ""
+    acl_after: str = ""
+    cleanup_returncode: int | None = None
+
+
 @contextmanager
 def _windows_acl_deny(path: Path, permission: str):
-    """Deny a Windows ACL permission in a temporary directory and restore it exactly."""
+    """Add and remove only the test-owned DENY ACE on a pytest temporary path.
+
+    This helper deliberately never uses ``icacls /save`` or ``icacls /restore``.
+    Restoring a full descriptor can require privileges unavailable to ordinary
+    Windows users and can modify unrelated inherited ACEs.  Instead it removes
+    the single explicit deny entry that this test added for the exact identity.
+    """
     icacls = _windows_icacls()
     assert icacls is not None
-    backup_dir = path.parent / f"acl-backup-{uuid.uuid4().hex}"
-    backup_dir.mkdir()
-    backup_name = "original.acl"
-    saved = subprocess.run(
-        [icacls, str(path.parent), "/save", backup_name, "/t", "/c"],
-        cwd=backup_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    if saved.returncode != 0:
-        shutil.rmtree(backup_dir, ignore_errors=True)
-        pytest.skip("Windows ACL test skipped: unable to back up temporary-directory ACL")
-    user = subprocess.run(
-        ["whoami"], capture_output=True, text=True, encoding="utf-8", errors="replace",
-    ).stdout.strip()
-    if not user:
-        shutil.rmtree(backup_dir, ignore_errors=True)
-        pytest.skip("Windows ACL test skipped: unable to resolve current user")
-    changed = subprocess.run(
-        [icacls, str(path), "/deny", f"{user}:({permission})", "/c"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    if changed.returncode != 0:
-        subprocess.run([icacls, str(path.parent), "/restore", backup_name, "/c"],
-                       cwd=backup_dir, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        shutil.rmtree(backup_dir, ignore_errors=True)
-        pytest.skip("Windows ACL test skipped: ACL denial could not be applied safely")
+    identity = _windows_identity()
+    before = _icacls_snapshot(icacls, path)
+    lease = WindowsDenyLease(path=path, identity=identity, permission=permission, acl_before=before)
+
+    applied = _icacls_run(icacls, str(path), "/deny", f"{identity}:({permission})", "/c")
+    if applied.returncode != 0:
+        pytest.skip("Windows ACL test skipped: test-owned DENY ACE could not be applied")
+    lease.acl_during = _icacls_snapshot(icacls, path)
+    if not _has_explicit_deny(lease.acl_during, identity):
+        # Attempt and verify narrow cleanup even if icacls reported a misleading success.
+        lease.acl_after = _cleanup_test_deny(icacls, path, identity)
+        if lease.acl_after != lease.acl_before:
+            pytest.fail("Windows ACL cleanup changed unrelated ACL entries on a pytest temporary path")
+        pytest.skip("Windows ACL test skipped: applied DENY ACE was not observable")
+
     try:
-        yield
+        yield lease
     finally:
-        restored = subprocess.run(
-            [icacls, str(path.parent), "/restore", backup_name, "/c"],
-            cwd=backup_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
-        shutil.rmtree(backup_dir, ignore_errors=True)
-        if restored.returncode != 0:
-            pytest.fail("Windows ACL restoration failed for a pytest temporary path")
+        lease.acl_after = _cleanup_test_deny(icacls, path, identity)
+        lease.cleanup_returncode = 0
+        if lease.acl_after != lease.acl_before:
+            pytest.fail("Windows ACL cleanup changed unrelated ACL entries on a pytest temporary path")
 
 
 @contextmanager
 def verified_unreadable_file(path: Path):
     """Make a temporary file actually unreadable, or explicitly skip."""
     if os.name == "nt":
-        with _windows_acl_deny(path, "R"):
+        with _windows_acl_deny(path, "R") as lease:
             if _can_read(path):
                 pytest.skip("Windows ACL denial did not make the temporary file unreadable")
+            assert _has_explicit_deny(lease.acl_during, lease.identity)
             yield
+        if not _can_read(path):
+            pytest.fail("Windows ACL cleanup failed: temporary file remains unreadable")
         return
 
     original_mode = path.stat().st_mode
@@ -194,10 +251,13 @@ def verified_unreadable_file(path: Path):
 def verified_unwritable_artifact_parent(parent: Path):
     """Make a temporary parent genuinely unwritable for child creation, or skip."""
     if os.name == "nt":
-        with _windows_acl_deny(parent, "W"):
+        with _windows_acl_deny(parent, "W") as lease:
             if _can_create_child(parent):
                 pytest.skip("Windows ACL denial did not make temporary artifact parent unwritable")
+            assert _has_explicit_deny(lease.acl_during, lease.identity)
             yield parent / "runtime-artifacts"
+        if not _can_create_child(parent):
+            pytest.fail("Windows ACL cleanup failed: temporary artifact parent remains unwritable")
         return
 
     original_mode = parent.stat().st_mode
@@ -284,7 +344,7 @@ class TestV242RequiredEvidenceExit3:
                 result, artifact_dir = run_cli(["--data-dir", str(data)])
                 artifact = assert_execution_error(result, artifact_dir)
                 assert artifact["error_category"] == "unreadable_required_input"
-            # POSIX restoration is checked directly; Windows restoration is enforced by icacls /restore.
+            # POSIX restoration is checked directly; Windows cleanup removes only the test-owned deny ACE.
             if os.name != "nt":
                 assert target.stat().st_mode == original_mode
 

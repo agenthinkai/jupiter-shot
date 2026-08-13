@@ -1,15 +1,15 @@
 {
   "schema_version": "1.0",
-  "package_commit": "5fc0d570665c492c7e3daa97aa6c02a2a566f0de",
+  "package_commit": "411eae35141e8a23ecaa1d5b4c03036d5fe377cd",
   "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-  "generated_at_utc": "2026-08-12T13:34:56.663262+00:00",
+  "generated_at_utc": "2026-08-13T10:04:01.406879+00:00",
   "total_findings": 3,
   "blocked_count": 0,
   "review_required_count": 3,
   "findings": [
     {
       "schema_version": "1.0",
-      "package_commit": "5fc0d570665c492c7e3daa97aa6c02a2a566f0de",
+      "package_commit": "411eae35141e8a23ecaa1d5b4c03036d5fe377cd",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
       "record_id": "seed4b-train-0032",
       "severity": "REVIEW_REQUIRED",
@@ -20,11 +20,11 @@
       "matched_field": "response",
       "safe_excerpt": "ation employment commitments. Specific current requirements should be verified against CITRA's published regulations.",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
-      "generated_at_utc": "2026-08-12T13:34:56.663290+00:00"
+      "generated_at_utc": "2026-08-13T10:04:01.406898+00:00"
     },
     {
       "schema_version": "1.0",
-      "package_commit": "5fc0d570665c492c7e3daa97aa6c02a2a566f0de",
+      "package_commit": "411eae35141e8a23ecaa1d5b4c03036d5fe377cd",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
       "record_id": "seed4b-train-0038",
       "severity": "REVIEW_REQUIRED",
@@ -35,11 +35,11 @@
       "matched_field": "response",
       "safe_excerpt": "وني وحماية بيانات المستهلكين. يُنصح بمراجعة الموقع الرسمي للهيئة للاطلاع على أحدث اللوائح.",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
-      "generated_at_utc": "2026-08-12T13:34:56.663300+00:00"
+      "generated_at_utc": "2026-08-13T10:04:01.406903+00:00"
     },
     {
       "schema_version": "1.0",
-      "package_commit": "5fc0d570665c492c7e3daa97aa6c02a2a566f0de",
+      "package_commit": "411eae35141e8a23ecaa1d5b4c03036d5fe377cd",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
       "record_id": "seed4b-valid-0005",
       "severity": "REVIEW_REQUIRED",
@@ -50,7 +50,7 @@
       "matched_field": "response",
       "safe_excerpt": "لا يجوز للمشغّل الاستئثار به. يُنصح بمراجعة المعيار الكامل والهيئة الشرعية للتطبيق الفعلي.",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
-      "generated_at_utc": "2026-08-12T13:34:56.663303+00:00"
+      "generated_at_utc": "2026-08-13T10:04:01.406909+00:00"
     }
   ]
 }

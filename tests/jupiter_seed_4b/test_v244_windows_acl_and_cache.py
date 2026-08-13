@@ -6,6 +6,7 @@ static source assertions as proof of ACL safety.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -35,6 +36,17 @@ def _tree_fingerprint(root: Path) -> list[str]:
         suffix = "/" if path.is_dir() else ""
         items.append(relative.as_posix() + suffix)
     return sorted(items)
+
+
+def _content_digest(root: Path) -> str:
+    """Hash reviewer-facing files so runtime tests prove they did not change."""
+    digest = hashlib.sha256()
+    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\\0")
+    return digest.hexdigest()
 
 
 def _run_gate(extra: list[str] | None = None, timeout: int = 240) -> subprocess.CompletedProcess[str]:
@@ -146,24 +158,49 @@ class TestWindowsAclDenyCleanup:
             shutil.rmtree(root, ignore_errors=False)
         assert not root.exists()
 
-    def test_windows_output_write_failure_is_safe_and_removes_deny_ace(self) -> None:
+    def test_windows_unwritable_output_uses_writable_artifact_dir_and_removes_deny_ace(self) -> None:
+        """An unwritable report path is not an unwritable artifact-directory scenario."""
         _require_windows_icacls()
         root = Path(tempfile.mkdtemp(prefix="jupiter-v244-output-"))
         parent = root / "unwritable-output"
         artifact_dir = root / "runtime-artifacts"
         parent.mkdir()
         artifact_dir.mkdir()
+        reviewer_before = _content_digest(REPO_ROOT / "docs" / "jupiter_seed_4b")
+        status_before = subprocess.run(
+            ["git", "status", "--short"], cwd=REPO_ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
+        ).stdout
         try:
             with acl.verified_unwritable_artifact_parent(parent):
                 output = parent / "readiness.md"
                 result = _run_gate(["--output", str(output), "--artifact-dir", str(artifact_dir)])
                 assert result.returncode == EXIT_EXECUTION_ERROR
-                assert "safe fallback" in result.stderr.lower()
+                assert "safe fallback" not in result.stderr.lower()
                 assert "traceback" not in result.stderr.lower()
                 assert not output.exists(), "failed report write must not leave a partial output"
+                assert not list(parent.glob("readiness.md*")), "temporary output residue must be absent"
+                public_artifact = artifact_dir / "EXECUTION_ERROR_ARTIFACT.json"
+                assert public_artifact.exists(), "writable artifact directory must receive error evidence"
+                payload = json.loads(public_artifact.read_text(encoding="utf-8"))
+                assert payload["outcome"] == "EXECUTION_ERROR"
+                assert payload["training_authorized"] is False
+                public_text = public_artifact.read_text(encoding="utf-8").lower()
+                assert "traceback" not in public_text
+                assert "diagnostic" not in public_text
+                assert "environment" not in public_text
+                assert "openai_api_key" not in public_text
+                assert not (artifact_dir / "EXECUTION_ERROR_INTERNAL.json").exists()
             assert acl._can_create_child(parent)
         finally:
+            reviewer_after = _content_digest(REPO_ROOT / "docs" / "jupiter_seed_4b")
+            status_after = subprocess.run(
+                ["git", "status", "--short"], cwd=REPO_ROOT,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
+            ).stdout
             shutil.rmtree(root, ignore_errors=False)
+        assert reviewer_after == reviewer_before
+        assert status_after == status_before
         assert not root.exists()
 
 

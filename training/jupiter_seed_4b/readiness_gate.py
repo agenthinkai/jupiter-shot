@@ -86,6 +86,7 @@ AUTHORIZED_TEST_FILES = [
     "test_v243_portability_and_interlock.py", # V2.4.3: portable permissions and completed authorization
     "test_v244_windows_acl_and_cache.py", # V2.4.4: deny-ACE cleanup and cache isolation
     "test_v246_literal_gate14.py", # V2.4.6: literal Arabic recall and effective review set
+    "test_v247_acl_and_temp_hygiene.py", # V2.4.7: Windows ACL and temporary-directory hygiene
 ]
 
 # Canonical authorized manifest hash (SHA-256 of sorted filenames joined by '|')

@@ -217,10 +217,10 @@ class TestGate11ExitCodeEnforcement:
 class TestAuthorizedTestManifest:
     """Tests for the authorized-test-manifest enforcement in Gate 11."""
 
-    def test_authorized_test_files_has_16_entries(self) -> None:
-        """AUTHORIZED_TEST_FILES must contain exactly 16 entries (V2.4.6 adds literal Gate 14 coverage)."""
-        assert len(AUTHORIZED_TEST_FILES) == 16, (
-            f"Expected 16 authorized test files, got {len(AUTHORIZED_TEST_FILES)}: "
+    def test_authorized_test_files_has_17_entries(self) -> None:
+        """AUTHORIZED_TEST_FILES must contain exactly 17 entries (V2.4.7 adds hygiene coverage)."""
+        assert len(AUTHORIZED_TEST_FILES) == 17, (
+            f"Expected 17 authorized test files, got {len(AUTHORIZED_TEST_FILES)}: "
             f"{AUTHORIZED_TEST_FILES}"
         )
 
@@ -253,6 +253,10 @@ class TestAuthorizedTestManifest:
     def test_v246_literal_gate14_suite_in_authorized_files(self) -> None:
         """The V2.4.6 literal Gate 14 suite must be enforced by Gate 11."""
         assert "test_v246_literal_gate14.py" in AUTHORIZED_TEST_FILES
+
+    def test_v247_acl_and_temp_hygiene_suite_in_authorized_files(self) -> None:
+        """The V2.4.7 ACL/temporary-directory hygiene suite must be enforced by Gate 11."""
+        assert "test_v247_acl_and_temp_hygiene.py" in AUTHORIZED_TEST_FILES
 
     def test_no_duplicate_entries_in_authorized_files(self) -> None:
         """AUTHORIZED_TEST_FILES must not contain duplicate entries."""

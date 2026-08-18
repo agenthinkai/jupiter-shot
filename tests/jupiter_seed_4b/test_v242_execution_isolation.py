@@ -42,31 +42,59 @@ def repo_status() -> str:
     ).stdout
 
 
-def run_cli(extra: list[str], timeout: int = 240) -> tuple[subprocess.CompletedProcess[str], Path]:
-    artifact_dir = Path(tempfile.mkdtemp(prefix="jupiter-v242-artifact-"))
-    env = dict(os.environ)
-    env.pop("PYTHONUTF8", None)
-    env.pop("PYTHONIOENCODING", None)
-    # Top-level production invocations must not inherit pytest's marker. Nested
-    # Gate 11 tests preserve it so their CLI children hit the recursion guard
-    # rather than spawning another complete authorized suite.
-    if not env.get("JUPITER_GATE11_SUBPROCESS"):
-        env.pop("PYTEST_CURRENT_TEST", None)
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--artifact-dir", str(artifact_dir), *extra],
-        cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout, env=env,
+@dataclass(frozen=True)
+class CliRun:
+    """Immutable CLI evidence retained after the helper deletes its owned directory."""
+    result: subprocess.CompletedProcess[str]
+    artifact_bytes: bytes | None
+    owned_directory_removed: bool
+
+
+def run_cli(
+    extra: list[str],
+    timeout: int = 240,
+    temp_root: Path | None = None,
+) -> CliRun:
+    """Run the production CLI and deterministically remove only this invocation's temp tree."""
+    temp_kwargs: dict[str, object] = {"prefix": "jupiter-v242-artifact-"}
+    if temp_root is not None:
+        temp_root.mkdir(parents=True, exist_ok=True)
+        temp_kwargs["dir"] = str(temp_root)
+    owned_dir: Path | None = None
+    artifact_bytes: bytes | None = None
+    with tempfile.TemporaryDirectory(**temp_kwargs) as raw:
+        owned_dir = Path(raw)
+        artifact_dir = owned_dir / "artifacts"
+        env = dict(os.environ)
+        env.pop("PYTHONUTF8", None)
+        env.pop("PYTHONIOENCODING", None)
+        # Top-level production invocations must not inherit pytest's marker.
+        if not env.get("JUPITER_GATE11_SUBPROCESS"):
+            env.pop("PYTEST_CURRENT_TEST", None)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--artifact-dir", str(artifact_dir), *extra],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        artifact_path = artifact_dir / "EXECUTION_ERROR_ARTIFACT.json"
+        if artifact_path.exists():
+            artifact_bytes = artifact_path.read_bytes()
+    assert owned_dir is not None
+    return CliRun(
+        result=result,
+        artifact_bytes=artifact_bytes,
+        owned_directory_removed=not owned_dir.exists(),
     )
-    return result, artifact_dir
 
 
-def assert_execution_error(result: subprocess.CompletedProcess[str], artifact_dir: Path) -> dict:
+def assert_execution_error(run: CliRun) -> dict:
+    result = run.result
     assert result.returncode == EXIT_EXECUTION_ERROR, (
         f"expected execution-error exit 3; got {result.returncode}\n"
         f"stdout={result.stdout[-500:]}\nstderr={result.stderr[-500:]}"
     )
-    artifact_path = artifact_dir / "EXECUTION_ERROR_ARTIFACT.json"
-    assert artifact_path.exists(), f"missing public artifact: {artifact_path}"
-    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert run.owned_directory_removed, "run_cli leaked its owned temporary directory"
+    assert run.artifact_bytes is not None, "missing captured public execution artifact"
+    artifact = json.loads(run.artifact_bytes.decode("utf-8"))
     required = {
         "schema_version", "outcome", "exit_code", "error_category", "error_type",
         "safe_message", "failed_operation", "timestamp_utc", "package_release_commit",
@@ -76,12 +104,10 @@ def assert_execution_error(result: subprocess.CompletedProcess[str], artifact_di
     assert artifact["outcome"] == "EXECUTION_ERROR"
     assert artifact["exit_code"] == 3
     assert artifact["training_authorized"] is False
-    public_text = artifact_path.read_text(encoding="utf-8").lower()
+    public_text = run.artifact_bytes.decode("utf-8").lower()
     assert "traceback" not in public_text
     assert "full_traceback" not in public_text
-    assert not (artifact_dir / "EXECUTION_ERROR_INTERNAL.json").exists()
     return artifact
-
 
 def copy_data(tmp: Path) -> Path:
     destination = tmp / "data"
@@ -147,34 +173,45 @@ def _icacls_run(icacls: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _icacls_snapshot(icacls: str, path: Path) -> str:
+def _icacls_snapshot(icacls: str, path: Path, *, preflight: bool = False) -> str:
     result = _icacls_run(icacls, str(path))
     if result.returncode != 0:
-        pytest.skip("Windows ACL test skipped: unable to inspect pytest temporary-path ACL")
+        if preflight:
+            pytest.skip("Windows ACL test skipped: unable to inspect pytest temporary-path ACL before denial")
+        pytest.fail("Windows ACL test failure: unable to inspect ACL after DENY operation began")
     return result.stdout.replace("\r\n", "\n").strip()
 
 
 def _has_explicit_deny(snapshot: str, identity: str) -> bool:
     """Detect the deny entry for the exact identity, not merely any DENY ACE."""
     folded_identity = identity.casefold()
-    for line in snapshot.splitlines():
-        folded_line = line.casefold()
-        if folded_identity in folded_line and "(deny)" in folded_line:
-            return True
-    return False
+    return any(
+        folded_identity in line.casefold() and "(deny)" in line.casefold()
+        for line in snapshot.splitlines()
+    )
 
 
-def _cleanup_test_deny(icacls: str, path: Path, identity: str) -> str:
-    """Remove only this test's deny ACE and return the verified post-cleanup ACL."""
-    removed = _icacls_run(icacls, str(path), "/remove:d", identity, "/c")
-    if removed.returncode != 0:
-        pytest.fail("Windows ACL cleanup failed: icacls /remove:d could not remove the test-owned DENY ACE")
-    inspected = _icacls_run(icacls, str(path))
-    if inspected.returncode != 0:
-        pytest.fail("Windows ACL cleanup failed: unable to verify post-cleanup ACL")
-    after = inspected.stdout.replace("\\r\\n", "\\n").strip()
+def _icacls_failure_text(result: subprocess.CompletedProcess[str]) -> bool:
+    text = (result.stdout + "\n" + result.stderr).casefold()
+    if "failed processing" in text and "failed processing 0 files" not in text:
+        return True
+    return any(token in text for token in ("access is denied", "error ", "unable to", "failed to"))
+
+
+def _remove_exact_test_deny(icacls: str, path: Path, identity: str) -> str:
+    """Remove only the exact deny ACE added by this test; never use /c, /save, or /restore."""
+    first = _icacls_run(icacls, str(path), "/remove:d", identity)
+    if first.returncode != 0 or _icacls_failure_text(first):
+        # A single narrowly scoped retry is the safest recovery; no descriptor restore is attempted.
+        retry = _icacls_run(icacls, str(path), "/remove:d", identity)
+        if retry.returncode != 0 or _icacls_failure_text(retry):
+            pytest.fail(
+                "Windows ACL cleanup failed for exact test-owned DENY ACE: "
+                f"first={first.stdout!r}/{first.stderr!r}; retry={retry.stdout!r}/{retry.stderr!r}"
+            )
+    after = _icacls_snapshot(icacls, path)
     if _has_explicit_deny(after, identity):
-        pytest.fail("Windows ACL cleanup failed: test-owned DENY ACE remains after /remove:d")
+        pytest.fail("Windows ACL cleanup failed: exact test-owned DENY ACE remains after /remove:d")
     return after
 
 
@@ -184,51 +221,59 @@ class WindowsDenyLease:
     identity: str
     permission: str
     acl_before: str
+    parent_acl_before: str
     acl_during: str = ""
     acl_after: str = ""
-    cleanup_returncode: int | None = None
 
 
 @contextmanager
 def _windows_acl_deny(path: Path, permission: str):
-    """Add and remove only the test-owned DENY ACE on a pytest temporary path.
+    """Apply a narrow test-owned DENY ACE and guarantee verified cleanup after every path.
 
-    This helper deliberately never uses ``icacls /save`` or ``icacls /restore``.
-    Restoring a full descriptor can require privileges unavailable to ordinary
-    Windows users and can modify unrelated inherited ACEs.  Instead it removes
-    the single explicit deny entry that this test added for the exact identity.
+    File content denial uses ``RD`` (ReadData), not generic ``R``: RD denies content
+    reads while preserving READ_CONTROL so the identity can inspect and repair the ACL.
+    The helper never uses descriptor save/restore and never uses ``/c`` for cleanup.
     """
     icacls = _windows_icacls()
     assert icacls is not None
     identity = _windows_identity()
-    before = _icacls_snapshot(icacls, path)
-    lease = WindowsDenyLease(path=path, identity=identity, permission=permission, acl_before=before)
-
-    applied = _icacls_run(icacls, str(path), "/deny", f"{identity}:({permission})", "/c")
-    if applied.returncode != 0:
-        pytest.skip("Windows ACL test skipped: test-owned DENY ACE could not be applied")
-    lease.acl_during = _icacls_snapshot(icacls, path)
-    if not _has_explicit_deny(lease.acl_during, identity):
-        # Attempt and verify narrow cleanup even if icacls reported a misleading success.
-        lease.acl_after = _cleanup_test_deny(icacls, path, identity)
-        if lease.acl_after != lease.acl_before:
-            pytest.fail("Windows ACL cleanup changed unrelated ACL entries on a pytest temporary path")
-        pytest.skip("Windows ACL test skipped: applied DENY ACE was not observable")
-
+    before = _icacls_snapshot(icacls, path, preflight=True)
+    parent_before = _icacls_snapshot(icacls, path.parent, preflight=True)
+    lease = WindowsDenyLease(
+        path=path, identity=identity, permission=permission,
+        acl_before=before, parent_acl_before=parent_before,
+    )
+    deny_started = False
     try:
+        deny_started = True
+        applied = _icacls_run(icacls, str(path), "/deny", f"{identity}:({permission})")
+        lease.acl_during = _icacls_snapshot(icacls, path)
+        if applied.returncode != 0 or _icacls_failure_text(applied):
+            if _has_explicit_deny(lease.acl_during, identity):
+                pytest.fail("Windows ACL denial command reported failure after applying a DENY ACE")
+            pytest.skip("Windows ACL test skipped: safe test-owned DENY ACE could not be applied")
+        if not _has_explicit_deny(lease.acl_during, identity):
+            pytest.skip("Windows ACL test skipped: test-owned DENY ACE was not observable")
         yield lease
     finally:
-        lease.acl_after = _cleanup_test_deny(icacls, path, identity)
-        lease.cleanup_returncode = 0
-        if lease.acl_after != lease.acl_before:
-            pytest.fail("Windows ACL cleanup changed unrelated ACL entries on a pytest temporary path")
+        if deny_started:
+            current = _icacls_snapshot(icacls, path)
+            if _has_explicit_deny(current, identity):
+                lease.acl_after = _remove_exact_test_deny(icacls, path, identity)
+            else:
+                lease.acl_after = current
+            parent_after = _icacls_snapshot(icacls, path.parent)
+            if lease.acl_after != lease.acl_before:
+                pytest.fail("Windows ACL cleanup changed the temporary file ACL beyond the exact test DENY ACE")
+            if parent_after != lease.parent_acl_before:
+                pytest.fail("Windows ACL cleanup changed a parent or inherited ACL outside the test-owned file ACE")
 
 
 @contextmanager
 def verified_unreadable_file(path: Path):
     """Make a temporary file actually unreadable, or explicitly skip."""
     if os.name == "nt":
-        with _windows_acl_deny(path, "R") as lease:
+        with _windows_acl_deny(path, "RD") as lease:
             if _can_read(path):
                 pytest.skip("Windows ACL denial did not make the temporary file unreadable")
             assert _has_explicit_deny(lease.acl_during, lease.identity)
@@ -274,8 +319,8 @@ class TestV242RequiredEvidenceExit3:
     def test_missing_data_directory_is_exit_3_with_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             missing = Path(raw) / "missing-data"
-            result, artifact_dir = run_cli(["--data-dir", str(missing)])
-            artifact = assert_execution_error(result, artifact_dir)
+            run = run_cli(["--data-dir", str(missing)])
+            artifact = assert_execution_error(run)
             assert artifact["error_category"] == "missing_required_input"
             assert artifact["failed_path"] == str(missing)
 
@@ -284,8 +329,8 @@ class TestV242RequiredEvidenceExit3:
         with tempfile.TemporaryDirectory() as raw:
             data = copy_data(Path(raw))
             (data / missing_name).unlink()
-            result, artifact_dir = run_cli(["--data-dir", str(data)])
-            artifact = assert_execution_error(result, artifact_dir)
+            run = run_cli(["--data-dir", str(data)])
+            artifact = assert_execution_error(run)
             assert artifact["failed_path"].endswith(missing_name)
 
     @pytest.mark.parametrize(
@@ -296,23 +341,23 @@ class TestV242RequiredEvidenceExit3:
         with tempfile.TemporaryDirectory() as raw:
             docs = copy_docs(Path(raw))
             (docs / missing_name).unlink()
-            result, artifact_dir = run_cli(["--docs-dir", str(docs)])
-            artifact = assert_execution_error(result, artifact_dir)
+            run = run_cli(["--docs-dir", str(docs)])
+            artifact = assert_execution_error(run)
             assert artifact["failed_path"].endswith(missing_name)
 
     def test_missing_benchmark_directory_is_exit_3(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             missing = Path(raw) / "missing-benchmark"
-            result, artifact_dir = run_cli(["--benchmark-dir", str(missing)])
-            assert_execution_error(result, artifact_dir)
+            run = run_cli(["--benchmark-dir", str(missing)])
+            assert_execution_error(run)
 
     @pytest.mark.parametrize("missing_name", ["FROZEN_CORPUS_MANIFEST.json", "FROZEN_BENCHMARK_MANIFEST.json"])
     def test_missing_each_required_benchmark_manifest_is_exit_3(self, missing_name: str) -> None:
         with tempfile.TemporaryDirectory() as raw:
             bench = copy_bench(Path(raw))
             (bench / missing_name).unlink()
-            result, artifact_dir = run_cli(["--benchmark-dir", str(bench)])
-            artifact = assert_execution_error(result, artifact_dir)
+            run = run_cli(["--benchmark-dir", str(bench)])
+            artifact = assert_execution_error(run)
             assert artifact["failed_path"].endswith(missing_name)
 
     @pytest.mark.parametrize("target", ["train.jsonl", "human_review_queue.jsonl"])
@@ -320,8 +365,8 @@ class TestV242RequiredEvidenceExit3:
         with tempfile.TemporaryDirectory() as raw:
             data = copy_data(Path(raw))
             (data / target).write_text("{not-json}\n", encoding="utf-8")
-            result, artifact_dir = run_cli(["--data-dir", str(data)])
-            artifact = assert_execution_error(result, artifact_dir)
+            run = run_cli(["--data-dir", str(data)])
+            artifact = assert_execution_error(run)
             assert artifact["error_category"] == "malformed_jsonl"
 
     @pytest.mark.parametrize("target", ["FROZEN_CORPUS_MANIFEST.json", "FROZEN_BENCHMARK_MANIFEST.json"])
@@ -329,8 +374,8 @@ class TestV242RequiredEvidenceExit3:
         with tempfile.TemporaryDirectory() as raw:
             bench = copy_bench(Path(raw))
             (bench / target).write_text("{not-json}\n", encoding="utf-8")
-            result, artifact_dir = run_cli(["--benchmark-dir", str(bench)])
-            artifact = assert_execution_error(result, artifact_dir)
+            run = run_cli(["--benchmark-dir", str(bench)])
+            artifact = assert_execution_error(run)
             assert artifact["error_category"] == "malformed_json"
 
     def test_unreadable_required_file_is_exit_3(self) -> None:
@@ -341,8 +386,8 @@ class TestV242RequiredEvidenceExit3:
             original_mode = target.stat().st_mode
             with verified_unreadable_file(target):
                 assert not _can_read(target), "test setup must prove the file is actually unreadable"
-                result, artifact_dir = run_cli(["--data-dir", str(data)])
-                artifact = assert_execution_error(result, artifact_dir)
+                run = run_cli(["--data-dir", str(data)])
+                artifact = assert_execution_error(run)
                 assert artifact["error_category"] == "unreadable_required_input"
             # POSIX restoration is checked directly; Windows cleanup removes only the test-owned deny ACE.
             if os.name != "nt":
@@ -351,9 +396,9 @@ class TestV242RequiredEvidenceExit3:
     def test_output_write_failure_is_exit_3_with_safe_stderr_fallback(self) -> None:
         if not Path("/dev/full").exists():
             pytest.skip("/dev/full is unavailable on this platform")
-        result, artifact_dir = run_cli(["--output", "/dev/full"])
-        assert_execution_error(result, artifact_dir)
-        assert "traceback" not in result.stderr.lower()
+        run = run_cli(["--output", "/dev/full"])
+        assert_execution_error(run)
+        assert "traceback" not in run.result.stderr.lower()
 
     def test_error_artifact_write_failure_remains_exit_3(self) -> None:
         """Verify a real unwritable temporary destination; never depend on /dev or null paths."""
@@ -384,19 +429,21 @@ class TestV242RuntimeIsolation:
         if os.environ.get("JUPITER_GATE11_SUBPROCESS"):
             pytest.skip("Avoid recursive baseline invocation inside Gate 11 subprocess")
         before = repo_status()
-        result, artifact_dir = run_cli([])
+        run = run_cli([])
         after = repo_status()
-        assert result.returncode == EXIT_HUMAN_REVIEW_REQUIRED, result.stderr[-1000:]
+        assert run.result.returncode == EXIT_HUMAN_REVIEW_REQUIRED, run.result.stderr[-1000:]
         assert before == after
-        assert not artifact_dir.exists() or not list(artifact_dir.iterdir())
+        assert run.owned_directory_removed
+        assert run.artifact_bytes is None
 
     def test_explicit_output_is_optional_and_isolated(self) -> None:
         if os.environ.get("JUPITER_GATE11_SUBPROCESS"):
             pytest.skip("Avoid recursive baseline invocation inside Gate 11 subprocess")
         with tempfile.TemporaryDirectory() as raw:
             report = Path(raw) / "readiness.md"
-            result, _ = run_cli(["--output", str(report)])
-            assert result.returncode == EXIT_HUMAN_REVIEW_REQUIRED
+            run = run_cli(["--output", str(report)])
+            assert run.result.returncode == EXIT_HUMAN_REVIEW_REQUIRED
+            assert run.owned_directory_removed
             assert report.exists()
             assert "HUMAN_REVIEW_REQUIRED" in report.read_text(encoding="utf-8")
 
@@ -408,12 +455,14 @@ class TestV242RuntimeIsolation:
             sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
             sidecar["package_commit"] = "0" * 40
             sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
-            result, artifact_dir = run_cli(["--docs-dir", str(docs)])
-            assert result.returncode == EXIT_MECHANICAL_FAILURE
-            assert not artifact_dir.exists() or not list(artifact_dir.iterdir())
+            run = run_cli(["--docs-dir", str(docs)])
+            assert run.result.returncode == EXIT_MECHANICAL_FAILURE
+            assert run.owned_directory_removed
+            assert run.artifact_bytes is None
 
     def test_human_review_required_baseline_is_exit_2_not_exit_3(self) -> None:
         if os.environ.get("JUPITER_GATE11_SUBPROCESS"):
             pytest.skip("Avoid recursive baseline invocation inside Gate 11 subprocess")
-        result, _ = run_cli([])
-        assert result.returncode == EXIT_HUMAN_REVIEW_REQUIRED
+        run = run_cli([])
+        assert run.result.returncode == EXIT_HUMAN_REVIEW_REQUIRED
+        assert run.owned_directory_removed

@@ -4,7 +4,7 @@
 > This document is generated from the frozen corpus and Gate 14 findings.
 > Human reviewers must independently judge every record.
 > Software has not populated any reviewer judgment field.
-> Package source commit: `7c1b58395617cc7dce36cdc68f4fff145a37fc47`
+> Package source commit: `3116bf8465e8d617f8843d54aedf61d128db6fe4`
 > Package identity scheme: `package_commit` identifies the source commit; the artifact release commit is its direct child.
 
 ## Coverage

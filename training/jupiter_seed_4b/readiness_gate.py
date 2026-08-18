@@ -85,6 +85,7 @@ AUTHORIZED_TEST_FILES = [
     "test_v242_execution_isolation.py", # V2.4.2: exit classification and runtime isolation
     "test_v243_portability_and_interlock.py", # V2.4.3: portable permissions and completed authorization
     "test_v244_windows_acl_and_cache.py", # V2.4.4: deny-ACE cleanup and cache isolation
+    "test_v246_literal_gate14.py", # V2.4.6: literal Arabic recall and effective review set
 ]
 
 # Canonical authorized manifest hash (SHA-256 of sorted filenames joined by '|')
@@ -329,15 +330,28 @@ BLOCKING_CONTENT_PATTERNS = [
 # Module-level corpus constants (used by Gate 13, Gate 16, and test suite)
 EXPECTED_CORPUS_HASH = "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0"
 
-# V2.3: Corrected GCC_TRIP_PHRASES — removed erroneous $ end-anchor.
-# Previous patterns used \.$  which is \. (literal period) + $ (end-of-string anchor).
-# This meant phrases were only detected when they appeared at the very end of the string.
-# Corrected: \. matches a sentence-ending period anywhere in the text.
-# Regression tests in test_v23_regex.py verify anchor behaviour and punctuation boundaries.
+# V2.4.6 literal Gate 14 contract.
+# GCC_TRIP_AR detects the documented Arabic phrase in the RESPONSE field only.
+# ``\s+`` is deterministic flexible whitespace: it accepts one or more ordinary
+# whitespace characters (including a newline) between the two documented words.
+# It deliberately imposes no position, punctuation, authority, split, or length condition.
 GCC_TRIP_PHRASES = [
-    re.compile(r"يُنصح بمراجعة[^\.]{0,50}\.", re.UNICODE),
+    re.compile(r"يُنصح\s+بمراجعة", re.UNICODE),
     re.compile(r"specific current requirements should be verified[^\.]{0,60}\.", re.IGNORECASE),
 ]
+GCC_TRIP_RULE_IDS = ("GCC_TRIP_AR", "GCC_TRIP_EN")
+GCC_TRIP_RULE_DESCRIPTIONS = {
+    "GCC_TRIP_AR": (
+        "Arabic GCC trip phrase: يُنصح بمراجعة. The literal documented phrase is "
+        "detected anywhere in the response field with deterministic flexible whitespace."
+    ),
+    "GCC_TRIP_EN": (
+        "English GCC trip phrase: specific current requirements should be verified. "
+        "The established English sentence rule remains unchanged and requires human reviewer judgment."
+    ),
+}
+# Both documented advisory rules are response-scoped. Prompt-only text is never a finding.
+GCC_TRIP_FIELDS = {"GCC_TRIP_AR": ("response",), "GCC_TRIP_EN": ("response",)}
 
 
 def _require_directory(path: Path, operation: str) -> None:
@@ -1260,207 +1274,183 @@ def gate_corpus_integrity(records: List[Dict], benchmark_dir: Path) -> GateResul
 
 # ─── Gate 14: Content-Risk Gate (V2.3) ──────────────────────────────────────
 
+def _excerpt(text: str, start: int, end: int) -> str:
+    """Return a deterministic one-line excerpt suitable for reviewer artifacts."""
+    left = max(0, start - 30)
+    right = min(len(text), end + 60)
+    return re.sub(r"\s+", " ", text[left:right]).strip()[:160]
+
+
+def _review_required_findings(records: List[Dict]) -> List[Dict]:
+    """Return response-scoped documented GCC findings without split or ID conditions."""
+    findings: List[Dict] = []
+    for record in records:
+        eid = record.get("example_id", "?")
+        for index, pattern in enumerate(GCC_TRIP_PHRASES):
+            rule_id = GCC_TRIP_RULE_IDS[index]
+            for field in GCC_TRIP_FIELDS[rule_id]:
+                text = str(record.get(field, ""))
+                for match in pattern.finditer(text):
+                    findings.append({
+                        "example_id": eid,
+                        "field": field,
+                        "rule_id": rule_id,
+                        "rule_description": GCC_TRIP_RULE_DESCRIPTIONS[rule_id],
+                        "rule": pattern.pattern,
+                        "excerpt": _excerpt(text, match.start(), match.end()),
+                        "severity": REVIEW_REQUIRED,
+                    })
+    return findings
+
+
 def gate_content_risk(records: List[Dict]) -> GateResult:
+    """Gate 14: scan blocking patterns and documented GCC advisory phrases.
+
+    V2.4.6 fixes Arabic recall by matching the literal documented phrase
+    ``يُنصح بمراجعة`` anywhere in a response. No per-record allowlist, split cap,
+    authority condition, punctuation condition, or response-length condition exists.
     """
-    V2.3 Task 1: Production content-risk gate.
-    Scans the actual corpus using BLOCKING_CONTENT_PATTERNS and GCC_TRIP_PHRASES.
-
-    Severity A — BLOCKED:
-      Any match on BLOCKING_CONTENT_PATTERNS (e.g. '100% guaranteed').
-      Makes the final mechanical verdict NOT_READY.
-      Prevents training authorization.
-
-    Severity B — REVIEW_REQUIRED:
-      Any match on GCC_TRIP_PHRASES (culturally sensitive phrases).
-      Adds record to human-review attention list.
-      Prevents training/release authorization.
-      Does not silently disappear behind an overall PASS.
-
-    Each finding records: example_id, field, rule, safe excerpt.
-    """
-    blocked_findings = []
-    review_required_findings = []
-
-    for r in records:
-        eid = r.get("example_id", "?")
+    blocked_findings: List[Dict] = []
+    for record in records:
+        eid = record.get("example_id", "?")
         for field in ("prompt", "response"):
-            text = r.get(field, "")
-
-            # Severity A: BLOCKED
-            for pat, rule_name in BLOCKING_CONTENT_PATTERNS:
-                m = pat.search(text)
-                if m:
-                    start = max(0, m.start() - 30)
-                    end = min(len(text), m.end() + 30)
-                    excerpt = text[start:end].replace("\n", " ")
+            text = str(record.get(field, ""))
+            for pattern, rule_name in BLOCKING_CONTENT_PATTERNS:
+                match = pattern.search(text)
+                if match:
                     blocked_findings.append({
                         "example_id": eid,
                         "field": field,
-                        "rule": rule_name,
-                        "excerpt": excerpt[:120],
-                        "severity": "BLOCKED",
+                        "rule_id": rule_name,
+                        "rule_description": rule_name,
+                        "rule": pattern.pattern,
+                        "excerpt": _excerpt(text, match.start(), match.end()),
+                        "severity": BLOCKED,
                     })
-
-            # Severity B: REVIEW_REQUIRED
-            for pat in GCC_TRIP_PHRASES:
-                m = pat.search(text)
-                if m:
-                    start = max(0, m.start() - 30)
-                    end = min(len(text), m.end() + 30)
-                    excerpt = text[start:end].replace("\n", " ")
-                    review_required_findings.append({
-                        "example_id": eid,
-                        "field": field,
-                        "rule": repr(pat.pattern),
-                        "excerpt": excerpt[:120],
-                        "severity": "REVIEW_REQUIRED",
-                    })
-
+    review_required_findings = _review_required_findings(records)
     all_findings = blocked_findings + review_required_findings
-
+    review_required_records = sorted({f["example_id"] for f in review_required_findings})
+    metadata = {
+        "blocked_count": len(blocked_findings),
+        "review_required_count": len(review_required_findings),
+        "blocked_records": sorted({f["example_id"] for f in blocked_findings}),
+        "review_required_records": review_required_records,
+        "findings": all_findings,
+        "rule_counts": {
+            "GCC_TRIP_AR": sum(1 for f in review_required_findings if f["rule_id"] == "GCC_TRIP_AR"),
+            "GCC_TRIP_EN": sum(1 for f in review_required_findings if f["rule_id"] == "GCC_TRIP_EN"),
+        },
+    }
     if blocked_findings:
         return GateResult(
             14, "Content-Risk", BLOCKED,
-            f"{len(blocked_findings)} BLOCKED finding(s) and "
-            f"{len(review_required_findings)} REVIEW_REQUIRED finding(s). "
-            f"Blocked records must not be used for training.",
-            errors=[
-                f"BLOCKED | {f['example_id']} [{f['field']}] | {f['rule']} | {repr(f['excerpt'])}"
-                for f in blocked_findings
-            ],
-            warnings=[
-                f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule'][:40]} | {repr(f['excerpt'])}"
-                for f in review_required_findings
-            ],
-            metadata={
-                "blocked_count": len(blocked_findings),
-                "review_required_count": len(review_required_findings),
-                "blocked_records": [f["example_id"] for f in blocked_findings],
-                "review_required_records": list({f["example_id"] for f in review_required_findings}),
-            },
+            f"{len(blocked_findings)} BLOCKED finding(s) and {len(review_required_findings)} REVIEW_REQUIRED finding(s).",
+            errors=[f"BLOCKED | {f['example_id']} [{f['field']}] | {f['rule_id']}" for f in blocked_findings],
+            warnings=[f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule_id']}" for f in review_required_findings],
+            metadata=metadata,
         )
-
     if review_required_findings:
         return GateResult(
             14, "Content-Risk", REVIEW_REQUIRED,
             f"0 BLOCKED, {len(review_required_findings)} REVIEW_REQUIRED finding(s). "
-            f"Records must appear in human-review queue before training/release authorization.",
-            warnings=[
-                f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule'][:40]} | {repr(f['excerpt'])}"
-                for f in review_required_findings
-            ],
-            metadata={
-                "blocked_count": 0,
-                "review_required_count": len(review_required_findings),
-                "review_required_records": list({f["example_id"] for f in review_required_findings}),
-                "findings": review_required_findings,
-            },
+            "Literal response-scoped GCC rules require human review.",
+            warnings=[f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule_id']}" for f in review_required_findings],
+            metadata=metadata,
         )
-
-    return GateResult(
-        14, "Content-Risk", PASS,
-        "No BLOCKED or REVIEW_REQUIRED content found in corpus.",
-        metadata={"blocked_count": 0, "review_required_count": 0},
-    )
+    return GateResult(14, "Content-Risk", PASS, "No BLOCKED or REVIEW_REQUIRED content found in corpus.", metadata=metadata)
 
 
-# ─── Gate 15: Review-queue coverage (V2.3 Task 4) ─────────────────────────────
+def _load_frozen_base_queue(data_dir: Path) -> tuple[list[Dict], set[str], list[str]]:
+    """Load the immutable 50-record base queue and detect malformed/duplicate IDs."""
+    queue_path = data_dir / "human_review_queue.jsonl"
+    errors: list[str] = []
+    rows: list[Dict] = []
+    ids: set[str] = set()
+    if not queue_path.exists():
+        return rows, ids, [f"Queue file not found: {queue_path}"]
+    try:
+        with queue_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                eid = row.get("example_id", "")
+                if not eid or eid in ids:
+                    errors.append(f"Frozen base queue duplicate or missing example_id at line {line_number}: {eid!r}")
+                ids.add(eid)
+                rows.append(row)
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"Cannot load frozen base queue: {type(exc).__name__}")
+    if len(rows) != 50 or len(ids) != 50:
+        errors.append(f"Frozen base queue must contain exactly 50 unique records; found rows={len(rows)}, ids={len(ids)}")
+    return rows, ids, errors
 
+
+def derive_effective_review_set(records: List[Dict], data_dir: Path, content_risk_gate: GateResult) -> tuple[list[Dict], Dict]:
+    """Derive base queue plus every uncovered Gate 14 finding without mutating frozen data."""
+    base_rows, base_ids, errors = _load_frozen_base_queue(data_dir)
+    required_ids = set(content_risk_gate.metadata.get("review_required_records", []))
+    corpus_by_id = {str(row.get("example_id", "")): row for row in records}
+    supplemental_ids = sorted(required_ids - base_ids)
+    missing_corpus = sorted(eid for eid in supplemental_ids if eid not in corpus_by_id)
+    if missing_corpus:
+        errors.append(f"Mandatory supplement IDs are absent from corpus: {missing_corpus}")
+    effective_rows = list(base_rows) + [corpus_by_id[eid] for eid in supplemental_ids if eid in corpus_by_id]
+    effective_ids = [row.get("example_id", "") for row in effective_rows]
+    if len(effective_ids) != len(set(effective_ids)):
+        errors.append("Effective review set contains duplicate IDs")
+    unexpected = sorted(set(effective_ids) - (base_ids | required_ids))
+    if unexpected:
+        errors.append(f"Effective review set contains unjustified supplemental IDs: {unexpected}")
+    policy = {
+        "frozen_base_queue_count": len(base_rows),
+        "mandatory_risk_supplement_count": len(supplemental_ids),
+        "effective_review_set_count": len(effective_rows),
+        "review_required_count": len(required_ids),
+        "none_count": len(effective_rows) - len(required_ids),
+        "clear_count": 0,
+        "supplemental_ids": supplemental_ids,
+        "review_required_ids": sorted(required_ids),
+        "selection_rule": "FROZEN_BASE_QUEUE UNION ALL_GATE_14_FINDINGS_NOT_ALREADY_IN_BASE_QUEUE",
+        "errors": errors,
+    }
+    return effective_rows, policy
+
+# ─── Gate 15: Effective review-set coverage (V2.4.6) ─────────────────────────
 def gate_review_queue_coverage(
     records: List[Dict],
     data_dir: Path,
     content_risk_gate: GateResult,
+    effective_ids_override: Optional[List[str]] = None,
 ) -> GateResult:
+    """Validate frozen base queue plus deterministic mandatory risk supplements.
+
+    The frozen queue is always 50 records. The effective review set is the base
+    queue union every Gate 14 finding absent from that frozen queue. An override
+    is test-only evidence for detecting missing, duplicate, or unjustified rows.
     """
-    V2.3 Task 4: For every REVIEW_REQUIRED corpus record, verify it appears
-    in the authoritative human-review queue JSONL.
-    Returns exit-code 2 (MECHANICALLY_BLOCKED) if any required-review record
-    is absent from the queue.
-    Human judgment fields must remain empty.
-    """
-    # Identify REVIEW_REQUIRED records from Gate 14
-    review_required_ids: set = set()
-    if content_risk_gate.metadata:
-        review_required_ids = set(
-            content_risk_gate.metadata.get("review_required_records", [])
-        )
-
-    if not review_required_ids:
-        return GateResult(
-            15, "Review-Queue Coverage", PASS,
-            "No REVIEW_REQUIRED records to verify.",
-        )
-
-    # Load the authoritative queue JSONL from the data directory
-    queue_path = data_dir / "human_review_queue.jsonl"
-    if not queue_path.exists():
-        return GateResult(
-            15, "Review-Queue Coverage", BLOCKED,
-            "human_review_queue.jsonl not found — cannot verify coverage.",
-            errors=[f"Queue file not found: {queue_path}"],
-        )
-
-    queue_ids: set = set()
-    illegal_approvals = []
-    with queue_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                qr = json.loads(line)
-                queue_ids.add(qr.get("example_id", ""))
-                # Check no human judgment fields are populated
-                for jf in REVIEWER_JUDGMENT_FIELDS:
-                    val = qr.get(jf, "")
-                    if val and str(val).strip():
-                        illegal_approvals.append(
-                            f"{qr.get('example_id', '?')}: reviewer field '{jf}' is populated"
-                        )
-            except json.JSONDecodeError:
-                pass
-
-    missing = sorted(review_required_ids - queue_ids)
-    errors = []
-    warnings = []
-
+    effective_rows, policy = derive_effective_review_set(records, data_dir, content_risk_gate)
+    errors = list(policy.pop("errors"))
+    expected_ids = [row.get("example_id", "") for row in effective_rows]
+    actual_ids = list(effective_ids_override) if effective_ids_override is not None else expected_ids
+    if len(actual_ids) != len(set(actual_ids)):
+        errors.append("Effective review set contains duplicate IDs")
+    missing = sorted(set(expected_ids) - set(actual_ids))
+    unexpected = sorted(set(actual_ids) - set(expected_ids))
     if missing:
-        errors.append(
-            f"{len(missing)} REVIEW_REQUIRED record(s) absent from human-review queue: {missing}"
-        )
-
-    if illegal_approvals:
-        errors.append(
-            f"{len(illegal_approvals)} reviewer judgment field(s) illegally populated by software"
-        )
-        errors.extend(illegal_approvals[:5])
-
+        errors.append(f"Effective review set missing required IDs: {missing}")
+    if unexpected:
+        errors.append(f"Effective review set contains unexpected supplemental IDs: {unexpected}")
     if errors:
-        return GateResult(
-            15, "Review-Queue Coverage", BLOCKED,
-            f"Review-queue coverage failed: {len(errors)} error(s). Exit code 2 required.",
-            errors=errors,
-            warnings=warnings,
-            metadata={
-                "review_required_ids": sorted(review_required_ids),
-                "queue_ids_found": sorted(queue_ids & review_required_ids),
-                "missing_from_queue": missing,
-            },
-        )
+        return GateResult(15, "Review-Queue Coverage", BLOCKED,
+                          f"Effective review-set coverage failed: {len(errors)} error(s).",
+                          errors=errors, metadata=policy | {"expected_effective_ids": expected_ids, "actual_effective_ids": actual_ids})
+    return GateResult(15, "Review-Queue Coverage", PASS,
+                      f"Frozen base queue {policy['frozen_base_queue_count']} + mandatory risk supplement "
+                      f"{policy['mandatory_risk_supplement_count']} = effective review set "
+                      f"{policy['effective_review_set_count']}.", metadata=policy | {"expected_effective_ids": expected_ids})
 
-    return GateResult(
-        15, "Review-Queue Coverage", PASS,
-        f"All {len(review_required_ids)} REVIEW_REQUIRED record(s) present in queue. "
-        f"No reviewer judgment fields populated.",
-        warnings=warnings,
-        metadata={
-            "review_required_ids": sorted(review_required_ids),
-            "queue_coverage": "COMPLETE",
-        },
-    )
-
-
-# ─── Gate 16: Review-Package Identity and Coverage (V2.4) ───────────────────────
+# ─── Gate 16:# ─── Gate 16: Review-Package Identity and Coverage (V2.4) ───────────────────────
 
 def gate_review_package_identity(
     records: List[Dict],
@@ -1532,13 +1522,23 @@ def gate_review_package_identity(
     queue_rows = _read_jsonl_by_id(data_dir / 'human_review_queue.jsonl', 'human_review_queue.jsonl', errors)
     package_rows = _read_jsonl_by_id(docs_dir / 'REVIEWER_PACKAGE.jsonl', 'REVIEWER_PACKAGE.jsonl', errors)
     csv_rows = _read_csv_by_id(docs_dir / 'REVIEWER_TEMPLATE.csv', errors)
-    queue_ids = set(queue_rows)
-
+    effective_rows, effective_policy = derive_effective_review_set(records, data_dir, content_risk_gate)
+    policy_errors = effective_policy.pop('errors')
+    errors.extend(policy_errors)
+    expected_effective_ids = {row.get('example_id', '') for row in effective_rows}
+    if sidecar.get('frozen_base_queue_count') != effective_policy['frozen_base_queue_count']:
+        errors.append('Sidecar frozen_base_queue_count mismatch')
+    if sidecar.get('mandatory_risk_supplement_count') != effective_policy['mandatory_risk_supplement_count']:
+        errors.append('Sidecar mandatory_risk_supplement_count mismatch')
+    if sidecar.get('effective_review_set_count') != effective_policy['effective_review_set_count']:
+        errors.append('Sidecar effective_review_set_count mismatch')
+    if sorted(sidecar.get('supplemental_ids', [])) != effective_policy['supplemental_ids']:
+        errors.append('Sidecar supplemental_ids mismatch')
     for label, rows in (('REVIEWER_PACKAGE.jsonl', package_rows), ('REVIEWER_TEMPLATE.csv', csv_rows)):
-        if set(rows) != queue_ids:
+        if set(rows) != expected_effective_ids:
             errors.append(
-                f'{label} ID set mismatch: missing={sorted(queue_ids - set(rows))[:5]} '
-                f'unexpected={sorted(set(rows) - queue_ids)[:5]}'
+                f'{label} ID set mismatch: missing={sorted(expected_effective_ids - set(rows))[:5]} '
+                f'unexpected={sorted(set(rows) - expected_effective_ids)[:5]}'
             )
         for eid, row in rows.items():
             commit = row.get('package_commit')
@@ -1559,7 +1559,7 @@ def gate_review_package_identity(
     elif matches[0].lower() != source_commit:
         errors.append('Markdown package_commit mismatch')
     markdown_ids = _markdown_all_queue_ids(markdown)
-    if len(markdown_ids) != len(set(markdown_ids)) or set(markdown_ids) != queue_ids:
+    if len(markdown_ids) != len(set(markdown_ids)) or set(markdown_ids) != expected_effective_ids:
         errors.append('Markdown queue-ID set is missing, duplicated, or unexpected')
 
     # Validate risk-state and reason identity across sidecar, JSONL, CSV, and Markdown.
@@ -1587,7 +1587,7 @@ def gate_review_package_identity(
         if eid not in markdown or finding.get('matched_rule_id', '') not in markdown or finding.get('safe_excerpt', '')[:30] not in markdown:
             errors.append(f'Markdown missing risk disclosure for {eid}')
 
-    for eid in queue_ids - review_required_ids:
+    for eid in expected_effective_ids - review_required_ids:
         for label, rows in (('REVIEWER_PACKAGE.jsonl', package_rows), ('REVIEWER_TEMPLATE.csv', csv_rows)):
             row = rows.get(eid, {})
             if row.get('content_risk_status') != 'NONE':
@@ -1611,7 +1611,7 @@ def gate_review_package_identity(
             errors=errors[:20], warnings=warnings,
             metadata={'artifact_release_commit': release_commit,
                       'artifact_source_commit': source_commit,
-                      'review_required_ids': sorted(review_required_ids)},
+                      'review_required_ids': sorted(review_required_ids), **effective_policy},
         )
     return GateResult(
         16, 'Review-Package Identity', PASS,
@@ -1622,7 +1622,7 @@ def gate_review_package_identity(
         metadata={'artifact_release_commit': release_commit,
                   'artifact_source_commit': source_commit,
                   'sidecar_package_commit': sidecar_commit,
-                  'review_required_ids': sorted(review_required_ids)},
+                  'review_required_ids': sorted(review_required_ids), **effective_policy},
     )
 
 

@@ -26,9 +26,9 @@ sys.path.insert(0, str(TRAINING_DIR))
 import readiness_gate as rg
 
 EXPECTED_FLAGGED = {
-    "seed4b-train-0032",
-    "seed4b-train-0038",
-    "seed4b-valid-0005",
+    "seed4b-eval-0004", "seed4b-train-0015", "seed4b-train-0016",
+    "seed4b-train-0028", "seed4b-train-0032", "seed4b-train-0038",
+    "seed4b-train-0039", "seed4b-valid-0005", "seed4b-valid-0014",
 }
 HUMAN_FIELDS = rg.REVIEWER_JUDGMENT_FIELDS
 
@@ -184,8 +184,8 @@ class TestV241PackageIdentity:
     def test_exact_status_counts_and_no_clear_alias(self) -> None:
         package = load_jsonl(DOCS_DIR / "REVIEWER_PACKAGE.jsonl")
         statuses = [r["content_risk_status"] for r in package]
-        assert statuses.count("REVIEW_REQUIRED") == 3
-        assert statuses.count("NONE") == 47
+        assert statuses.count("REVIEW_REQUIRED") == 9
+        assert statuses.count("NONE") == 44
         assert "CLEAR" not in statuses
         assert {r["example_id"] for r in package if r["content_risk_status"] == "REVIEW_REQUIRED"} == EXPECTED_FLAGGED
 
@@ -196,7 +196,7 @@ class TestV241PackageIdentity:
         md = (DOCS_DIR / "ARABIC_HUMAN_REVIEW_QUEUE.md").read_text(encoding="utf-8")
         package_ids = {r["example_id"] for r in package}
         csv_ids = {r["example_id"] for r in csv_rows}
-        assert len(package_ids) == len(csv_ids) == 50
+        assert len(package_ids) == len(csv_ids) == 53
         assert package_ids == csv_ids
         assert f"> Package source commit: `{source_commit()}`" in md
         assert {r["package_commit"] for r in package} == {source_commit()}

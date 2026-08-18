@@ -47,6 +47,7 @@ from readiness_gate import (
     BLOCKED,
     GCC_TRIP_PHRASES,
     BLOCKING_CONTENT_PATTERNS,
+    derive_effective_review_set,
     REVIEWER_JUDGMENT_FIELDS,
     is_valid_git_commit,
     resolve_git_commit,
@@ -199,106 +200,58 @@ def compute_content_risk_fields(
 
 def generate_sidecar(
     corpus_records: List[Dict],
+    base_queue_records: List[Dict],
     package_commit: str,
     output_path: Path,
-) -> Dict[str, List[Dict]]:
-    """
-    Run Gate 14 on the corpus, build the REVIEW_RISK_FINDINGS.json sidecar,
-    and return a dict mapping example_id → list of findings.
-    """
+) -> tuple[Dict[str, List[Dict]], Dict]:
+    """Build sidecar from production Gate 14 and the deterministic effective review-set policy."""
     gate14 = gate_content_risk(corpus_records)
-
-    findings_list = []
-    findings_by_id: Dict[str, List[Dict]] = {}
-
-    # Process all findings from Gate 14 metadata
     raw_findings = gate14.metadata.get("findings", [])
-
-    # Also collect BLOCKED findings from errors
-    for r in corpus_records:
-        eid = r.get("example_id", "")
-        for field in ("prompt", "response"):
-            text = r.get(field, "")
-
-            # BLOCKED patterns
-            for pat, rule_name in BLOCKING_CONTENT_PATTERNS:
-                m = pat.search(text)
-                if m:
-                    start = max(0, m.start() - 30)
-                    end = min(len(text), m.end() + 30)
-                    excerpt = text[start:end].replace("\n", " ")
-                    rule_id = build_rule_id(pat.pattern, False)
-                    finding = {
-                        "record_id": eid,
-                        "severity": "BLOCKED",
-                        "status": "BLOCKED",
-                        "source_gate": "gate_14_content_risk",
-                        "matched_rule_id": rule_id,
-                        "matched_rule_description": build_rule_description(rule_id),
-                        "matched_field": field,
-                        "safe_excerpt": excerpt[:120],
-                        "reviewer_instruction": (
-                            "This record contains objectively prohibited content. "
-                            "It must NOT be used for training, validation, or evaluation. "
-                            "Mark as REJECT."
-                        ),
-                        # Internal fields for cross-representation identity
-                        "rule_id": rule_id,
-                        "rule_description": build_rule_description(rule_id),
-                        "field": field,
-                        "excerpt": excerpt[:120],
-                    }
-                    findings_list.append(finding)
-                    findings_by_id.setdefault(eid, []).append(finding)
-
-            # REVIEW_REQUIRED patterns (GCC trip phrases)
-            for i, pat in enumerate(GCC_TRIP_PHRASES):
-                m = pat.search(text)
-                if m:
-                    start = max(0, m.start() - 30)
-                    end = min(len(text), m.end() + 30)
-                    excerpt = text[start:end].replace("\n", " ")
-                    is_arabic = i == 0  # Pattern 0 is Arabic
-                    rule_id = build_rule_id(pat.pattern, is_arabic)
-                    finding = {
-                        "record_id": eid,
-                        "severity": "REVIEW_REQUIRED",
-                        "status": "REVIEW_REQUIRED",
-                        "source_gate": "gate_14_content_risk",
-                        "matched_rule_id": rule_id,
-                        "matched_rule_description": build_rule_description(rule_id),
-                        "matched_field": field,
-                        "safe_excerpt": excerpt[:120],
-                        "reviewer_instruction": (
-                            "This record contains a GCC regulatory advisory phrase. "
-                            "Please verify that the advice is accurate, current, and appropriate "
-                            "for the target audience. Mark ACCEPT if correct, REVISE if wording "
-                            "needs adjustment, or REJECT if the advice is misleading."
-                        ),
-                        # Internal fields for cross-representation identity
-                        "rule_id": rule_id,
-                        "rule_description": build_rule_description(rule_id),
-                        "field": field,
-                        "excerpt": excerpt[:120],
-                    }
-                    findings_list.append(finding)
-                    findings_by_id.setdefault(eid, []).append(finding)
-
-    # Deduplicate by (record_id, rule_id, field)
-    seen = set()
-    deduped = []
-    for f in findings_list:
-        key = (f["record_id"], f["matched_rule_id"], f["matched_field"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(f)
-    findings_list = deduped
-    # Rebuild findings_by_id from deduped
-    findings_by_id = {}
-    for f in findings_list:
-        findings_by_id.setdefault(f["record_id"], []).append(f)
-
-    # Build sidecar document
+    findings_by_id: Dict[str, List[Dict]] = {}
+    findings_list: List[Dict] = []
+    for raw in raw_findings:
+        eid = raw.get("example_id", "")
+        rule_id = raw.get("rule_id", "")
+        finding = {
+            "record_id": eid,
+            "severity": raw.get("severity", ""),
+            "status": raw.get("severity", ""),
+            "source_gate": "gate_14_content_risk",
+            "matched_rule_id": rule_id,
+            "matched_rule_description": raw.get("rule_description", build_rule_description(rule_id)),
+            "matched_field": raw.get("field", ""),
+            "safe_excerpt": raw.get("excerpt", ""),
+            "reviewer_instruction": (
+                "This record contains a GCC regulatory advisory phrase. Please verify that the advice is "
+                "accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, "
+                "REVISE if wording needs adjustment, or REJECT if the advice is misleading."
+            ),
+            "rule_id": rule_id,
+            "rule_description": raw.get("rule_description", build_rule_description(rule_id)),
+            "field": raw.get("field", ""),
+            "excerpt": raw.get("excerpt", ""),
+        }
+        findings_list.append(finding)
+        findings_by_id.setdefault(eid, []).append(finding)
+    base_ids = {r.get("example_id", "") for r in base_queue_records}
+    required_ids = set(findings_by_id)
+    supplemental_ids = sorted(required_ids - base_ids)
+    corpus_by_id = {r.get("example_id", ""): r for r in corpus_records}
+    missing = sorted(eid for eid in supplemental_ids if eid not in corpus_by_id)
+    if missing:
+        raise ValueError(f"Mandatory supplements missing from corpus: {missing}")
+    effective_records = list(base_queue_records) + [corpus_by_id[eid] for eid in supplemental_ids]
+    policy = {
+        "frozen_base_queue_count": len(base_queue_records),
+        "mandatory_risk_supplement_count": len(supplemental_ids),
+        "effective_review_set_count": len(effective_records),
+        "review_required_count": len(required_ids),
+        "none_count": len(effective_records) - len(required_ids),
+        "clear_count": 0,
+        "supplemental_ids": supplemental_ids,
+        "review_required_ids": sorted(required_ids),
+        "selection_rule": "FROZEN_BASE_QUEUE UNION ALL_GATE_14_FINDINGS_NOT_ALREADY_IN_BASE_QUEUE",
+    }
     sidecar = {
         "schema_version": SIDECAR_SCHEMA_VERSION,
         "package_commit": package_commit,
@@ -306,37 +259,21 @@ def generate_sidecar(
         "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "total_findings": len(findings_list),
         "blocked_count": sum(1 for f in findings_list if f["severity"] == "BLOCKED"),
-        "review_required_count": sum(
-            1 for f in findings_list if f["severity"] == "REVIEW_REQUIRED"
-        ),
+        **policy,
         "findings": [
-            {
-                "schema_version": SIDECAR_SCHEMA_VERSION,
-                "package_commit": package_commit,
-                "corpus_sha256": EXPECTED_CORPUS_SHA256,
-                "record_id": f["record_id"],
-                "severity": f["severity"],
-                "status": f["status"],
-                "source_gate": f["source_gate"],
-                "matched_rule_id": f["matched_rule_id"],
-                "matched_rule_description": f["matched_rule_description"],
-                "matched_field": f["matched_field"],
-                "safe_excerpt": f["safe_excerpt"],
-                "reviewer_instruction": f["reviewer_instruction"],
-                "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            }
+            {k: v for k, v in f.items() if k not in {"rule_id", "rule_description", "field", "excerpt"}}
+            | {"schema_version": SIDECAR_SCHEMA_VERSION, "package_commit": package_commit,
+               "corpus_sha256": EXPECTED_CORPUS_SHA256,
+               "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()}
             for f in findings_list
         ],
     }
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as fh:
         json.dump(sidecar, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
-
     print(f"Sidecar written: {output_path} ({len(findings_list)} findings)")
-    return findings_by_id
-
+    return findings_by_id, policy, effective_records
 
 def generate_reviewer_package(
     queue_records: List[Dict],
@@ -404,6 +341,7 @@ def generate_markdown(
     findings_by_id: Dict[str, List[Dict]],
     package_commit: str,
     output_path: Path,
+    policy: Optional[Dict] = None,
 ) -> None:
     """Generate ARABIC_HUMAN_REVIEW_QUEUE.md — Markdown index with content-risk disclosure."""
     flagged_ids = set(findings_by_id.keys())
@@ -424,7 +362,9 @@ def generate_markdown(
         f"| :--- | :--- |",
         f"| Total records | {len(queue_records)} |",
         f"| Flagged (REVIEW_REQUIRED) | {len(flagged_ids)} |",
-        f"| Clear | {len(queue_records) - len(flagged_ids)} |",
+        f"| Not flagged (NONE) | {len(queue_records) - len(flagged_ids)} |",
+        f"| Frozen base queue | {(policy or {}).get('frozen_base_queue_count', len(queue_records))} |",
+        f"| Mandatory risk supplement | {(policy or {}).get('mandatory_risk_supplement_count', 0)} |",
         "",
         "## Flagged Records — Require Reviewer Attention",
         "",
@@ -525,24 +465,25 @@ def main() -> None:
 
     # Generate sidecar
     sidecar_path = args.docs_dir / "REVIEW_RISK_FINDINGS.json"
-    findings_by_id = generate_sidecar(corpus_records, package_commit, sidecar_path)
+    findings_by_id, policy, effective_records = generate_sidecar(corpus_records, queue_records, package_commit, sidecar_path)
 
     # Generate reviewer-facing representations
     generate_reviewer_package(
-        queue_records, findings_by_id, package_commit,
+        effective_records, findings_by_id, package_commit,
         args.docs_dir / "REVIEWER_PACKAGE.jsonl"
     )
     generate_reviewer_csv(
-        queue_records, findings_by_id, package_commit,
+        effective_records, findings_by_id, package_commit,
         args.docs_dir / "REVIEWER_TEMPLATE.csv"
     )
     generate_markdown(
-        queue_records, findings_by_id, package_commit,
-        args.docs_dir / "ARABIC_HUMAN_REVIEW_QUEUE.md"
+        effective_records, findings_by_id, package_commit,
+        args.docs_dir / "ARABIC_HUMAN_REVIEW_QUEUE.md", policy
     )
 
     print("\nReview package generation complete.")
     print(f"Flagged records: {sorted(findings_by_id.keys())}")
+    print(f"Effective review set: {policy['frozen_base_queue_count']} base + {policy['mandatory_risk_supplement_count']} supplement = {policy['effective_review_set_count']}")
 
 
 if __name__ == "__main__":

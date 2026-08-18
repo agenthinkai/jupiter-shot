@@ -144,8 +144,8 @@ class TestGCCArabicPattern:
         )
 
     def test_repr_is_correct(self) -> None:
-        """Pattern repr must match the corrected form (no $ anchor)."""
-        expected = "يُنصح بمراجعة[^\\.]{0,50}\\."
+        """Pattern repr must match the literal phrase with deterministic flexible whitespace."""
+        expected = r"يُنصح\s+بمراجعة"
         assert self.PAT.pattern == expected, (
             f"Pattern mismatch. Expected: {repr(expected)} Got: {repr(self.PAT.pattern)}"
         )
@@ -168,11 +168,11 @@ class TestGCCArabicPattern:
             f"Must match Arabic phrase followed by additional text. Text: {repr(text)}"
         )
 
-    def test_does_not_match_arabic_phrase_followed_by_exclamation(self) -> None:
-        """Pattern ends with \\. so it requires a period — ! should not match."""
+    def test_matches_arabic_phrase_followed_by_exclamation(self) -> None:
+        """Literal phrase detection has no punctuation requirement."""
         text = "يُنصح بمراجعة الجهات المختصة!"
-        assert not self.PAT.search(text), (
-            f"Must NOT match Arabic phrase followed by '!' (no period). Text: {repr(text)}"
+        assert self.PAT.search(text), (
+            f"Must match Arabic phrase regardless of following punctuation. Text: {repr(text)}"
         )
 
     def test_does_not_match_unrelated_arabic_control(self) -> None:
@@ -225,7 +225,7 @@ class TestGCCArabicPattern:
         )
 
     def test_new_arabic_pattern_matches_where_old_failed(self) -> None:
-        """New Arabic pattern must match where the old end-anchor pattern failed."""
+        """Literal Arabic pattern must match where historical punctuation-constrained rules failed."""
         text = "هذا النص يحتوي على معلومات مهمة. يُنصح بمراجعة الجهات المختصة. ثم نص إضافي."
         assert self.PAT.search(text), (
             "New Arabic pattern must match mid-text phrase where old $ pattern failed"

@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0",
-  "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+  "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
   "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-  "generated_at_utc": "2026-08-18T11:03:56.951728+00:00",
+  "generated_at_utc": "2026-08-18T12:53:27.221682+00:00",
   "total_findings": 9,
   "blocked_count": 0,
   "frozen_base_queue_count": 50,
@@ -40,9 +40,9 @@
       "safe_excerpt": "ء الشرعي في التقارير السنوية. يُنصح بمراجعة أحدث التعاميم الصادرة عن البنك المركزي للتحقق من المتطلبات",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
       "schema_version": "1.0",
-      "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+      "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-      "generated_at_utc": "2026-08-18T11:03:56.951762+00:00"
+      "generated_at_utc": "2026-08-18T12:53:27.221705+00:00"
     },
     {
       "record_id": "seed4b-train-0016",
@@ -55,9 +55,9 @@
       "safe_excerpt": "والصناديق الإسلامية المدرجة. يُنصح بمراجعة الموقع الرسمي لساما للاطلاع على أحدث اللوائح والتعاميم.",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
       "schema_version": "1.0",
-      "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+      "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-      "generated_at_utc": "2026-08-18T11:03:56.951769+00:00"
+      "generated_at_utc": "2026-08-18T12:53:27.221712+00:00"
     },
     {
       "record_id": "seed4b-train-0028",
@@ -70,9 +70,9 @@
       "safe_excerpt": "لى برنامج مكافحة غسل الأموال. يُنصح بمراجعة أحدث التعاميم الصادرة عن المصرف المركزي للتحقق من المتطلبات",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
       "schema_version": "1.0",
-      "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+      "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-      "generated_at_utc": "2026-08-18T11:03:56.951773+00:00"
+      "generated_at_utc": "2026-08-18T12:53:27.221716+00:00"
     },
     {
       "record_id": "seed4b-train-0032",
@@ -85,9 +85,9 @@
       "safe_excerpt": "ation employment commitments. Specific current requirements should be verified against CITRA's published regulations.",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
       "schema_version": "1.0",
-      "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+      "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-      "generated_at_utc": "2026-08-18T11:03:56.951777+00:00"
+      "generated_at_utc": "2026-08-18T12:53:27.221719+00:00"
     },
     {
       "record_id": "seed4b-train-0038",
@@ -100,9 +100,9 @@
       "safe_excerpt": "وني وحماية بيانات المستهلكين. يُنصح بمراجعة الموقع الرسمي للهيئة للاطلاع على أحدث اللوائح.",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
       "schema_version": "1.0",
-      "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+      "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-      "generated_at_utc": "2026-08-18T11:03:56.951780+00:00"
+      "generated_at_utc": "2026-08-18T12:53:27.221722+00:00"
     },
     {
       "record_id": "seed4b-train-0039",
@@ -115,9 +115,9 @@
       "safe_excerpt": "الات وفق نظام التفضيل المحلي. يُنصح بمراجعة النص الرسمي للقانون والتعاميم الصادرة عن الجهاز للاطلاع على",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
       "schema_version": "1.0",
-      "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+      "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-      "generated_at_utc": "2026-08-18T11:03:56.951783+00:00"
+      "generated_at_utc": "2026-08-18T12:53:27.221726+00:00"
     },
     {
       "record_id": "seed4b-valid-0005",
@@ -130,9 +130,9 @@
       "safe_excerpt": "لا يجوز للمشغّل الاستئثار به. يُنصح بمراجعة المعيار الكامل والهيئة الشرعية للتطبيق الفعلي.",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
       "schema_version": "1.0",
-      "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+      "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-      "generated_at_utc": "2026-08-18T11:03:56.951786+00:00"
+      "generated_at_utc": "2026-08-18T12:53:27.221729+00:00"
     },
     {
       "record_id": "seed4b-valid-0014",
@@ -145,9 +145,9 @@
       "safe_excerpt": "معقدة لإخفاء هويتهم الحقيقية. يُنصح بمراجعة التعاميم الصادرة عن البنك المركزي المختص للاطلاع على المتطل",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
       "schema_version": "1.0",
-      "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+      "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-      "generated_at_utc": "2026-08-18T11:03:56.951789+00:00"
+      "generated_at_utc": "2026-08-18T12:53:27.221732+00:00"
     },
     {
       "record_id": "seed4b-eval-0004",
@@ -160,9 +160,9 @@
       "safe_excerpt": "هيكل الملكية والقطاع والنشاط. يُنصح بمراجعة الموقع الرسمي لوزارة التجارة والصناعة للاطلاع على الإجراءات",
       "reviewer_instruction": "This record contains a GCC regulatory advisory phrase. Please verify that the advice is accurate, current, and appropriate for the target audience. Mark ACCEPT if correct, REVISE if wording needs adjustment, or REJECT if the advice is misleading.",
       "schema_version": "1.0",
-      "package_commit": "50c20dd505e476c144ab433d05dc6d9a0d4c4bc6",
+      "package_commit": "d0eeceaeaa9e32d157ffd459044590b5fcda39a8",
       "corpus_sha256": "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0",
-      "generated_at_utc": "2026-08-18T11:03:56.951798+00:00"
+      "generated_at_utc": "2026-08-18T12:53:27.221737+00:00"
     }
   ]
 }

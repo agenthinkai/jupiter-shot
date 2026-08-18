@@ -46,49 +46,49 @@ def load_queue() -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Markdown and JSONL contain exactly the same 50 records
+# Test 1: Markdown and generated reviewer JSONL contain exactly the same 53 effective records
 # ---------------------------------------------------------------------------
 
-def test_markdown_and_jsonl_same_50_records() -> None:
+def test_markdown_and_jsonl_same_53_effective_records() -> None:
     queue = load_queue()
+    pkg_path = DOCS_DIR / "REVIEWER_PACKAGE.jsonl"
     md_path = DOCS_DIR / "ARABIC_HUMAN_REVIEW_QUEUE.md"
+    assert pkg_path.exists(), "REVIEWER_PACKAGE.jsonl not found"
     assert md_path.exists(), "ARABIC_HUMAN_REVIEW_QUEUE.md not found"
     md_content = md_path.read_text(encoding="utf-8")
-
-    jsonl_ids = {r["example_id"] for r in queue}
-    # Extract IDs from Markdown table rows
+    package_ids = {json.loads(line)["example_id"] for line in pkg_path.read_text(encoding="utf-8").splitlines() if line.strip()}
     md_ids = set(re.findall(r"`(seed4b-[a-z]+-\d{4})`", md_content))
 
-    assert len(queue) == 50, f"JSONL has {len(queue)} records, expected 50"
-    assert len(md_ids) == 50, f"Markdown has {len(md_ids)} IDs, expected 50"
-    assert jsonl_ids == md_ids, (
-        f"JSONL and Markdown IDs differ.\n"
-        f"In JSONL only: {jsonl_ids - md_ids}\n"
-        f"In Markdown only: {md_ids - jsonl_ids}"
+    assert len(queue) == 50, f"Frozen queue has {len(queue)} records, expected 50"
+    assert len(package_ids) == 53, f"Reviewer package has {len(package_ids)} records, expected 53"
+    assert len(md_ids) == 53, f"Markdown has {len(md_ids)} IDs, expected 53"
+    assert package_ids == md_ids, (
+        f"Reviewer JSONL and Markdown IDs differ.\n"
+        f"In JSONL only: {package_ids - md_ids}\n"
+        f"In Markdown only: {md_ids - package_ids}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Generated CSV contains the same 50 records
+# Test 2: Generated CSV contains the same 53 effective records
 # ---------------------------------------------------------------------------
 
-def test_csv_contains_same_50_records() -> None:
-    queue = load_queue()
+def test_csv_contains_same_53_effective_records() -> None:
+    pkg_path = DOCS_DIR / "REVIEWER_PACKAGE.jsonl"
     csv_path = DOCS_DIR / "REVIEWER_TEMPLATE.csv"
+    assert pkg_path.exists(), "REVIEWER_PACKAGE.jsonl not found"
     assert csv_path.exists(), "REVIEWER_TEMPLATE.csv not found"
 
     with csv_path.open("r", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        csv_rows = list(reader)
-
-    jsonl_ids = {r["example_id"] for r in queue}
+        csv_rows = list(csv.DictReader(fh))
+    package_ids = {json.loads(line)["example_id"] for line in pkg_path.read_text(encoding="utf-8").splitlines() if line.strip()}
     csv_ids = {row["example_id"] for row in csv_rows}
 
-    assert len(csv_rows) == 50, f"CSV has {len(csv_rows)} rows, expected 50"
-    assert jsonl_ids == csv_ids, (
-        f"JSONL and CSV IDs differ.\n"
-        f"In JSONL only: {jsonl_ids - csv_ids}\n"
-        f"In CSV only: {csv_ids - jsonl_ids}"
+    assert len(csv_rows) == 53, f"CSV has {len(csv_rows)} rows, expected 53"
+    assert package_ids == csv_ids, (
+        f"Reviewer JSONL and CSV IDs differ.\n"
+        f"In JSONL only: {package_ids - csv_ids}\n"
+        f"In CSV only: {csv_ids - package_ids}"
     )
 
 

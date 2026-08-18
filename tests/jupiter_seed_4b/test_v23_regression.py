@@ -58,7 +58,11 @@ DOCS_DIR = REPO_ROOT / "docs" / "jupiter_seed_4b"
 EXPECTED_CORPUS_HASH = "123fbdaf47a1e6befdb8f3c55ac5f9c5df01d2b473bbdec4417e3c3bfce5ccd0"
 EXPECTED_CONTENT_COMMIT = "2e36f6b977a8af052fced5a532c1168dc1988b6f"
 
-THREE_FLAGGED_RECORDS = {"seed4b-train-0032", "seed4b-train-0038", "seed4b-valid-0005"}
+LITERAL_FLAGGED_RECORDS = {
+    "seed4b-eval-0004", "seed4b-train-0015", "seed4b-train-0016",
+    "seed4b-train-0028", "seed4b-train-0032", "seed4b-train-0038",
+    "seed4b-train-0039", "seed4b-valid-0005", "seed4b-valid-0014",
+}
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
@@ -344,27 +348,11 @@ class TestReviewQueueCoverage:
 
     def test_present_review_required_record_passes_coverage(self) -> None:
         """If all REVIEW_REQUIRED records are in the queue, gate_review_queue_coverage passes."""
-        fake_content_risk = GateResult(
-            14, "Content-Risk", REVIEW_REQUIRED,
-            "1 REVIEW_REQUIRED finding",
-            metadata={
-                "blocked_count": 0,
-                "review_required_count": 1,
-                "review_required_records": ["adv-present-in-queue"],
-            }
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            data_dir = Path(tmpdir) / "data"
-            data_dir.mkdir(parents=True)
-            queue_path = data_dir / "human_review_queue.jsonl"
-            with queue_path.open("w", encoding="utf-8") as fh:
-                fh.write(json.dumps({"example_id": "adv-present-in-queue"}) + "\n")
-
-            result = gate_review_queue_coverage([], data_dir, fake_content_risk)
-
+        records = load_all_records()
+        result = gate_review_queue_coverage(records, DATA_DIR, gate_content_risk(records))
         assert result.status == PASS, (
-            f"Gate 15 must PASS when all REVIEW_REQUIRED records are in queue. "
-            f"Got: {result.status}"
+            f"Gate 15 must PASS when the effective review set contains the frozen base plus all mandatory supplements. "
+            f"Got: {result.status}; errors={result.errors}"
         )
 
 
@@ -549,9 +537,9 @@ class TestThreeFlaggedRecordsDisclosed:
             f"Got: {result.status}"
         )
         disclosed_ids = set(result.metadata.get("review_required_records", []))
-        missing = THREE_FLAGGED_RECORDS - disclosed_ids
+        missing = LITERAL_FLAGGED_RECORDS - disclosed_ids
         assert not missing, (
-            f"gate_content_risk must disclose all three flagged records. "
+            f"gate_content_risk must disclose all literal-rule flagged records. "
             f"Missing: {missing}. Disclosed: {disclosed_ids}"
         )
 

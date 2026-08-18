@@ -76,7 +76,11 @@ from readiness_gate import (
 )
 from training_runner import check_training_authorization, EXPECTED_CORPUS_SHA256, EXPECTED_DATASET_CONTENT_COMMIT, BASE_MODEL_ID
 
-THREE_FLAGGED = {"seed4b-train-0032", "seed4b-train-0038", "seed4b-valid-0005"}
+LITERAL_FLAGGED = {
+    "seed4b-eval-0004", "seed4b-train-0015", "seed4b-train-0016",
+    "seed4b-train-0028", "seed4b-train-0032", "seed4b-train-0038",
+    "seed4b-train-0039", "seed4b-valid-0005", "seed4b-valid-0014",
+}
 
 PYTHON = sys.executable
 GATE_SCRIPT = str(TRAINING_DIR / "readiness_gate.py")
@@ -158,11 +162,11 @@ class TestReviewPackagePropagation:
         assert "corpus_sha256" in s
         assert "findings" in s
 
-    def test_sidecar_has_three_flagged_records(self) -> None:
+    def test_sidecar_has_literal_flagged_records(self) -> None:
         with (DOCS_DIR / "REVIEW_RISK_FINDINGS.json").open("r", encoding="utf-8") as fh:
             s = json.load(fh)
         finding_ids = {f["record_id"] for f in s["findings"]}
-        missing = THREE_FLAGGED - finding_ids
+        missing = LITERAL_FLAGGED - finding_ids
         assert not missing, f"Sidecar missing flagged records: {missing}"
 
     def test_reviewer_package_flagged_records_show_review_required(self) -> None:
@@ -173,9 +177,9 @@ class TestReviewPackagePropagation:
         with pkg_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 r = json.loads(line)
-                if r["example_id"] in THREE_FLAGGED:
+                if r["example_id"] in LITERAL_FLAGGED:
                     found[r["example_id"]] = r
-        for eid in THREE_FLAGGED:
+        for eid in LITERAL_FLAGGED:
             assert eid in found, f"{eid} missing from REVIEWER_PACKAGE.jsonl"
             assert found[eid].get("content_risk_status") == "REVIEW_REQUIRED", (
                 f"{eid}: content_risk_status must be REVIEW_REQUIRED, "
@@ -189,7 +193,7 @@ class TestReviewPackagePropagation:
         with pkg_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 r = json.loads(line)
-                if r["example_id"] in THREE_FLAGGED:
+                if r["example_id"] in LITERAL_FLAGGED:
                     flags = r.get("integrity_flags", "")
                     assert flags != "OK", (
                         f"{r['example_id']}: integrity_flags must not be OK for flagged record. "
@@ -204,7 +208,7 @@ class TestReviewPackagePropagation:
         with pkg_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 r = json.loads(line)
-                if r["example_id"] not in THREE_FLAGGED:
+                if r["example_id"] not in LITERAL_FLAGGED:
                     status = r.get("content_risk_status", "")
                     if status != "NONE":
                         violations.append(f"{r['example_id']}: {status}")

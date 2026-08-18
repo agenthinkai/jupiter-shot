@@ -1346,7 +1346,7 @@ def gate_content_risk(records: List[Dict]) -> GateResult:
             14, "Content-Risk", BLOCKED,
             f"{len(blocked_findings)} BLOCKED finding(s) and {len(review_required_findings)} REVIEW_REQUIRED finding(s).",
             errors=[f"BLOCKED | {f['example_id']} [{f['field']}] | {f['rule_id']}" for f in blocked_findings],
-            warnings=[f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule_id']}" for f in review_required_findings],
+            warnings=[f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule_id']} | {f['rule_description']}" for f in review_required_findings],
             metadata=metadata,
         )
     if review_required_findings:
@@ -1354,7 +1354,7 @@ def gate_content_risk(records: List[Dict]) -> GateResult:
             14, "Content-Risk", REVIEW_REQUIRED,
             f"0 BLOCKED, {len(review_required_findings)} REVIEW_REQUIRED finding(s). "
             "Literal response-scoped GCC rules require human review.",
-            warnings=[f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule_id']}" for f in review_required_findings],
+            warnings=[f"REVIEW_REQUIRED | {f['example_id']} [{f['field']}] | {f['rule_id']} | {f['rule_description']}" for f in review_required_findings],
             metadata=metadata,
         )
     return GateResult(14, "Content-Risk", PASS, "No BLOCKED or REVIEW_REQUIRED content found in corpus.", metadata=metadata)

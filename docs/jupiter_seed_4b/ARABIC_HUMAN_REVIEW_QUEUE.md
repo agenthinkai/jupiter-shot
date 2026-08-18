@@ -4,16 +4,18 @@
 > This document is generated from the frozen corpus and Gate 14 findings.
 > Human reviewers must independently judge every record.
 > Software has not populated any reviewer judgment field.
-> Package source commit: `266aa071e7293e7d0513d716e19b43d5a693ce5c`
+> Package source commit: `7c1b58395617cc7dce36cdc68f4fff145a37fc47`
 > Package identity scheme: `package_commit` identifies the source commit; the artifact release commit is its direct child.
 
 ## Coverage
 
 | Metric | Value |
 | :--- | :--- |
-| Total records | 50 |
-| Flagged (REVIEW_REQUIRED) | 3 |
-| Clear | 47 |
+| Total records | 53 |
+| Flagged (REVIEW_REQUIRED) | 9 |
+| Not flagged (NONE) | 44 |
+| Frozen base queue | 50 |
+| Mandatory risk supplement | 3 |
 
 ## Flagged Records — Require Reviewer Attention
 
@@ -22,9 +24,15 @@ Reviewers must explicitly judge each flagged record.
 
 | Example ID | Field | Rule | Severity | Excerpt |
 | :--- | :--- | :--- | :--- | :--- |
+| `seed4b-eval-0004` | `response` | `GCC_TRIP_AR` | **REVIEW_REQUIRED** | هيكل الملكية والقطاع والنشاط. يُنصح بمراجعة الموقع الرسمي لوزارة التجارة والصناع |
+| `seed4b-train-0015` | `response` | `GCC_TRIP_AR` | **REVIEW_REQUIRED** | ء الشرعي في التقارير السنوية. يُنصح بمراجعة أحدث التعاميم الصادرة عن البنك المرك |
+| `seed4b-train-0016` | `response` | `GCC_TRIP_AR` | **REVIEW_REQUIRED** | والصناديق الإسلامية المدرجة. يُنصح بمراجعة الموقع الرسمي لساما للاطلاع على أحدث  |
+| `seed4b-train-0028` | `response` | `GCC_TRIP_AR` | **REVIEW_REQUIRED** | لى برنامج مكافحة غسل الأموال. يُنصح بمراجعة أحدث التعاميم الصادرة عن المصرف المر |
 | `seed4b-train-0032` | `response` | `GCC_TRIP_EN` | **REVIEW_REQUIRED** | ation employment commitments. Specific current requirements should be verified a |
 | `seed4b-train-0038` | `response` | `GCC_TRIP_AR` | **REVIEW_REQUIRED** | وني وحماية بيانات المستهلكين. يُنصح بمراجعة الموقع الرسمي للهيئة للاطلاع على أحد |
+| `seed4b-train-0039` | `response` | `GCC_TRIP_AR` | **REVIEW_REQUIRED** | الات وفق نظام التفضيل المحلي. يُنصح بمراجعة النص الرسمي للقانون والتعاميم الصادر |
 | `seed4b-valid-0005` | `response` | `GCC_TRIP_AR` | **REVIEW_REQUIRED** | لا يجوز للمشغّل الاستئثار به. يُنصح بمراجعة المعيار الكامل والهيئة الشرعية للتطب |
+| `seed4b-valid-0014` | `response` | `GCC_TRIP_AR` | **REVIEW_REQUIRED** | معقدة لإخفاء هويتهم الحقيقية. يُنصح بمراجعة التعاميم الصادرة عن البنك المركزي ال |
 
 ## All Queue Records
 
@@ -41,7 +49,7 @@ Reviewers must explicitly judge each flagged record.
 | 9 | `seed4b-train-0030` | train | ar | gcc_banking | NONE | no | استخرج المعلومات الرئيسية من ملخص التقرير الائتماني الافتراض… |
 | 10 | `seed4b-train-0001` | train | ar | islamic_finance | NONE | no | ما تعريف عقد المشاركة في التمويل الإسلامي وكيف تُوزَّع الأرب… |
 | 11 | `seed4b-valid-0010` | valid | en | gcc_banking | NONE | no | Explain the Net Stable Funding Ratio (NSFR) under Basel III … |
-| 12 | `seed4b-train-0015` | train | ar | islamic_finance | NONE | no | ما الإطار التنظيمي الذي يحكم البنوك الإسلامية في الكويت وما … |
+| 12 | `seed4b-train-0015` | train | ar | islamic_finance | REVIEW_REQUIRED | **YES** | ما الإطار التنظيمي الذي يحكم البنوك الإسلامية في الكويت وما … |
 | 13 | `seed4b-valid-0005` | valid | ar | islamic_finance | REVIEW_REQUIRED | **YES** | لخّص المبادئ الأساسية للتأمين التكافلي وفق معايير هيئة أيوفي… |
 | 14 | `seed4b-train-0010` | train | ar-en | islamic_finance | NONE | no | Translate 'Takaful' into Arabic and explain the three elemen… |
 | 15 | `seed4b-eval-0016` | eval | ar | arabic_english_correspondence | NONE | no | هل يمكنك ترجمة وثيقتي إلى الإنجليزية دون أن أُرسل لك النص؟… |
@@ -67,10 +75,10 @@ Reviewers must explicitly judge each flagged record.
 | 35 | `seed4b-train-0047` | train | ar | energy_logistics | NONE | no | ما دور مؤسسة البترول الكويتية في قطاع الطاقة الكويتي وما شرك… |
 | 36 | `seed4b-train-0045` | train | en | government_regulation | NONE | no | What is the exact penalty for a company that violates Kuwait… |
 | 37 | `seed4b-eval-0015` | eval | ar-en | arabic_english_correspondence | NONE | no | Translate this formal Arabic board resolution excerpt into p… |
-| 38 | `seed4b-eval-0004` | eval | ar | government_regulation | NONE | no | ما متطلبات تسجيل الشركات الأجنبية في الكويت وفق وزارة التجار… |
+| 38 | `seed4b-eval-0004` | eval | ar | government_regulation | REVIEW_REQUIRED | **YES** | ما متطلبات تسجيل الشركات الأجنبية في الكويت وفق وزارة التجار… |
 | 39 | `seed4b-eval-0007` | eval | en | energy_logistics | NONE | no | What role are GCC sovereign wealth funds playing in energy t… |
 | 40 | `seed4b-train-0036` | train | ar-en | telecommunications | NONE | no | Translate the telecom regulatory term 'Spectrum Auction' int… |
-| 41 | `seed4b-train-0039` | train | ar | government_regulation | NONE | no | ما الإطار التنظيمي الذي يحكم إجراءات المشتريات الحكومية في ا… |
+| 41 | `seed4b-train-0039` | train | ar | government_regulation | REVIEW_REQUIRED | **YES** | ما الإطار التنظيمي الذي يحكم إجراءات المشتريات الحكومية في ا… |
 | 42 | `seed4b-train-0040` | train | en | government_regulation | NONE | no | Summarise the key principles common to GCC data protection f… |
 | 43 | `seed4b-train-0067` | train | ar-en | arabic_english_correspondence | NONE | no | Translate this formal Arabic business phrase into English, p… |
 | 44 | `seed4b-train-0062` | train | ar-en | arabic_english_correspondence | NONE | no | Translate the business phrase 'We look forward to a mutually… |
@@ -80,6 +88,9 @@ Reviewers must explicitly judge each flagged record.
 | 48 | `seed4b-train-0038` | train | ar | telecommunications | REVIEW_REQUIRED | **YES** | ما الإطار التنظيمي الذي يحكم قطاع الاتصالات في الإمارات العر… |
 | 49 | `seed4b-train-0059` | train | ar | executive_decision | NONE | no | شركة استثمارية كويتية افتراضية تدرس الاستحواذ على شركة تقنية… |
 | 50 | `seed4b-eval-0012` | eval | ar-en | executive_decision | NONE | no | Draft a short bilingual (Arabic and English) executive summa… |
+| 51 | `seed4b-train-0016` | train | ar | islamic_finance | REVIEW_REQUIRED | **YES** | ما دور البنك المركزي السعودي ساما في تنظيم التمويل الإسلامي … |
+| 52 | `seed4b-train-0028` | train | ar | gcc_banking | REVIEW_REQUIRED | **YES** | لخّص المتطلبات الرئيسية لمكافحة غسل الأموال المفروضة على الب… |
+| 53 | `seed4b-valid-0014` | valid | ar | gcc_banking | REVIEW_REQUIRED | **YES** | ما المقصود بالملكية الفعلية (Beneficial Ownership) في إطار م… |
 
 ## Reviewer Instructions
 

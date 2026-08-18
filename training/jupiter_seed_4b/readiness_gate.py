@@ -768,44 +768,52 @@ def gate_family_isolation(records: List[Dict]) -> GateResult:
 
 # ─── Gate 9: Review-representation identity ───────────────────────────────
 
-def gate_review_identity(data_dir: Path, docs_dir: Path) -> GateResult:
-    errors = []
-    jsonl_path = data_dir / "human_review_queue.jsonl"
+def gate_review_identity(data_dir: Path, docs_dir: Path, records: List[Dict], content_risk_gate: GateResult) -> GateResult:
+    """Verify all generated reviewer representations equal the derived effective review set."""
+    errors: List[str] = []
+    effective_rows, policy = derive_effective_review_set(records, data_dir, content_risk_gate)
+    errors.extend(policy.pop("errors"))
+    expected_ids = {row.get("example_id", "") for row in effective_rows}
+    package_path = docs_dir / "REVIEWER_PACKAGE.jsonl"
     md_path = docs_dir / "ARABIC_HUMAN_REVIEW_QUEUE.md"
     csv_path = docs_dir / "REVIEWER_TEMPLATE.csv"
 
-    if not jsonl_path.exists():
-        return GateResult(9, "Review-Representation Identity", FAIL,
-                          "human_review_queue.jsonl not found")
-
-    with jsonl_path.open("r", encoding="utf-8") as fh:
-        queue = [json.loads(l) for l in fh if l.strip()]
-    jsonl_ids = {r["example_id"] for r in queue}
+    if package_path.exists():
+        with package_path.open("r", encoding="utf-8") as fh:
+            package_rows = [json.loads(line) for line in fh if line.strip()]
+        package_ids = {row.get("example_id", "") for row in package_rows}
+        if package_ids != expected_ids or len(package_ids) != len(package_rows):
+            errors.append(
+                f"REVIEWER_PACKAGE.jsonl has {len(package_ids)} IDs, expected {len(expected_ids)}. "
+                f"Diff: {package_ids.symmetric_difference(expected_ids)}"
+            )
+    else:
+        package_rows = []
+        errors.append("REVIEWER_PACKAGE.jsonl not found")
 
     if md_path.exists():
         md_content = md_path.read_text(encoding="utf-8")
-        md_ids = set(re.findall(r"`(seed4b-[a-z]+-\d{4})`", md_content))
-        if jsonl_ids != md_ids:
+        markdown_ids = set(_markdown_all_queue_ids(md_content))
+        if markdown_ids != expected_ids:
             errors.append(
-                f"JSONL has {len(jsonl_ids)} IDs, Markdown has {len(md_ids)} IDs. "
-                f"Diff: {jsonl_ids.symmetric_difference(md_ids)}"
+                f"Markdown has {len(markdown_ids)} IDs, expected {len(expected_ids)}. "
+                f"Diff: {markdown_ids.symmetric_difference(expected_ids)}"
             )
     else:
         errors.append("ARABIC_HUMAN_REVIEW_QUEUE.md not found")
 
     if csv_path.exists():
-        with csv_path.open("r", encoding="utf-8-sig") as fh:
-            reader = csv.DictReader(fh)
-            csv_rows = list(reader)
-        csv_ids = {row["example_id"] for row in csv_rows}
-        if jsonl_ids != csv_ids:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
+            csv_rows = list(csv.DictReader(fh))
+        csv_ids = {row.get("example_id", "") for row in csv_rows}
+        if csv_ids != expected_ids or len(csv_ids) != len(csv_rows):
             errors.append(
-                f"JSONL has {len(jsonl_ids)} IDs, CSV has {len(csv_ids)} IDs. "
-                f"Diff: {jsonl_ids.symmetric_difference(csv_ids)}"
+                f"CSV has {len(csv_ids)} IDs, expected {len(expected_ids)}. "
+                f"Diff: {csv_ids.symmetric_difference(expected_ids)}"
             )
         for row in csv_rows:
             for field in REVIEWER_JUDGMENT_FIELDS:
-                if field in row and row[field].strip():
+                if str(row.get(field, "")).strip():
                     errors.append(f"Reviewer field '{field}' is not empty for {row.get('example_id', '?')}")
                     break
     else:
@@ -813,11 +821,10 @@ def gate_review_identity(data_dir: Path, docs_dir: Path) -> GateResult:
 
     if errors:
         return GateResult(9, "Review-Representation Identity", FAIL,
-                          f"{len(errors)} review representation errors",
-                          errors=errors[:10])
+                          f"{len(errors)} review representation errors", errors=errors[:10], metadata=policy)
     return GateResult(9, "Review-Representation Identity", PASS,
-                      f"JSONL, Markdown, and CSV all contain the same {len(jsonl_ids)} IDs. "
-                      "All reviewer judgment fields are empty.")
+                      f"Reviewer JSONL, Markdown, and CSV all contain the same {len(expected_ids)} effective IDs. "
+                      "All reviewer judgment fields are empty.", metadata=policy)
 
 
 # ─── Gate 10: Benchmark manifest integrity ────────────────────────────────
@@ -1884,7 +1891,7 @@ def _main_inner(args: argparse.Namespace) -> None:
         gate_canonical_duplication(records),
         gate_semantic_leakage(records),
         gate_family_isolation(records),
-        gate_review_identity(args.data_dir, args.docs_dir),
+        gate_review_identity(args.data_dir, args.docs_dir, records, gate_content_risk(records)),
         gate_benchmark_manifest(args.benchmark_dir),
         gate_test_suite(args.repo_root),
         gate_human_review(records),

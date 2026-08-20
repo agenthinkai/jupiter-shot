@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -213,23 +214,75 @@ def test_evaluate_returns_mock_on_cpu() -> None:
 # Inference Server Tests
 # ---------------------------------------------------------------------------
 
-def test_inference_server_creates_app() -> None:
+def test_inference_server_creates_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from inference_server import create_app
+
+    original_cwd = Path.cwd()
+    status_before = subprocess.run(
+        ["git", "status", "--short"], cwd=REPO_ROOT,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
+    ).stdout
+    repository_artifacts = REPO_ROOT / "artifacts"
+    assert not repository_artifacts.exists(), "test requires a clean repository artifact path"
+
+    monkeypatch.chdir(tmp_path)
     app = create_app("mock_model_path", backend="transformers")
+    compliance_log = tmp_path / "artifacts" / "compliance_log.jsonl"
     assert app is not None
     assert app.title == "Jupiter Seed 4B Inference Server"
+    assert (tmp_path / "artifacts").is_dir()
+    assert not repository_artifacts.exists()
+    if compliance_log.exists():
+        assert compliance_log.is_file()
+        assert compliance_log.is_relative_to(tmp_path)
+
+    monkeypatch.undo()
+    status_after = subprocess.run(
+        ["git", "status", "--short"], cwd=REPO_ROOT,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
+    ).stdout
+    assert Path.cwd() == original_cwd
+    assert status_after == status_before
+    assert not repository_artifacts.exists()
 
 
-def test_inference_server_health_endpoint() -> None:
+def test_inference_server_health_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from inference_server import create_app
     from fastapi.testclient import TestClient
-    app = create_app("mock_model_path", backend="transformers")
-    client = TestClient(app)
-    response = client.get("/health")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
-    assert "NOT production-ready" in data["disclaimer"]
+
+    original_cwd = Path.cwd()
+    status_before = subprocess.run(
+        ["git", "status", "--short"], cwd=REPO_ROOT,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
+    ).stdout
+    repository_artifacts = REPO_ROOT / "artifacts"
+    assert not repository_artifacts.exists(), "test requires a clean repository artifact path"
+
+    monkeypatch.chdir(tmp_path)
+    try:
+        app = create_app("mock_model_path", backend="transformers")
+        client = TestClient(app)
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert "NOT production-ready" in data["disclaimer"]
+        compliance_log = tmp_path / "artifacts" / "compliance_log.jsonl"
+        assert (tmp_path / "artifacts").is_dir()
+        assert not repository_artifacts.exists()
+        if compliance_log.exists():
+            assert compliance_log.is_file()
+            assert compliance_log.is_relative_to(tmp_path)
+    finally:
+        monkeypatch.undo()
+
+    status_after = subprocess.run(
+        ["git", "status", "--short"], cwd=REPO_ROOT,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
+    ).stdout
+    assert Path.cwd() == original_cwd
+    assert status_after == status_before
+    assert not repository_artifacts.exists()
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+import test_v244_windows_acl_and_cache as v244
+
 from test_v242_execution_isolation import (
     EXIT_EXECUTION_ERROR,
     _can_read,
@@ -26,6 +28,7 @@ from test_v242_execution_isolation import (
 
 
 V242_PATH = Path(inspect.getsourcefile(run_cli)).resolve()
+V244_PATH = V242_PATH.with_name("test_v244_windows_acl_and_cache.py")
 
 
 def _children(root: Path) -> set[str]:
@@ -121,6 +124,50 @@ class TestRunCliOwnedTemporaryDirectory:
         assert "TemporaryDirectory" in source
         assert "with tempfile.TemporaryDirectory" in source
         assert "mkdtemp" not in source
+
+
+class TestLegacyV244RuntimeIsolation:
+    def test_legacy_gate_helper_owns_artifacts_and_preserves_repository_tree(self, tmp_path: Path) -> None:
+        if os.environ.get("JUPITER_GATE11_SUBPROCESS"):
+            pytest.skip("Avoid recursive production Gate 11 invocation inside Gate 11 subprocess")
+        cache = v244.REPO_ROOT / ".pytest_cache"
+        if cache.exists():
+            pytest.skip("Clean-worktree runtime isolation is verified in an isolated worktree")
+        before = v244._tree_fingerprint(v244.REPO_ROOT)
+        runtime_root = tmp_path / "legacy-gate-runtime"
+        first = v244._run_gate(runtime_root=runtime_root)
+        middle = v244._tree_fingerprint(v244.REPO_ROOT)
+        second = v244._run_gate(runtime_root=runtime_root)
+        after = v244._tree_fingerprint(v244.REPO_ROOT)
+        assert first.returncode == v244.EXIT_HUMAN_REVIEW_REQUIRED, first.stderr[-1000:]
+        assert second.returncode == v244.EXIT_HUMAN_REVIEW_REQUIRED, second.stderr[-1000:]
+        assert before == middle == after
+        assert runtime_root.exists() and not list(runtime_root.iterdir())
+        source = inspect.getsource(v244._run_gate)
+        assert "TemporaryDirectory" in source
+        assert '"--artifact-dir"' in source
+        assert "runtime_root" in source
+
+
+class TestLegacyV244AclMigration:
+    def test_legacy_file_scoped_acl_calls_use_rd_without_obsolete_cleanup_state(self) -> None:
+        tree = ast.parse(V244_PATH.read_text(encoding="utf-8"))
+        deny_permissions = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != "_windows_acl_deny" or len(node.args) < 2:
+                continue
+            permission = node.args[1]
+            if isinstance(permission, ast.Constant) and isinstance(permission.value, str):
+                deny_permissions.append(permission.value)
+        assert deny_permissions.count("RD") == 2
+        assert "R" not in deny_permissions
+        source = V244_PATH.read_text(encoding="utf-8")
+        assert "cleanup_returncode" not in source
+        assert "lease.acl_after == lease.acl_before" in source
+        assert "acl._can_read(target)" in source
+        assert "shutil.rmtree" in source
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL functional verification requires native Windows")

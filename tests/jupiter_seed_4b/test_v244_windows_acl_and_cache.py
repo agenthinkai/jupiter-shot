@@ -49,17 +49,31 @@ def _content_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _run_gate(extra: list[str] | None = None, timeout: int = 240) -> subprocess.CompletedProcess[str]:
+def _run_gate(
+    extra: list[str] | None = None,
+    timeout: int = 240,
+    runtime_root: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the production gate with runtime outputs owned by the invoking pytest fixture."""
     env = dict(os.environ)
     env.pop("PYTHONUTF8", None)
     env.pop("PYTHONIOENCODING", None)
     if not env.get("JUPITER_GATE11_SUBPROCESS"):
         env.pop("PYTEST_CURRENT_TEST", None)
-    return subprocess.run(
-        [sys.executable, str(SCRIPT), *(extra or [])], cwd=REPO_ROOT,
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout, env=env,
-    )
+    args = list(extra or [])
+    temp_kwargs: dict[str, str] = {"prefix": "jupiter-v244-gate-"}
+    if runtime_root is not None:
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        temp_kwargs["dir"] = str(runtime_root)
+    with tempfile.TemporaryDirectory(**temp_kwargs) as raw:
+        owned = Path(raw)
+        if "--artifact-dir" not in args:
+            args.extend(["--artifact-dir", str(owned / "artifacts")])
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args], cwd=REPO_ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, env=env,
+        )
 
 
 def _require_windows_icacls() -> None:
@@ -70,16 +84,17 @@ def _require_windows_icacls() -> None:
 
 
 class TestGate11CacheIsolation:
-    def test_gate11_cache_is_outside_repository_and_repeated_runs_preserve_tree(self) -> None:
+    def test_gate11_cache_is_outside_repository_and_repeated_runs_preserve_tree(self, tmp_path: Path) -> None:
         if os.environ.get("JUPITER_GATE11_SUBPROCESS"):
             pytest.skip("Avoid recursive production Gate 11 invocation inside Gate 11 subprocess")
         cache = REPO_ROOT / ".pytest_cache"
         if cache.exists():
             pytest.skip("Clean-worktree cache proof is performed by isolated post-push verification")
         before = _tree_fingerprint(REPO_ROOT)
-        first = _run_gate()
+        runtime_root = tmp_path / "gate-runtime"
+        first = _run_gate(runtime_root=runtime_root)
         middle = _tree_fingerprint(REPO_ROOT)
-        second = _run_gate()
+        second = _run_gate(runtime_root=runtime_root)
         after = _tree_fingerprint(REPO_ROOT)
         assert first.returncode == EXIT_HUMAN_REVIEW_REQUIRED, first.stderr[-1000:]
         assert second.returncode == EXIT_HUMAN_REVIEW_REQUIRED, second.stderr[-1000:]
@@ -97,10 +112,9 @@ class TestWindowsAclDenyCleanup:
         target = root / "required.jsonl"
         target.write_text('{"safe": true}\n', encoding="utf-8")
         try:
-            with acl._windows_acl_deny(target, "R") as lease:
+            with acl._windows_acl_deny(target, "RD") as lease:
                 assert acl._has_explicit_deny(lease.acl_during, lease.identity)
                 assert not acl._can_read(target)
-            assert lease.cleanup_returncode == 0
             assert lease.acl_after == lease.acl_before
             assert acl._can_read(target)
         finally:
@@ -114,10 +128,9 @@ class TestWindowsAclDenyCleanup:
         target.write_text('{"safe": true}\n', encoding="utf-8")
         try:
             with pytest.raises(RuntimeError):
-                with acl._windows_acl_deny(target, "R") as lease:
+                with acl._windows_acl_deny(target, "RD") as lease:
                     assert not acl._can_read(target)
                     raise RuntimeError("intentional production assertion failure")
-            assert lease.cleanup_returncode == 0
             assert lease.acl_after == lease.acl_before
             assert acl._can_read(target)
         finally:
@@ -134,7 +147,6 @@ class TestWindowsAclDenyCleanup:
                 with acl._windows_acl_deny(parent, "W") as lease:
                     assert not acl._can_create_child(parent)
                     raise subprocess.TimeoutExpired(["readiness_gate.py"], 1)
-            assert lease.cleanup_returncode == 0
             assert lease.acl_after == lease.acl_before
             assert acl._can_create_child(parent)
         finally:
@@ -150,7 +162,6 @@ class TestWindowsAclDenyCleanup:
                 target.mkdir()
                 with acl._windows_acl_deny(target, "W") as lease:
                     assert not acl._can_create_child(target)
-                assert lease.cleanup_returncode == 0
                 assert acl._can_create_child(target)
                 shutil.rmtree(target, ignore_errors=False)
             assert not list(root.iterdir())
@@ -158,10 +169,11 @@ class TestWindowsAclDenyCleanup:
             shutil.rmtree(root, ignore_errors=False)
         assert not root.exists()
 
-    def test_windows_unwritable_output_uses_writable_artifact_dir_and_removes_deny_ace(self) -> None:
+    def test_windows_unwritable_output_uses_writable_artifact_dir_and_removes_deny_ace(self, tmp_path: Path) -> None:
         """An unwritable report path is not an unwritable artifact-directory scenario."""
         _require_windows_icacls()
-        root = Path(tempfile.mkdtemp(prefix="jupiter-v244-output-"))
+        root = tmp_path / "v244-output-runtime"
+        root.mkdir()
         parent = root / "unwritable-output"
         artifact_dir = root / "runtime-artifacts"
         parent.mkdir()
@@ -174,7 +186,10 @@ class TestWindowsAclDenyCleanup:
         try:
             with acl.verified_unwritable_artifact_parent(parent):
                 output = parent / "readiness.md"
-                result = _run_gate(["--output", str(output), "--artifact-dir", str(artifact_dir)])
+                result = _run_gate(
+                    ["--output", str(output), "--artifact-dir", str(artifact_dir)],
+                    runtime_root=tmp_path / "gate-runtime",
+                )
                 assert result.returncode == EXIT_EXECUTION_ERROR
                 assert "safe fallback" not in result.stderr.lower()
                 assert "traceback" not in result.stderr.lower()
@@ -221,14 +236,16 @@ class TestV244IsolationPreservation:
             shutil.rmtree(root, ignore_errors=False)
         assert not root.exists()
 
-    def test_production_execution_error_keeps_public_artifact_safe(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            missing = Path(raw) / "missing-data"
-            artifact_dir = Path(raw) / "runtime"
-            result = _run_gate(["--data-dir", str(missing), "--artifact-dir", str(artifact_dir)])
-            assert result.returncode == EXIT_EXECUTION_ERROR
-            artifact = artifact_dir / "EXECUTION_ERROR_ARTIFACT.json"
-            payload = json.loads(artifact.read_text(encoding="utf-8"))
-            assert payload["training_authorized"] is False
-            assert "traceback" not in artifact.read_text(encoding="utf-8").lower()
-            assert not (artifact_dir / "EXECUTION_ERROR_INTERNAL.json").exists()
+    def test_production_execution_error_keeps_public_artifact_safe(self, tmp_path: Path) -> None:
+        missing = tmp_path / "missing-data"
+        artifact_dir = tmp_path / "runtime"
+        result = _run_gate(
+            ["--data-dir", str(missing), "--artifact-dir", str(artifact_dir)],
+            runtime_root=tmp_path / "gate-runtime",
+        )
+        assert result.returncode == EXIT_EXECUTION_ERROR
+        artifact = artifact_dir / "EXECUTION_ERROR_ARTIFACT.json"
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        assert payload["training_authorized"] is False
+        assert "traceback" not in artifact.read_text(encoding="utf-8").lower()
+        assert not (artifact_dir / "EXECUTION_ERROR_INTERNAL.json").exists()
